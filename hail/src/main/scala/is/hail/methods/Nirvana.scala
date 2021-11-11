@@ -373,6 +373,9 @@ object Nirvana {
         fatal(s"could not open file: ${ e.getMessage }")
     }
 
+    //Additional properties for the wrapper script location
+    val wrapper = properties.getProperty("hail.nirvana.wrapper", "run_Nirvana.sh")
+      
     val dotnet = properties.getProperty("hail.nirvana.dotnet", "dotnet")
 
     val nirvanaLocation = properties.getProperty("hail.nirvana.location")
@@ -385,16 +388,16 @@ object Nirvana {
 
 
     val supplementaryAnnotationDirectoryOpt = Option(properties.getProperty("hail.nirvana.supplementaryAnnotationDirectory"))
-    val supplementaryAnnotationDirectory = if (supplementaryAnnotationDirectoryOpt.isEmpty) List[String]() else List("--sd", supplementaryAnnotationDirectoryOpt.get)
+    val supplementaryAnnotationDirectory = if (supplementaryAnnotationDirectoryOpt.isEmpty) List[String]() else List("-s", supplementaryAnnotationDirectoryOpt.get)
 
     val reference = properties.getProperty("hail.nirvana.reference")
 
-    val cmd: List[String] = List[String](dotnet, s"$nirvanaLocation") ++
+    val cmd: List[String] = List[String](wrapper, "-d", dotnet) ++
       List("-c", cache) ++
       supplementaryAnnotationDirectory ++
-      List("--disable-recomposition", "-r", reference,
-        "-i", "-",
-        "-o", "-")
+      List("-r", reference,
+           s"$nirvanaLocation"
+        )
 
     println(cmd.mkString(" "))
 
