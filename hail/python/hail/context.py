@@ -83,7 +83,7 @@ class HailContext(object):
         if not quiet:
             py_version = version()
             sys.stderr.write(
-                'Welcome to\n'
+                "Welcome to Illumina's version of\n"
                 '     __  __     <>__\n'
                 '    / /_/ /__  __/ /\n'
                 '   / __  / _ `/ / /\n'
