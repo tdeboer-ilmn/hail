@@ -24,7 +24,7 @@ import scala.collection.mutable
 
 object Nirvana {
 
-  //For Nirnava v2.0.8
+  //For Nirnava v3.17.0
 
   val nirvanaSignature = TStruct(
     "chromosome" -> TString,
@@ -147,12 +147,10 @@ object Nirvana {
             val rc = proc.waitFor()
             if (rc != 0)
               fatal(s"nirvana command failed with non-zero exit status $rc\n\tError:\n${err.toString}")
-
+            info(s"$r")
             r
           }
       }
-    
-    info(s"$annotations")
 
     val nirvanaRVDType = prev.typ.copy(rowType = prev.rowPType.appendKey("nirvana", PType.canonical(nirvanaSignature)))
 
