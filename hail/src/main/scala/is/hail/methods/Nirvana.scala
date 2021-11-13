@@ -151,7 +151,7 @@ object Nirvana {
             if (rc != 0)
               fatal(s"nirvana command failed with non-zero exit status $rc\n\tError:\n${err.toString}")
             
-            val debugger = r.mkString(" ")
+            info(r.mkString(" "))
 
             r
           }
