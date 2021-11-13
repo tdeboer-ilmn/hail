@@ -139,7 +139,6 @@ object Nirvana {
                 startQuery(a).asInstanceOf[Int])
               val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
               (Annotation(locus, alleles), a)
-              info(locus)
             }
 
             val r = kt.toArray
@@ -152,6 +151,8 @@ object Nirvana {
             r
           }
       }
+    
+    info(s"$annotations")
 
     val nirvanaRVDType = prev.typ.copy(rowType = prev.rowPType.appendKey("nirvana", PType.canonical(nirvanaSignature)))
 
