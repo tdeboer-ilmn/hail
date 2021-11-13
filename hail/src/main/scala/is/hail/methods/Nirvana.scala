@@ -108,6 +108,9 @@ object Nirvana {
     val rowKeyOrd = tv.typ.keyType.ordering
 
     info("Running Nirvana")
+      
+    val debugger = "Debug string"
+    info(debugger)
 
     val prev = tv.rvd
 
@@ -147,11 +150,15 @@ object Nirvana {
             val rc = proc.waitFor()
             if (rc != 0)
               fatal(s"nirvana command failed with non-zero exit status $rc\n\tError:\n${err.toString}")
-            info(s"$r")
+            
+            val debugger = r.mkString(" ")
+
             r
           }
       }
 
+    info(debugger)
+    
     val nirvanaRVDType = prev.typ.copy(rowType = prev.rowPType.appendKey("nirvana", PType.canonical(nirvanaSignature)))
 
     val nirvanaRowType = nirvanaRVDType.rowType
