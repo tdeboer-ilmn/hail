@@ -113,6 +113,8 @@ object Nirvana {
     info(debugger)
 
     val prev = tv.rvd
+      
+    info(prev.mkString(" "))
 
     val annotations = prev
       .mapPartitions { (_, it) =>
@@ -151,8 +153,6 @@ object Nirvana {
             if (rc != 0)
               fatal(s"nirvana command failed with non-zero exit status $rc\n\tError:\n${err.toString}")
             
-            info(r.mkString(" "))
-
             r
           }
       }
