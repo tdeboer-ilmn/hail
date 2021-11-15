@@ -108,14 +108,9 @@ object Nirvana {
     val rowKeyOrd = tv.typ.keyType.ordering
 
     info("Running Nirvana")
-      
-    val debugger = "Debug string"
-    info(debugger)
 
     val prev = tv.rvd
       
-    info(prev.mkString(" "))
-
     val annotations = prev
       .mapPartitions { (_, it) =>
         val pb = new ProcessBuilder(cmd.asJava)
@@ -137,6 +132,8 @@ object Nirvana {
               printContext,
               printElement(localRowType),
               _ => ())
+            //DEBUG
+            fatal(s"$jt")
             // The filter is because every other output line is a comma.
             val kt = jt.filter(_.startsWith("{\"chromosome")).map { s => 
               val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
@@ -145,7 +142,7 @@ object Nirvana {
               val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
               (Annotation(locus, alleles), a)
             }
-
+              
             val r = kt.toArray
               .sortBy(_._1)(rowKeyOrd.toOrdering)
 
@@ -156,8 +153,6 @@ object Nirvana {
             r
           }
       }
-
-    info(debugger)
     
     val nirvanaRVDType = prev.typ.copy(rowType = prev.rowPType.appendKey("nirvana", PType.canonical(nirvanaSignature)))
 
