@@ -132,8 +132,10 @@ object Nirvana {
               printContext,
               printElement(localRowType),
               _ => ())
+            
             //DEBUG
-            fatal(s"$jt")
+            fatal(jt.next())
+              
             // The filter is because every other output line is a comma.
             val kt = jt.filter(_.startsWith("{\"chromosome")).map { s => 
               val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
@@ -145,7 +147,7 @@ object Nirvana {
               
             val r = kt.toArray
               .sortBy(_._1)(rowKeyOrd.toOrdering)
-
+              
             val rc = proc.waitFor()
             if (rc != 0)
               fatal(s"nirvana command failed with non-zero exit status $rc\n\tError:\n${err.toString}")
