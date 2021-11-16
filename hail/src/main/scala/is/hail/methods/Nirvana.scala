@@ -132,15 +132,17 @@ object Nirvana {
               printContext,
               printElement(localRowType),
               _ => ())
-            // DEBUG
-            fatal(jt.next())
-            
+
             // The filter is because every other output line is a comma.
             val kt = jt.filter(_.startsWith("{\"chromosome")).map { s => 
               val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
               val locus = Locus(contigQuery(a).asInstanceOf[String],
                 startQuery(a).asInstanceOf[Int])
               val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
+              
+              //DEBUG
+              fatal(s"$locus")
+            
               (Annotation(locus, alleles), a)
             }
               
