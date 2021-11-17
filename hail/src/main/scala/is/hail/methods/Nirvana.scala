@@ -72,7 +72,7 @@ object Nirvana {
 
     //Additional properties for the wrapper script location
     val wrapper = properties.getProperty("hail.nirvana.wrapper", "run_Nirvana.sh")
-      
+
     val dotnet = properties.getProperty("hail.nirvana.dotnet", "dotnet")
 
     val nirvanaLocation = properties.getProperty("hail.nirvana.location")
@@ -110,7 +110,7 @@ object Nirvana {
     info("Running Nirvana")
 
     val prev = tv.rvd
-      
+
     val annotations = prev
       .mapPartitions { (_, it) =>
         val pb = new ProcessBuilder(cmd.asJava)
@@ -133,35 +133,37 @@ object Nirvana {
               printElement(localRowType),
               _ => ())
 
+            //DEBUG
             //jt.next()
             //fatal(jt.next()) //<- This one is empty when both uncommented. But shows top line when by itself.
-            val aap = jt.next()
-            val noot = jt.next()
-            fatal(s"First: $aap" + s"\nSecond: $noot" + s"\nEnd of the line")  
+            //val aap = jt.next()
+            //val noot = jt.next()
+            //fatal(s"First: $aap" + s"\nSecond: $noot" + s"\nEnd of the line")
+
             // The filter is because every other output line is a comma.
-            val kt = jt.filter(_.startsWith("""{"chromosome""")).map { s => 
+            val kt = jt.filter(_.startsWith("{\"chromosome")).map { s =>
               val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
-              //This never gets reached, so it seems the iterator is empty after getting the first line?
-              fatal(s"Nirvana generated this" +
-                        s"\n  json:   $s" +
-                        s"\n  parsed: $a")
+              //DEBUG
+              //fatal(s"Nirvana generated this" +
+              //          s"\n  json:   $s" +
+              //          s"\n  parsed: $a")
               val locus = Locus(contigQuery(a).asInstanceOf[String],
                 startQuery(a).asInstanceOf[Int])
               val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
               (Annotation(locus, alleles), a)
             }
-              
+
             val r = kt.toArray
               .sortBy(_._1)(rowKeyOrd.toOrdering)
-              
+
             val rc = proc.waitFor()
             if (rc != 0)
               fatal(s"nirvana command failed with non-zero exit status $rc\n\tError:\n${err.toString}")
-            
+
             r
           }
       }
-    
+
     val nirvanaRVDType = prev.typ.copy(rowType = prev.rowPType.appendKey("nirvana", PType.canonical(nirvanaSignature)))
 
     val nirvanaRowType = nirvanaRVDType.rowType
