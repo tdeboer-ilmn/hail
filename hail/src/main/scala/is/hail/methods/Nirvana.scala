@@ -134,10 +134,14 @@ object Nirvana {
               _ => ())
 
             //jt.next()
-            fatal(jt.next())
+            //fatal(jt.next()) //<- This one is empty when both uncommented. But shows top line when by itself.
+              
             // The filter is because every other output line is a comma.
             val kt = jt.filter(_.startsWith("{\"chromosome")).map { s => 
               val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
+              fatal(s"Nirvana generated this" +
+                        s"\n  json:   $s" +
+                        s"\n  parsed: $a")
               val locus = Locus(contigQuery(a).asInstanceOf[String],
                 startQuery(a).asInstanceOf[Int])
               val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
