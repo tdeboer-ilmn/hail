@@ -133,7 +133,7 @@ object Nirvana {
               printElement(localRowType),
               _ => ())
 
-            jt.next()
+            //jt.next()
             fatal(jt.next())
             // The filter is because every other output line is a comma.
             val kt = jt.filter(_.startsWith("{\"chromosome")).map { s => 
