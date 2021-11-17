@@ -135,10 +135,13 @@ object Nirvana {
 
             //jt.next()
             //fatal(jt.next()) //<- This one is empty when both uncommented. But shows top line when by itself.
-              
+            val aap = jt.next()
+            val noot = jt.next()
+            fatal(s"First: $aap" + s"\nSecond: $noot" + s"\nEnd of the line")  
             // The filter is because every other output line is a comma.
-            val kt = jt.filter(_.startsWith("{\"chromosome")).map { s => 
+            val kt = jt.filter(_.startsWith("""{"chromosome""")).map { s => 
               val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
+              //This never gets reached, so it seems the iterator is empty after getting the first line?
               fatal(s"Nirvana generated this" +
                         s"\n  json:   $s" +
                         s"\n  parsed: $a")
