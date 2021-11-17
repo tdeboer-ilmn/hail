@@ -138,11 +138,9 @@ object Nirvana {
               val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
               val locus = Locus(contigQuery(a).asInstanceOf[String],
                 startQuery(a).asInstanceOf[Int])
-              val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
-              
               //DEBUG
               fatal(s"$locus")
-            
+              val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
               (Annotation(locus, alleles), a)
             }
               
