@@ -17,6 +17,8 @@ import is.hail.variant.{Locus, RegionValueVariant}
 import org.apache.spark.sql.Row
 import org.apache.spark.storage.StorageLevel
 import org.json4s.jackson.JsonMethods
+//Added for parsing the nirvana struct to one that Nirvana.scala uses
+import is.hail.expr.ir.IRParser
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -26,13 +28,263 @@ object Nirvana {
 
   //For Nirnava v3.17.0
 
-  val nirvanaSignature = TStruct(
-    "chromosome" -> TString,
-    "refAllele" -> TString,
-    "position" -> TInt32,
-    "altAlleles" -> TArray(TString),
-    "cytogeneticBand" -> TString
-  )
+  val nirvanaParseableStruct = """
+      struct{
+        chromosome: str,
+        position: int,
+        repeatUnit: str,
+        refRepeatCount: int,
+        svEnd: int,
+        refAllele: str,
+        altAlleles: array<str>,
+        quality: float,
+        filters: array<str>,
+        ciPos: array<int>,
+        ciEnd: array<int>,
+        svLength: int,
+        strandBias: float,
+        jointSomaticNormalQuality: int,
+        cytogeneticBand: str,
+        clingen: array<struct{
+            chromosome: str,
+            begin: int, 
+            end: int,
+            variantType: str,
+            id: str,
+            clinicalInterpretation: str,
+            observedGains: int,
+            observedLosses: int,
+            validated: bool,
+            phenotypes: array<str>,
+            phenotypeIds: array<str>,
+            reciprocalOverlap: float
+        }>,
+        clingenDosageSensitivityMap: array<struct{
+            chromosome: str,
+            begin: int, 
+            end: int,
+            haploinsufficiency: str,
+            triplosensitivity: str,
+            reciprocalOverlap: float,
+            annotationOverlap: float
+        }>,
+        oneKg: array<struct{
+            chromosome: str,
+            begin: int, 
+            end: int,
+            variantType: str,
+            id: str,
+            allAn: float,
+            allAc: float,
+            allAf: float,
+            afrAf: float,
+            amrAf: float,
+            eurAf: float,
+            easAf: int,
+            sasAf: int,
+            reciprocalOverlap: str
+        }>,
+        mitomap: array<struct{
+            chromosome: str,
+            begin: int, 
+            end: int,
+            variantType: array<str>,
+            reciprocalOverlap: float,
+            annotationOverlap: float
+        }>,
+        variants: array<struct{
+            vid: str,
+            chromosome: str,
+            begin: int, 
+            end: int,
+            isReferenceMinorAllele: bool,
+            isStructuralVariant: bool,
+            inLowComplexityRegion: bool,
+            refAllele: str,
+            altAllele: str,
+            variantType: str,
+            isDecomposedVariant: bool,
+            isRecomposedVariant: bool,
+            linkedVids: array<str>,
+            hgvsg: str,
+            phylopScore: float,
+            globalAllele:struct{
+                globalMinorAllele:str,
+                globalMinorAlleleFrequency:float
+            },
+            transcripts: array<struct{
+                transcript: str,
+                source: str,
+                bioType: str,
+                codons: str,
+                aminoAcids: str,
+                cdnaPos: str,
+                cdsPos: str,
+                exons: str,
+                introns: str,
+                proteinPos: str,
+                geneId: str,
+                hgnc: str,
+                consequence: array<str>,
+                hgvsc: str,
+                hgvsp: str,
+                geneFusion: struct{
+                    exon:int,
+                    intron: int,
+                    fusions: array<struct{
+                        hgvsc:str,
+                        exon:int,
+                        intron:int
+                    }>
+                },
+                isCanonical: bool,
+                polyPhenScore: float,
+                polyPhenPrediction: str,
+                proteinId: str,
+                siftScore: float,
+                siftPrediction: str,
+                completeOverlap: bool,
+                aminoAcidConservation: struct{
+                    scores: array<float>
+                }
+            }>,
+            regulatoryRegions:array<struct{
+                id: str,
+                type: str,
+                consequence: array<str>
+            }>,
+            clinvar:array<struct{
+                id: str,
+                variationId: str,
+                reviewStatus: str,
+                alleleOrigins: array<str>,
+                refAllele: str,
+                altAllele: str,
+                phenotypes: array<str>,
+                medGenIds: array<str>,
+                omimIds: array<str>,
+                orphanetIds: array<str>,
+                significance: array<str>,
+                lastUpdatedDate: str,
+                pubMedIds: array<str>,
+                isAlleleSpecific: bool
+            }>,
+            oneKg:struct{
+                allAf: float,
+                allAc: int,
+                allAn: int,
+                afrAf: float,
+                afrAc: int,
+                afrAn: int,
+                amrAf: float,
+                amrAc: int,
+                amrAn: int,
+                easAf: float,
+                easAc: int,
+                easAn: int,
+                eurAf: float,
+                eurAc: int,
+                eurAn: int,
+                sasAf: float,
+                sasAc: int,
+                sasAn: int
+            },
+            gnomad:struct{
+                coverage: int,
+                allAf: float,
+                maleAf: float,
+                femaleAf: float,
+                controlsAllAf: float,
+                allAc: int,
+                maleAc: int,
+                femaleAc: int,
+                controlsAllAc: int,
+                allAn: int,
+                maleAn: int,
+                femaleAn: int,
+                controlsAllAn: int,
+                allHc: int,
+                maleHc: int,
+                femaleHc: int,
+                afrAf: float,
+                afrAc: int,
+                afrAn: int,
+                afrHc: int,
+                amrAf: float,
+                amrAc: int,
+                amrAn: int,
+                amrHc: int,
+                easAf: float,
+                easAc: int,
+                easAn: int,
+                easHc: int,
+                finAf: float,
+                finAc: int,
+                finAn: int,
+                finHc: int,
+                nfeAf: float,
+                nfeAc: int,
+                nfeAn: int,
+                nfeHc: int,
+                othAf: float,
+                othAc: int,
+                othAn: int,
+                othHc: int,
+                asjAf: float,
+                asjAc: int,
+                asjAn: int,
+                asjHc: int,
+                sasAf: float,
+                sasAc: int,
+                sasAn: int,
+                sasHc: int,
+                failedFilter: bool,
+                lowComplexityRegion: bool
+            },
+            dbsnp:array<str>,
+            mitomap:array<struct{
+                refAllele: str,
+                altAllele: str,
+                diseases: array<str>,
+                hasHomoplasmy: bool,
+                hasHeteroplasmy: bool,
+                status: str,
+                clinicalSignificance: str,
+                scorePercentile: float,
+                numGenBankFullLengthSeqs: int,
+                pubMedIds: array<str>,
+                isAlleleSpecific: bool
+            }>,
+            primateAI:array<struct{
+                hgnc: str,
+                scorePercentile: float
+            }>,
+            revel:struct{
+                score: float
+            },
+            spliceAI:array<struct{
+                hgnc: str,
+                acceptorGainDistance: int,
+                acceptorGainScore: float,
+                acceptorLossDistance: int,
+                acceptorLossScore: float,
+                donorGainDistance: int,
+                donorGainScore: float,
+                donorLossDistance: int,
+                donorLossScore: float
+            }>,
+            topmed:struct{
+                allAc: int,
+                allAn: int,
+                allAf: float,
+                allHc: int,
+                failedFilter: bool
+            }
+        }>
+    }
+  """
+    
+  val nirvanaSignature = IRParser.parseStructType(nirvanaParseableStruct)
 
   def printContext(w: (String) => Unit) {
     w("##fileformat=VCFv4.1")
