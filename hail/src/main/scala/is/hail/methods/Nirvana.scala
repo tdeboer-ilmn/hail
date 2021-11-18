@@ -279,7 +279,39 @@ object Nirvana {
                 "allHc" -> TInt32,
                 "failedFilter" -> TBoolean
             )
+        )),
+      "genes" -> TArray(TStruct(
+        "name" -> TString,
+        "hgncId" -> TInt32,
+        "summary" -> TString,
+        "omim" -> TArray(TStruct(
+          "mimNumber" -> TInt32,
+          "geneName" -> TString,
+          "description" -> TString,
+          "phenotypes" -> TArray(TStruct(
+            "mimNumber" -> TInt32,
+            "phenotype" -> TString,
+            "description" -> TString,
+            "mapping" -> TString,
+            "inheritance" -> TArray(TString),
+            "comments" -> TArray(TString)
+          ))
+        )),
+        "gnomAD" -> TStruct(
+          "pLi" -> TFloat64,
+          "pRec" -> TFloat64,
+          "pNull" -> TFloat64,
+          "synZ" -> TFloat64,
+          "misZ" -> TFloat64,
+          "loeuf" -> TFloat64
+        ),
+        "clingenGeneValidity" -> TArray(TStruct(
+          "diseaseId" -> TString,
+          "disease" -> TString,
+          "classification" -> TString,
+          "classificationDate" -> TString
         ))
+      ))
     )
 
   def printContext(w: (String) => Unit) {
