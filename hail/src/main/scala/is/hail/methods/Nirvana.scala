@@ -18,7 +18,7 @@ import org.apache.spark.sql.Row
 import org.apache.spark.storage.StorageLevel
 import org.json4s.jackson.JsonMethods
 //Added for parsing the nirvana struct to one that Nirvana.scala uses
-import is.hail.expr.ir.IRParser
+import is.hail.expr.ir.IRParser.parseStructType
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -28,8 +28,17 @@ object Nirvana {
 
   //For Nirnava v3.17.0
 
-  val nirvanaParseableStruct = """
-      struct{
+  /*val nirvanaParseableStruct = """struct{
+          |chromosome: str,
+          |position: int,
+          |refAllele: str,
+          |altAlleles: array<str>,
+          |quality: float,
+          |filters: array<str>,
+          |cytogeneticBand: str
+        |}""".stripMargin.replaceAll("\n","")
+
+  val nirvanaParseableStruct = """struct{
         chromosome: str,
         position: int,
         repeatUnit: str,
@@ -47,7 +56,7 @@ object Nirvana {
         cytogeneticBand: str,
         clingen: array<struct{
             chromosome: str,
-            begin: int, 
+            begin: int,
             end: int,
             variantType: str,
             id: str,
@@ -61,7 +70,7 @@ object Nirvana {
         }>,
         clingenDosageSensitivityMap: array<struct{
             chromosome: str,
-            begin: int, 
+            begin: int,
             end: int,
             haploinsufficiency: str,
             triplosensitivity: str,
@@ -70,7 +79,7 @@ object Nirvana {
         }>,
         oneKg: array<struct{
             chromosome: str,
-            begin: int, 
+            begin: int,
             end: int,
             variantType: str,
             id: str,
@@ -86,7 +95,7 @@ object Nirvana {
         }>,
         mitomap: array<struct{
             chromosome: str,
-            begin: int, 
+            begin: int,
             end: int,
             variantType: array<str>,
             reciprocalOverlap: float,
@@ -95,7 +104,7 @@ object Nirvana {
         variants: array<struct{
             vid: str,
             chromosome: str,
-            begin: int, 
+            begin: int,
             end: int,
             isReferenceMinorAllele: bool,
             isStructuralVariant: bool,
@@ -281,14 +290,26 @@ object Nirvana {
                 failedFilter: bool
             }
         }>
-    }
-  """
-    
-  val nirvanaSignature = IRParser.parseStructType(nirvanaParseableStruct)
+    }""".stripMargin.replaceAll("\n", "")
+
+  val nirvanaSignature = parseStructType(nirvanaParseableStruct)*/
+
+    val nirvanaSignature = TStruct(
+      "chromosome" -> TString,
+      "refAllele" -> TString,
+      "position" -> TInt32,
+      "altAlleles" -> TArray(TString),
+      "cytogeneticBand" -> TString,
+      "quality" -> TFloat64,
+      "filters" -> TArray(TString)
+    )
+
+  //DEBUG
+  //fatal(s"$nirvanaSignature")
 
   def printContext(w: (String) => Unit) {
     w("##fileformat=VCFv4.1")
-    w("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")
+    w("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO") //Removed GT field since Nirvana does not like that to be there
   }
 
   def printElement(vaSignature: PType)(w: (String) => Unit, v: (Locus, Array[String])) {
@@ -303,7 +324,7 @@ object Nirvana {
     sb += '\t'
     sb.append(alleles.tail.filter(_ != "*").mkString(","))
     sb += '\t'
-    sb.append("\t.\t.\tGT")
+    sb.append("\t.\t.") //Remove GT
     w(sb.result())
   }
 
