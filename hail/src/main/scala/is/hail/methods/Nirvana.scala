@@ -19,6 +19,8 @@ import org.apache.spark.storage.StorageLevel
 import org.json4s.jackson.JsonMethods
 //Added for parsing the nirvana struct to one that Nirvana.scala uses
 import is.hail.expr.ir.IRParser
+//Added for debugging
+import com.fasterxml.jackson.core.JsonParseException
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -350,7 +352,7 @@ object Nirvana {
         fatal(s"could not open file: ${ e.getMessage }")
     }
 
-    //Additional properties for the wrapper script location
+    //Additional properties for the wrapper script location and tolerate parser error
     val wrapper = properties.getProperty("hail.nirvana.wrapper", "run_Nirvana.sh")
 
     val dotnet = properties.getProperty("hail.nirvana.dotnet", "dotnet")
@@ -407,28 +409,32 @@ object Nirvana {
         }
           .grouped(localBlockSize)
           .flatMap { block =>
-            val (jt, err, proc) = block.iterator.pipe(pb,
-              printContext,
-              printElement(localRowType),
-              _ => ())
+              val (jt, err, proc) = block.iterator.pipe(pb,
+                printContext,
+                printElement(localRowType),
+                _ => ())
 
-            // The filter is because every other output line is a comma.
-            val kt = jt.filter(_.startsWith("{\"chromosome")).map { s =>
-              val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
-              val locus = Locus(contigQuery(a).asInstanceOf[String],
-                startQuery(a).asInstanceOf[Int])
-              val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
-              (Annotation(locus, alleles), a)
-            }
+              // The filter is because every other output line is a comma.
+              val kt = jt.filter(_.startsWith("{\"chromosome")).map { s =>
+                val a = JSONAnnotationImpex.importAnnotation(JsonMethods.parse(s), nirvanaSignature, warnContext = warnContext)
+                val variantString = contigQuery(a).asInstanceOf[String]
+                if (variantString == null)
+                  fatal(s"Nirvana generated null variant string" +
+                    s"\n  json:   $s" +
+                    s"\n  parsed: $a")
+                val locus = Locus(variantString, startQuery(a).asInstanceOf[Int])
+                val alleles = refQuery(a).asInstanceOf[String] +: altsQuery(a).asInstanceOf[IndexedSeq[String]]
+                (Annotation(locus, alleles), a)
+              }
 
-            val r = kt.toArray
-              .sortBy(_._1)(rowKeyOrd.toOrdering)
+              val r = kt.toArray
+                .sortBy(_._1)(rowKeyOrd.toOrdering)
 
-            val rc = proc.waitFor()
-            if (rc != 0)
-              fatal(s"nirvana command failed with non-zero exit status $rc\n\tError:\n${err.toString}")
+              val rc = proc.waitFor()
+              if (rc != 0)
+                fatal(s"nirvana command failed with non-zero exit status $rc\n\tError:\n${err.toString}")
 
-            r
+              r
           }
       }
 
