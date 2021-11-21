@@ -136,6 +136,7 @@ object RelationalFunctions {
     val jv = JsonMethods.parse(config)
     (jv \ "name").extract[String] match {
       case "VEP" => VEP.fromJValue(ctx.fs, jv).asInstanceOf[T]
+      case "Nirvana" => Nirvana.fromJValue(ctx.fs, jv).asInstanceOf[T]
       case _ => {
         log.info("JSON: " + jv.toString)
         jv.extract[T]

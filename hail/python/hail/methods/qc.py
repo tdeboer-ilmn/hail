@@ -30,7 +30,7 @@ def sample_qc(mt, name='sample_qc') -> MatrixTable:
 
     This method computes summary statistics per sample from a genetic matrix and stores
     the results as a new column-indexed struct field in the matrix, named based on the
-    `name` parameter.
+    `name` parameter.vepSignature
 
     If `mt` contains an entry field `DP` of type :py:data:`.tint32`, then the
     field `dp_stats` is computed. If `mt` contains an entry field `GQ` of type
@@ -635,8 +635,9 @@ def vep(dataset: Union[Table, MatrixTable], config=None, block_size=1000, name='
 @typecheck(dataset=oneof(Table, MatrixTable),
            config=str,
            block_size=int,
-           name=str)
-def nirvana(dataset: Union[MatrixTable, Table], config, block_size=500000, name='nirvana'):
+           name=str,
+           tolerate_parse_error=bool)
+def nirvana(dataset: Union[MatrixTable, Table], config, block_size=500000, name='nirvana', tolerate_parse_error = True):
     """Annotate variants using `Nirvana <https://github.com/Illumina/Nirvana>`_.
 
     .. include:: ../_templates/experimental.rst
@@ -652,32 +653,35 @@ def nirvana(dataset: Union[MatrixTable, Table], config, block_size=500000, name=
 
     Add Nirvana annotations to the dataset:
 
-    >>> result = hl.nirvana(dataset, "data/nirvana.properties") # doctest: +SKIP
+    >>> result = hl.nirvana(dataset, "/user/hadoop/nirvana_conf.GRCh38.json") # doctest: +SKIP
 
     **Configuration**
 
-    :func:`.nirvana` requires a configuration file. The format is a
-    `.properties file <https://en.wikipedia.org/wiki/.properties>`__, where each
-    line defines a property as a key-value pair of the form ``key = value``.
-    :func:`.nirvana` supports the following properties:
+    The format of the configuration file is JSON, and :func:`.nirvana`
+    expects a JSON object with three fields:
 
-    - **hail.nirvana.dotnet** -- Location of dotnet. Optional, default: dotnet.
-    - **hail.nirvana.path** -- Value of the PATH environment variable when
-      invoking Nirvana. Optional, by default PATH is not set.
-    - **hail.nirvana.location** -- Location of Nirvana.dll. Required.
-    - **hail.nirvana.reference** -- Location of reference genome. Required.
-    - **hail.nirvana.cache** -- Location of cache. Required.
-    - **hail.nirvana.supplementaryAnnotationDirectory** -- Location of
-      Supplementary Database. Optional, no supplementary database by default.
+    - `command` (array of string) -- The Nirvana command line to run.
+    - `env` (object) -- A map of environment variables to values to add to the environment when invoking the command.  The value of each object member must be a string.
+    - `nirvana_json_schema` (string): (OPTIONAL) The definition of the NIRVANA JSON schema. If defined as empty string, will use the default Nirvana structure (valid for 3.17+). Note: This is the old-style 'parseable' Hail type syntax.  This will change.
 
-    Here is an example ``nirvana.properties`` configuration file:
+    Here is an example configuration file for invoking Nirvana wrapper script that takes the input on STDIN and prints the JSON output on STDOUT:
 
     .. code-block:: text
 
-        hail.nirvana.location = /path/to/dotnet/netcoreapp2.0/Nirvana.dll
-        hail.nirvana.reference = /path/to/nirvana/References/Homo_sapiens.GRCh37.Nirvana.dat
-        hail.nirvana.cache = /path/to/nirvana/Cache/GRCh37/Ensembl
-        hail.nirvana.supplementaryAnnotationDirectory = /path/to/nirvana/SupplementaryDatabase/GRCh37
+        {
+            "command": [
+                "/opt/run_Nirvana.sh",
+                "-r", "/mnt/nirvana_data/Reference/Homo_sapiens.GRCh38.Nirvana.dat",
+                "-c", "/mnt/nirvana_data/Cache/GRCh38/Both",
+                "-s", "/mnt/nirvana_data/SupplementaryAnnotation",
+                "-d", "dotnet",
+                "/opt/nirvana/Nirvana/dll"
+            ],
+            "env": {
+                "PATH": "/usr/local/bin:${PATH}"
+            },
+            "vep_json_schema": ""
+        }
 
     **Annotations**
 
@@ -686,259 +690,291 @@ def nirvana(dataset: Union[MatrixTable, Table], config, block_size=500000, name=
 
     .. code-block:: text
 
-        struct {
-            chromosome: str,
-            refAllele: str,
-            position: int32,
-            altAlleles: array<str>,
-            cytogeneticBand: str,
-            quality: float64,
-            filters: array<str>,
-            jointSomaticNormalQuality: int32,
-            copyNumber: int32,
-            strandBias: float64,
-            recalibratedQuality: float64,
-            variants: array<struct {
-                altAllele: str,
-                refAllele: str,
-                chromosome: str,
-                begin: int32,
-                end: int32,
-                phylopScore: float64,
-                isReferenceMinor: bool,
-                variantType: str,
-                vid: str,
-                hgvsg: str,
-                isRecomposedVariant: bool,
-                isDecomposedVariant: bool,
-                regulatoryRegions: array<struct {
-                    id: str,
-                    type: str,
-                    consequence: set<str>
-                }>,
-                clinvar: array<struct {
-                    id: str,
-                    reviewStatus: str,
-                    isAlleleSpecific: bool,
-                    alleleOrigins: array<str>,
-                    refAllele: str,
-                    altAllele: str,
-                    phenotypes: array<str>,
-                    medGenIds: array<str>,
-                    omimIds: array<str>,
-                    orphanetIds: array<str>,
-                    significance: str,
-                    lastUpdatedDate: str,
-                    pubMedIds: array<str>
-                }>,
-                cosmic: array<struct {
-                    id: str,
-                    isAlleleSpecific: bool,
-                    refAllele: str,
-                    altAllele: str,
-                    gene: str,
-                    sampleCount: int32,
-                    studies: array<struct {
-                        id: int32,
-                        histology: str,
-                        primarySite: str
-                    }>
-                }>,
-                dbsnp: struct {
-                    ids: array<str>
-                },
-                globalAllele: struct {
-                    globalMinorAllele: str,
-                    globalMinorAlleleFrequency: float64
-                },
-                gnomad: struct {
-                    coverage: str,
-                    allAf: float64,
-                    allAc: int32,
-                    allAn: int32,
-                    allHc: int32,
-                    afrAf: float64,
-                    afrAc: int32,
-                    afrAn: int32,
-                    afrHc: int32,
-                    amrAf: float64,
-                    amrAc: int32,
-                    amrAn: int32,
-                    amrHc: int32,
-                    easAf: float64,
-                    easAc: int32,
-                    easAn: int32,
-                    easHc: int32,
-                    finAf: float64,
-                    finAc: int32,
-                    finAn: int32,
-                    finHc: int32,
-                    nfeAf: float64,
-                    nfeAc: int32,
-                    nfeAn: int32,
-                    nfeHc: int32,
-                    othAf: float64,
-                    othAc: int32,
-                    othAn: int32,
-                    othHc: int32,
-                    asjAf: float64,
-                    asjAc: int32,
-                    asjAn: int32,
-                    asjHc: int32,
-                    failedFilter: bool
-                },
-                gnomadExome: struct {
-                    coverage: str,
-                    allAf: float64,
-                    allAc: int32,
-                    allAn: int32,
-                    allHc: int32,
-                    afrAf: float64,
-                    afrAc: int32,
-                    afrAn: int32,
-                    afrHc: int32,
-                    amrAf: float64,
-                    amrAc: int32,
-                    amrAn: int32,
-                    amrHc: int32,
-                    easAf: float64,
-                    easAc: int32,
-                    easAn: int32,
-                    easHc: int32,
-                    finAf: float64,
-                    finAc: int32,
-                    finAn: int32,
-                    finHc: int32,
-                    nfeAf: float64,
-                    nfeAc: int32,
-                    nfeAn: int32,
-                    nfeHc: int32,
-                    othAf: float64,
-                    othAc: int32,
-                    othAn: int32,
-                    othHc: int32,
-                    asjAf: float64,
-                    asjAc: int32,
-                    asjAn: int32,
-                    asjHc: int32,
-                    sasAf: float64,
-                    sasAc: int32,
-                    sasAn: int32,
-                    sasHc: int32,
-                    failedFilter: bool
-                },
-                topmed: struct {
-                    failedFilter: bool,
-                    allAc: int32,
-                    allAn: int32,
-                    allAf: float64,
-                    allHc: int32
-                },
-                oneKg: struct {
-                    ancestralAllele: str,
-                    allAf: float64,
-                    allAc: int32,
-                    allAn: int32,
-                    afrAf: float64,
-                    afrAc: int32,
-                    afrAn: int32,
-                    amrAf: float64,
-                    amrAc: int32,
-                    amrAn: int32,
-                    easAf: float64,
-                    easAc: int32,
-                    easAn: int32,
-                    eurAf: float64,
-                    eurAc: int32,
-                    eurAn: int32,
-                    sasAf: float64,
-                    sasAc: int32,
-                    sasAn: int32
-                },
-                mitomap: array<struct {
-                    refAllele: str,
-                    altAllele: str,
-                    diseases : array<str>,
-                    hasHomoplasmy: bool,
-                    hasHeteroplasmy: bool,
-                    status: str,
-                    clinicalSignificance: str,
-                    scorePercentile: float64,
-                    isAlleleSpecific: bool,
-                    chromosome: str,
-                    begin: int32,
-                    end: int32,
-                    variantType: str
-                }
-                transcripts: struct {
-                    refSeq: array<struct {
-                        transcript: str,
-                        bioType: str,
-                        aminoAcids: str,
-                        cdnaPos: str,
-                        codons: str,
-                        cdsPos: str,
-                        exons: str,
-                        introns: str,
-                        geneId: str,
-                        hgnc: str,
-                        consequence: array<str>,
-                        hgvsc: str,
-                        hgvsp: str,
-                        isCanonical: bool,
-                        polyPhenScore: float64,
-                        polyPhenPrediction: str,
-                        proteinId: str,
-                        proteinPos: str,
-                        siftScore: float64,
-                        siftPrediction: str
-                    }>,
-                    ensembl: array<struct {
-                        transcript: str,
-                        bioType: str,
-                        aminoAcids: str,
-                        cdnaPos: str,
-                        codons: str,
-                        cdsPos: str,
-                        exons: str,
-                        introns: str,
-                        geneId: str,
-                        hgnc: str,
-                        consequence: array<str>,
-                        hgvsc: str,
-                        hgvsp: str,
-                        isCanonical: bool,
-                        polyPhenScore: float64,
-                        polyPhenPrediction: str,
-                        proteinId: str,
-                        proteinPos: str,
-                        siftScore: float64,
-                        siftPrediction: str
-                    }>
-                },
-                overlappingGenes: array<str>
-            }>
-            genes: array<struct {
-                name: str,
-                omim: array<struct {
-                    mimNumber: int32,
-                    hgnc: str,
-                    description: str,
-                    phenotypes: array<struct {
-                        mimNumber: int32,
-                        phenotype: str,
-                        mapping: str,
-                        inheritance: array<str>,
-                        comments: str
-                    }>
-                }>
-                exac: struct {
-                    pLi: float64,
-                    pRec: float64,
-                    pNull: float64
-                }
-            }>
-        }
+    TStruct(
+        "chromosome" -> TString,
+        "position" -> TInt32,
+        "repeatUnit" -> TString,
+        "refRepeatCount" -> TInt32,
+        "svEnd" -> TInt32,
+        "refAllele" -> TString,
+        "altAlleles" -> TArray(TString),
+        "quality" -> TFloat64,
+        "filters" -> TArray(TString),
+        "ciPos" -> TArray(TInt32),
+        "ciEnd" -> TArray(TInt32),
+        "svLength" -> TInt32,
+        "strandBias" -> TFloat64,
+        "jointSomaticNormalQuality" -> TInt32,
+        "cytogeneticBand" -> TString,
+        "clingen" -> TArray(TStruct(
+            "chromosome" -> TString,
+            "begin" -> TInt32,
+            "end" -> TInt32,
+            "variantType" -> TString,
+            "id" -> TString,
+            "clinicalInterpretation" -> TString,
+            "observedGains" -> TInt32,
+            "observedLosses" -> TInt32,
+            "validated" -> TBoolean,
+            "phenotypes" -> TArray(TString),
+            "phenotypeIds" -> TArray(TString),
+            "reciprocalOverlap" -> TFloat64
+        )),
+        "clingenDosageSensitivityMap" -> TArray(TStruct(
+            "chromosome" -> TString,
+            "begin" -> TInt32,
+            "end" -> TInt32,
+            "haploinsufficiency" -> TString,
+            "triplosensitivity" -> TString,
+            "reciprocalOverlap" -> TFloat64,
+            "annotationOverlap" -> TFloat64
+        )),
+        "oneKg" -> TArray(TStruct(
+            "chromosome" -> TString,
+            "begin" -> TInt32,
+            "end" -> TInt32,
+            "variantType" -> TString,
+            "id" -> TString,
+            "allAn" -> TFloat64,
+            "allAc" -> TFloat64,
+            "allAf" -> TFloat64,
+            "afrAf" -> TFloat64,
+            "amrAf" -> TFloat64,
+            "eurAf" -> TFloat64,
+            "easAf" -> TInt32,
+            "sasAf" -> TInt32,
+            "reciprocalOverlap" -> TString
+        )),
+        "mitomap" -> TArray(TStruct(
+            "chromosome" -> TString,
+            "begin" -> TInt32,
+            "end" -> TInt32,
+            "variantType" -> TArray(TString),
+            "reciprocalOverlap" -> TFloat64,
+            "annotationOverlap" -> TFloat64
+        )),
+        "variants" -> TArray(TStruct(
+            "vid" -> TString,
+            "chromosome" -> TString,
+            "begin" -> TInt32,
+            "end" -> TInt32,
+            "isReferenceMinorAllele" -> TBoolean,
+            "isStructuralVariant" -> TBoolean,
+            "inLowComplexityRegion" -> TBoolean,
+            "refAllele" -> TString,
+            "altAllele" -> TString,
+            "variantType" -> TString,
+            "isDecomposedVariant" -> TBoolean,
+            "isRecomposedVariant" -> TBoolean,
+            "linkedVids" -> TArray(TString),
+            "hgvsg" -> TString,
+            "phylopScore" -> TFloat64,
+            "globalAllele" -> TStruct(
+                "globalMinorAllele" -> TString,
+                "globalMinorAlleleFrequency" -> TFloat64
+            ),
+            "transcripts" -> TArray(TStruct(
+                "transcript" -> TString,
+                "source" -> TString,
+                "bioType" -> TString,
+                "codons" -> TString,
+                "aminoAcids" -> TString,
+                "cdnaPos" -> TString,
+                "cdsPos" -> TString,
+                "exons" -> TString,
+                "introns" -> TString,
+                "proteinPos" -> TString,
+                "geneId" -> TString,
+                "hgnc" -> TString,
+                "consequence" -> TArray(TString),
+                "hgvsc" -> TString,
+                "hgvsp" -> TString,
+                "geneFusion" -> TStruct(
+                    "exon" -> TInt32,
+                    "intron" -> TInt32,
+                    "fusions" -> TArray(TStruct(
+                        "hgvsc" -> TString,
+                        "exon" -> TInt32,
+                        "intron" -> TInt32
+                    ))
+                ),
+                "isCanonical" -> TBoolean,
+                "polyPhenScore" -> TFloat64,
+                "polyPhenPrediction" -> TString,
+                "proteinId" -> TString,
+                "siftScore" -> TFloat64,
+                "siftPrediction" -> TString,
+                "completeOverlap" -> TBoolean,
+                "aminoAcidConservation" -> TStruct(
+                    "scores" -> TArray(TFloat64)
+                )
+            )),
+            "regulatoryRegions" -> TArray(TStruct(
+                "id" -> TString,
+                "type" -> TString,
+                "consequence" -> TArray(TString)
+            )),
+            "clinvar" -> TArray(TStruct(
+                "id" -> TString,
+                "variationId" -> TString,
+                "reviewStatus" -> TString,
+                "alleleOrigins" -> TArray(TString),
+                "refAllele" -> TString,
+                "altAllele" -> TString,
+                "phenotypes" -> TArray(TString),
+                "medGenIds" -> TArray(TString),
+                "omimIds" -> TArray(TString),
+                "orphanetIds" -> TArray(TString),
+                "significance" -> TArray(TString),
+                "lastUpdatedDate" -> TString,
+                "pubMedIds" -> TArray(TString),
+                "isAlleleSpecific" -> TBoolean
+            )),
+            "oneKg" -> TStruct(
+                "allAf" -> TFloat64,
+                "allAc" -> TInt32,
+                "allAn" -> TInt32,
+                "afrAf" -> TFloat64,
+                "afrAc" -> TInt32,
+                "afrAn" -> TInt32,
+                "amrAf" -> TFloat64,
+                "amrAc" -> TInt32,
+                "amrAn" -> TInt32,
+                "easAf" -> TFloat64,
+                "easAc" -> TInt32,
+                "easAn" -> TInt32,
+                "eurAf" -> TFloat64,
+                "eurAc" -> TInt32,
+                "eurAn" -> TInt32,
+                "sasAf" -> TFloat64,
+                "sasAc" -> TInt32,
+                "sasAn" -> TInt32
+            ),
+            "gnomad" -> TStruct(
+                "coverage" -> TInt32,
+                "allAf" -> TFloat64,
+                "maleAf" -> TFloat64,
+                "femaleAf" -> TFloat64,
+                "controlsAllAf" -> TFloat64,
+                "allAc" -> TInt32,
+                "maleAc" -> TInt32,
+                "femaleAc" -> TInt32,
+                "controlsAllAc" -> TInt32,
+                "allAn" -> TInt32,
+                "maleAn" -> TInt32,
+                "femaleAn" -> TInt32,
+                "controlsAllAn" -> TInt32,
+                "allHc" -> TInt32,
+                "maleHc" -> TInt32,
+                "femaleHc" -> TInt32,
+                "afrAf" -> TFloat64,
+                "afrAc" -> TInt32,
+                "afrAn" -> TInt32,
+                "afrHc" -> TInt32,
+                "amrAf" -> TFloat64,
+                "amrAc" -> TInt32,
+                "amrAn" -> TInt32,
+                "amrHc" -> TInt32,
+                "easAf" -> TFloat64,
+                "easAc" -> TInt32,
+                "easAn" -> TInt32,
+                "easHc" -> TInt32,
+                "finAf" -> TFloat64,
+                "finAc" -> TInt32,
+                "finAn" -> TInt32,
+                "finHc" -> TInt32,
+                "nfeAf" -> TFloat64,
+                "nfeAc" -> TInt32,
+                "nfeAn" -> TInt32,
+                "nfeHc" -> TInt32,
+                "othAf" -> TFloat64,
+                "othAc" -> TInt32,
+                "othAn" -> TInt32,
+                "othHc" -> TInt32,
+                "asjAf" -> TFloat64,
+                "asjAc" -> TInt32,
+                "asjAn" -> TInt32,
+                "asjHc" -> TInt32,
+                "sasAf" -> TFloat64,
+                "sasAc" -> TInt32,
+                "sasAn" -> TInt32,
+                "sasHc" -> TInt32,
+                "failedFilter" -> TBoolean,
+                "lowComplexityRegion" -> TBoolean
+            ),
+            "dbsnp" -> TArray(TString),
+            "mitomap" -> TArray(TStruct(
+                "refAllele" -> TString,
+                "altAllele" -> TString,
+                "diseases" -> TArray(TString),
+                "hasHomoplasmy" -> TBoolean,
+                "hasHeteroplasmy" -> TBoolean,
+                "status" -> TString,
+                "clinicalSignificance" -> TString,
+                "scorePercentile" -> TFloat64,
+                "numGenBankFullLengthSeqs" -> TInt32,
+                "pubMedIds" -> TArray(TString),
+                "isAlleleSpecific" -> TBoolean
+            )),
+            "primateAI" -> TArray(TStruct(
+                "hgnc" -> TString,
+                "scorePercentile" -> TFloat64
+            )),
+            "revel" -> TStruct(
+                "score" -> TFloat64
+            ),
+            "spliceAI" -> TArray(TStruct(
+                "hgnc" -> TString,
+                "acceptorGainDistance" -> TInt32,
+                "acceptorGainScore" -> TFloat64,
+                "acceptorLossDistance" -> TInt32,
+                "acceptorLossScore" -> TFloat64,
+                "donorGainDistance" -> TInt32,
+                "donorGainScore" -> TFloat64,
+                "donorLossDistance" -> TInt32,
+                "donorLossScore" -> TFloat64
+            )),
+            "topmed" -> TStruct(
+                "allAc" -> TInt32,
+                "allAn" -> TInt32,
+                "allAf" -> TFloat64,
+                "allHc" -> TInt32,
+                "failedFilter" -> TBoolean
+            )
+        )),
+      "genes" -> TArray(TStruct(
+        "name" -> TString,
+        "hgncId" -> TInt32,
+        "summary" -> TString,
+        "omim" -> TArray(TStruct(
+          "mimNumber" -> TInt32,
+          "geneName" -> TString,
+          "description" -> TString,
+          "phenotypes" -> TArray(TStruct(
+            "mimNumber" -> TInt32,
+            "phenotype" -> TString,
+            "description" -> TString,
+            "mapping" -> TString,
+            "inheritance" -> TArray(TString),
+            "comments" -> TArray(TString)
+          ))
+        )),
+        "gnomAD" -> TStruct(
+          "pLi" -> TFloat64,
+          "pRec" -> TFloat64,
+          "pNull" -> TFloat64,
+          "synZ" -> TFloat64,
+          "misZ" -> TFloat64,
+          "loeuf" -> TFloat64
+        ),
+        "clingenGeneValidity" -> TArray(TStruct(
+          "diseaseId" -> TString,
+          "disease" -> TString,
+          "classification" -> TString,
+          "classificationDate" -> TString
+        ))
+      ))
+    )
 
     Parameters
     ----------
@@ -950,12 +986,21 @@ def nirvana(dataset: Union[MatrixTable, Table], config, block_size=500000, name=
         Number of rows to process per Nirvana invocation.
     name : :class:`str`
         Name for resulting row field.
+    tolerate_parse_error : :obj:`bool`
+        If ``True``, ignore invalid JSON produced by Nirvana and return a missing annotation.
 
     Returns
     -------
     :class:`.MatrixTable` or :class:`.Table`
         Dataset with new row-indexed field `name` containing Nirvana annotations.
     """
+    if config is None:
+        maybe_config = os.getenv("NIRVANA_CONFIG_URI")
+        if maybe_config is not None:
+            config = maybe_config
+        else:
+            raise ValueError("No config set and NIRVANA_CONFIG_URI was not set.")
+
     if isinstance(dataset, MatrixTable):
         require_row_key_variant(dataset, 'nirvana')
         ht = dataset.select_rows().rows()
@@ -963,16 +1008,19 @@ def nirvana(dataset: Union[MatrixTable, Table], config, block_size=500000, name=
         require_table_key_variant(dataset, 'nirvana')
         ht = dataset.select()
 
+    ht = ht.distinct()
     annotations = Table(TableToTableApply(ht._tir,
                                           {'name': 'Nirvana',
                                            'config': config,
-                                           'blockSize': block_size}
-                                          )).persist()
+                                           'blockSize': block_size,
+                                           'tolerateParseError': tolerate_parse_error})).persist()
 
     if isinstance(dataset, MatrixTable):
-        return dataset.annotate_rows(**{name: annotations[dataset.row_key].nirvana})
+        nirvana = annotations[dataset.row_key]
+        return dataset.annotate_rows(**{name: nirvana.nirvana, name + '_proc_id': nirvana.nirvana_proc_id})
     else:
-        return dataset.annotate(**{name: annotations[dataset.key].nirvana})
+        nirvana = annotations[dataset.key]
+        return dataset.annotate(**{name: nirvana.nirvana, name + '_proc_id': nirvana.nirvana_proc_id})
 
 
 class _VariantSummary(object):
