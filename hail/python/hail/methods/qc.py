@@ -662,7 +662,7 @@ def nirvana(dataset: Union[MatrixTable, Table], config, block_size=500000, name=
 
     - `command` (array of string) -- The Nirvana command line to run.
     - `env` (object) -- A map of environment variables to values to add to the environment when invoking the command.  The value of each object member must be a string.
-    - `nirvana_json_schema` (string): (OPTIONAL) The definition of the NIRVANA JSON schema. If defined as empty string, will use the default Nirvana structure (valid for 3.17+). Note: This is the old-style 'parseable' Hail type syntax.  This will change.
+    - `nirvana_json_schema` (string): The definition of the NIRVANA JSON schema. If defined as an empty Struct ("Struct{}"), will use the default Nirvana structure (valid for 3.17+). Note: This is the old-style 'parseable' Hail type syntax.  This will change.
 
     Here is an example configuration file for invoking Nirvana wrapper script that takes the input on STDIN and prints the JSON output on STDOUT:
 
@@ -678,9 +678,9 @@ def nirvana(dataset: Union[MatrixTable, Table], config, block_size=500000, name=
                 "/opt/nirvana/Nirvana/dll"
             ],
             "env": {
-                "PATH": "/usr/local/bin:${PATH}"
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             },
-            "vep_json_schema": ""
+            "vep_json_schema": "Struct{}"
         }
 
     **Annotations**
