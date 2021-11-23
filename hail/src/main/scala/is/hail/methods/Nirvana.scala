@@ -53,7 +53,7 @@ object Nirvana {
     sb.append(alleles(0))
     sb += '\t'
     sb.append(alleles.tail.filter(_ != "*").mkString(","))
-    sb.append("\t.\t.")
+    sb.append("\t.\t.\t.")
     w(sb.result())
   }
 
