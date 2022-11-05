@@ -11,8 +11,8 @@ from .expression_typecheck import coercer_from_dtype, \
     expr_int64, expr_str, expr_dict, expr_interval, expr_tuple, expr_oneof, \
     expr_ndarray
 from hail.expr.types import HailType, tint32, tint64, tfloat32, \
-    tfloat64, tbool, tcall, tset, tarray, tstruct, tdict, ttuple, tstr, \
-    tndarray, tlocus, tinterval, is_numeric
+    tfloat64, tbool, tcall, tset, tarray, tstream, tstruct, tdict, ttuple,\
+    tstr, tndarray, tlocus, tinterval, is_numeric
 import hail.ir as ir
 from hail.typecheck import typecheck, typecheck_method, func_spec, oneof, \
     identity, nullable, tupleof, sliceof, dictof, anyfunc
@@ -78,7 +78,7 @@ class CollectionExpression(Expression):
         [2, 4]
 
         >>> hl.eval(s3.filter(lambda x: ~(x[-1] == 'e')))  # doctest: +SKIP_OUTPUT_CHECK
-        frozenset({'Bob'})
+        {'Bob'}
 
         Notes
         -----
@@ -105,7 +105,7 @@ class CollectionExpression(Expression):
             return hl.tarray(self._type.element_type)
 
         def transform_ir(array, name, body):
-            return ir.ToArray(ir.StreamFilter(ir.ToStream(array), name, body))
+            return ir.toArray(ir.StreamFilter(ir.toStream(array), name, body))
 
         array_filter = hl.array(self)._ir_lambda_method(transform_ir, f, self.dtype.element_type, unify_ret)
 
@@ -183,7 +183,7 @@ class CollectionExpression(Expression):
             return hl.array(f(x)) if isinstance(value_type, tset) else f(x)
 
         def transform_ir(array, name, body):
-            return ir.ToArray(ir.StreamFlatMap(ir.ToStream(array), name, ir.ToStream(body)))
+            return ir.toArray(ir.StreamFlatMap(ir.toStream(array), name, ir.ToStream(body)))
 
         array_flatmap = hl.array(self)._ir_lambda_method(transform_ir, f2, self.dtype.element_type, identity)
 
@@ -216,42 +216,9 @@ class CollectionExpression(Expression):
         :class:`.Expression`.
         """
         collection = self
-        if isinstance(collection.dtype, tset):
+        if not isinstance(collection, ArrayExpression):
             collection = hl.array(collection)
-        indices, aggregations = unify_all(collection, zero)
-        accum_name = Env.get_uid()
-        elt_name = Env.get_uid()
-
-        accum_ref = construct_variable(accum_name, zero.dtype, indices, aggregations)
-        elt_ref = construct_variable(elt_name, collection.dtype.element_type, collection._indices, collection._aggregations)
-        body = to_expr(f(accum_ref, elt_ref))
-
-        if body.dtype != zero.dtype:
-            zero_coercer = coercer_from_dtype(zero.dtype)
-            if zero_coercer.can_coerce(body.dtype):
-                body = zero_coercer.coerce(body)
-            else:
-                body_coercer = coercer_from_dtype(body.dtype)
-                if body_coercer.can_coerce(zero.dtype):
-                    zero_coerced = body_coercer.coerce(zero)
-                    accum_ref = construct_variable(accum_name, zero_coerced.dtype, indices, aggregations)
-                    new_body = to_expr(f(accum_ref, elt_ref))
-                    if body_coercer.can_coerce(new_body.dtype):
-                        body = body_coercer.coerce(new_body)
-                        zero = zero_coerced
-
-        if body.dtype != zero.dtype:
-            raise ExpressionException("'CollectionExpression.fold' must take function returning "
-                                      "same expression type as zero value: \n"
-                                      "    zero.dtype: {}\n"
-                                      "    f.dtype: {}".format(
-                                          zero.dtype,
-                                          body.dtype))
-
-        x = ir.StreamFold(ir.ToStream(collection._ir), zero._ir, accum_name, elt_name, body._ir)
-
-        indices, aggregations = unify_all(self, zero, body)
-        return construct_expr(x, body.dtype, indices, aggregations)
+        return collection._to_stream().fold(lambda x, y: f(x, y), zero)
 
     @typecheck_method(f=func_spec(1, expr_bool))
     def all(self, f):
@@ -307,7 +274,7 @@ class CollectionExpression(Expression):
 
         keyed = hl.array(self).map(lambda x: hl.tuple([f(x), x]))
         types = keyed.dtype.element_type.types
-        return construct_expr(ir.GroupByKey(ir.ToStream(keyed._ir)), tdict(types[0], tarray(types[1])), keyed._indices, keyed._aggregations)
+        return construct_expr(ir.GroupByKey(ir.toStream(keyed._ir)), tdict(types[0], tarray(types[1])), keyed._indices, keyed._aggregations)
 
     @typecheck_method(f=func_spec(1, expr_any))
     def map(self, f):
@@ -320,7 +287,7 @@ class CollectionExpression(Expression):
         [1.0, 8.0, 27.0, 64.0, 125.0]
 
         >>> hl.eval(s3.map(lambda x: x.length()))
-        frozenset({3, 5, 7})
+        {3, 5, 7}
 
         Parameters
         ----------
@@ -334,9 +301,9 @@ class CollectionExpression(Expression):
         """
 
         def transform_ir(array, name, body):
-            a = ir.ToArray(ir.StreamMap(ir.ToStream(array), name, body))
+            a = ir.toArray(ir.StreamMap(ir.toStream(array), name, body))
             if isinstance(self.dtype, tset):
-                a = ir.ToSet(ir.ToStream(a))
+                a = ir.ToSet(ir.toStream(a))
             return a
 
         array_map = hl.array(self)._ir_lambda_method(transform_ir, f, self._type.element_type, lambda t: self._type.__class__(t))
@@ -700,40 +667,7 @@ class ArrayExpression(CollectionExpression):
         -------
         :class:`.ArrayExpression`.
         """
-        indices, aggregations = unify_all(self, zero)
-        accum_name = Env.get_uid()
-        elt_name = Env.get_uid()
-
-        accum_ref = construct_variable(accum_name, zero.dtype, indices, aggregations)
-        elt_ref = construct_variable(elt_name, self.dtype.element_type, self._indices, self._aggregations)
-        body = to_expr(f(accum_ref, elt_ref))
-
-        if body.dtype != zero.dtype:
-            zero_coercer = coercer_from_dtype(zero.dtype)
-            if zero_coercer.can_coerce(body.dtype):
-                body = zero_coercer.coerce(body)
-            else:
-                body_coercer = coercer_from_dtype(body.dtype)
-                if body_coercer.can_coerce(zero.dtype):
-                    zero_coerced = body_coercer.coerce(zero)
-                    accum_ref = construct_variable(accum_name, zero_coerced.dtype, indices, aggregations)
-                    new_body = to_expr(f(accum_ref, elt_ref))
-                    if body_coercer.can_coerce(new_body.dtype):
-                        body = body_coercer.coerce(new_body)
-                        zero = zero_coerced
-
-        if body.dtype != zero.dtype:
-            raise ExpressionException("'ArrayExpression.scan' must take function returning "
-                                      "same expression type as zero value: \n"
-                                      "    zero.dtype: {}\n"
-                                      "    f.dtype: {}".format(
-                                          zero.dtype,
-                                          body.dtype))
-
-        x = ir.ToArray(ir.StreamScan(ir.ToStream(self._ir), zero._ir, accum_name, elt_name, body._ir))
-
-        indices, aggregations = unify_all(self, zero, body)
-        return construct_expr(x, tarray(body.dtype), indices, aggregations)
+        return self._to_stream().scan(lambda x, y: f(x, y), zero).to_array()
 
     @typecheck_method(group_size=expr_int32)
     def grouped(self, group_size):
@@ -756,10 +690,13 @@ class ArrayExpression(CollectionExpression):
         :class:`.ArrayExpression`.
         """
         indices, aggregations = unify_all(self, group_size)
-        stream_ir = ir.StreamGrouped(ir.ToStream(self._ir), group_size._ir)
+        stream_ir = ir.StreamGrouped(ir.toStream(self._ir), group_size._ir)
         mapping_identifier = Env.get_uid("stream_grouped_map_to_arrays")
-        mapped_to_arrays = ir.StreamMap(stream_ir, mapping_identifier, ir.ToArray(ir.Ref(mapping_identifier)))
-        return construct_expr(ir.ToArray(mapped_to_arrays), tarray(self._type), indices, aggregations)
+        mapped_to_arrays = ir.StreamMap(stream_ir, mapping_identifier, ir.toArray(ir.Ref(mapping_identifier, tstream(self._type.element_type))))
+        return construct_expr(ir.toArray(mapped_to_arrays), tarray(self._type), indices, aggregations)
+
+    def _to_stream(self):
+        return construct_expr(ir.toStream(self._ir), tstream(self.dtype.element_type), self._indices, self._aggregations)
 
 
 class ArrayStructExpression(ArrayExpression):
@@ -1096,7 +1033,7 @@ class SetExpression(CollectionExpression):
         --------
 
         >>> hl.eval(s1.remove(1))
-        frozenset({2, 3})
+        {2, 3}
 
         Parameters
         ----------
@@ -1151,10 +1088,10 @@ class SetExpression(CollectionExpression):
         --------
 
         >>> hl.eval(s1.difference(s2))
-        frozenset({2})
+        {2}
 
         >>> hl.eval(s2.difference(s1))
-        frozenset({5})
+        {5}
 
         Parameters
         ----------
@@ -1180,7 +1117,7 @@ class SetExpression(CollectionExpression):
         --------
 
         >>> hl.eval(s1.intersection(s2))
-        frozenset({1, 3})
+        {1, 3}
 
         Parameters
         ----------
@@ -1235,7 +1172,7 @@ class SetExpression(CollectionExpression):
         --------
 
         >>> hl.eval(s1.union(s2))
-        frozenset({1, 2, 3, 5})
+        {1, 2, 3, 5}
 
         Parameters
         ----------
@@ -1336,10 +1273,10 @@ class SetExpression(CollectionExpression):
         --------
 
         >>> hl.eval(s1 - s2)
-        frozenset({2})
+        {2}
 
         >>> hl.eval(s2 - s1)
-        frozenset({5})
+        {5}
 
         Parameters
         ----------
@@ -1371,7 +1308,7 @@ class SetExpression(CollectionExpression):
         --------
 
         >>> hl.eval(s1 & s2)
-        frozenset({1, 3})
+        {1, 3}
 
         Parameters
         ----------
@@ -1399,7 +1336,7 @@ class SetExpression(CollectionExpression):
         --------
 
         >>> hl.eval(s1 | s2)
-        frozenset({1, 2, 3, 5})
+        {1, 2, 3, 5}
 
         Parameters
         ----------
@@ -1427,7 +1364,7 @@ class SetExpression(CollectionExpression):
         --------
 
         >>> hl.eval(s1 ^ s2)
-        frozenset({2, 5})
+        {2, 5}
 
         Parameters
         ----------
@@ -1797,13 +1734,24 @@ class StructExpression(Mapping[Union[str, int], Expression], Expression):
 
         for i, (f, t) in enumerate(self.dtype.items()):
             if isinstance(self._ir, ir.MakeStruct):
-                expr = construct_expr(self._ir.fields[i][1], t, self._indices,
+                expr = construct_expr(self._ir.fields[i][1],
+                                      t,
+                                      self._indices,
+                                      self._aggregations)
+            elif isinstance(self._ir, ir.SelectedTopLevelReference):
+                expr = construct_expr(ir.ProjectedTopLevelReference(self._ir.ref.name, f, t),
+                                      t,
+                                      self._indices,
                                       self._aggregations)
             elif isinstance(self._ir, ir.SelectFields):
-                expr = construct_expr(ir.GetField(self._ir.old, f), t, self._indices,
+                expr = construct_expr(ir.GetField(self._ir.old, f),
+                                      t,
+                                      self._indices,
                                       self._aggregations)
             else:
-                expr = construct_expr(ir.GetField(self._ir, f), t, self._indices,
+                expr = construct_expr(ir.GetField(self._ir, f),
+                                      t,
+                                      self._indices,
                                       self._aggregations)
             self._set_field(f, expr)
 
@@ -2916,6 +2864,14 @@ class StringExpression(Expression):
         else:
             return self._method("split", tarray(tstr), delim, n)
 
+    @typecheck_method(delim=expr_str, missing=expr_array(), quote=nullable(expr_str), regex=bool)
+    def _split_line(self, delim, missing, quote, regex):
+        regex_str = 'Regex' if regex else 'Char'
+        if quote is None:
+            return self._method(f"split{regex_str}", tarray(tstr), delim, missing)
+        else:
+            return self._method(f"splitQuoted{regex_str}", tarray(tstr), delim, missing, quote)
+
     def lower(self):
         """Returns a copy of the string, but with upper case letters converted
         to lower case.
@@ -3095,23 +3051,39 @@ class StringExpression(Expression):
         """
         return self._method('translate', tstr, mapping)
 
-    @typecheck_method(regex=expr_str)
-    def matches(self, regex):
-        """Returns ``True`` if the string contains any match for the given regex.
+    @typecheck_method(regex=expr_str, full_match=nullable(bool))
+    def matches(self, regex, full_match=False):
+        """Returns ``True`` if the string contains any match for the given regex if
+        `full_match` is false. Returns ``True`` if the whole string matches the
+        given regex if `full_match` is true.
 
         Examples
         --------
 
+        The `regex` parameter does not need to match the entire string if `full_match` is ``False``:
+
         >>> string = hl.literal('NA12878')
-
-        The `regex` parameter does not need to match the entire string:
-
         >>> hl.eval(string.matches('12'))
+        True
+
+        The `regex` parameter needs to match the entire string if `full_match` is ``True``:
+
+        >>> string = hl.literal('NA12878')
+        >>> hl.eval(string.matches('12', True))
+        False
+
+        >>> string = hl.literal('3412878')
+        >>> hl.eval(string.matches('^[0-9]*$'))
         True
 
         Regex motifs can be used to match sequences of characters:
 
+        >>> string = hl.literal('NA12878')
         >>> hl.eval(string.matches(r'NA\\d+'))
+        True
+
+        >>> string = hl.literal('3412878')
+        >>> hl.eval(string.matches('^[0-9]*$'))
         True
 
         Notes
@@ -3125,13 +3097,20 @@ class StringExpression(Expression):
         ----------
         regex: :class:`.StringExpression`
             Pattern to match.
+        full_match: :obj: `bool`
+            If ``True``, the function considers whether the whole string matches the regex.
+            If ``False``, the function considers whether the string has a partial match for that regex
 
         Returns
         -------
         :class:`.BooleanExpression`
-            ``True`` if the string contains any match for the regex, otherwise ``False``.
+            If `full_match` is ``False``,``True`` if the string contains any match for the regex, otherwise ``False``.
+            If `full_match` is ``True``,``True`` if the whole string matches the regex, otherwise ``False``.
         """
-        return regex._method("regexMatch", tbool, self)
+        if full_match is False:
+            return regex._method("regexMatch", tbool, self)
+        else:
+            return regex._method("regexFullMatch", tbool, self)
 
     def reverse(self):
         """Returns the reversed value.
@@ -3231,6 +3210,32 @@ class CallExpression(Expression):
                 raise TypeError("Call expects allele index to be an expression of type 'int32', "
                                 "found expression of type '{}'".format(item.dtype))
             return self._index(tint32, item)
+
+    def unphase(self):
+        """Returns an unphased version of this call.
+
+        Returns
+        -------
+        :class:`.CallExpression`
+        """
+        return self._method("unphase", tcall)
+
+    def contains_allele(self, allele):
+        """Returns true if the call has one or more called alleles of the given index.
+
+        >>> c = hl.call(0, 3)
+
+        >>> hl.eval(c.contains_allele(3))
+        True
+
+        >>> hl.eval(c.contains_allele(1))
+        False
+
+        Returns
+        -------
+        :class:`.BooleanExpression`
+        """
+        return self._method("containsAllele", tbool, allele)
 
     @property
     def ploidy(self):
@@ -4468,6 +4473,148 @@ class NDArrayNumericExpression(NDArrayExpression):
                 return result
 
 
+class StreamExpression(Expression):
+    @typecheck_method(f=func_spec(1, expr_bool))
+    def filter(self, f):
+        def unify_ret(t):
+            if t != tbool:
+                raise TypeError("'filter' expects 'f' to return an expression of type 'bool', found '{}'".format(t))
+            return hl.tstream(self._type.element_type)
+
+        def transform_ir(stream, name, body):
+            return ir.StreamFilter(stream, name, body)
+
+        return self._ir_lambda_method(transform_ir, f, self.dtype.element_type, unify_ret)
+
+    @typecheck_method(n=expr_int32)
+    def take(self, n):
+        indices, aggregations = unify_all(self, n)
+        take_ir = ir.StreamTake(self._ir, n._ir)
+        return construct_expr(take_ir, self.dtype, indices, aggregations)
+
+    @typecheck_method(f=func_spec(1, expr_any))
+    def map(self, f):
+        def transform_ir(stream, name, body):
+            return ir.StreamMap(stream, name, body)
+
+        return self._ir_lambda_method(transform_ir, f, self.dtype.element_type, lambda t: hl.tstream(t))
+
+    @typecheck_method(f=func_spec(1, expr_any))
+    def flatmap(self, f):
+        value_type = f(construct_variable(Env.get_uid(), self.dtype.element_type)).dtype
+
+        if not isinstance(value_type, tstream):
+            raise TypeError(f"'flatmap' expects 'f' to return an expression of type tstream, found '{value_type}'")
+
+        def transform_ir(stream, name, body):
+            return ir.StreamFlatMap(stream, name, body)
+
+        return self._ir_lambda_method(transform_ir, f, self.dtype.element_type, identity)
+
+    @typecheck_method(f=func_spec(2, expr_any), zero=expr_any)
+    def fold(self, f, zero):
+        indices, aggregations = unify_all(self, zero)
+        accum_name = Env.get_uid()
+        elt_name = Env.get_uid()
+
+        accum_ref = construct_variable(accum_name, zero.dtype, indices, aggregations)
+        elt_ref = construct_variable(elt_name, self.dtype.element_type, self._indices, self._aggregations)
+        body = to_expr(f(accum_ref, elt_ref))
+
+        if body.dtype != zero.dtype:
+            zero_coercer = coercer_from_dtype(zero.dtype)
+            if zero_coercer.can_coerce(body.dtype):
+                body = zero_coercer.coerce(body)
+            else:
+                body_coercer = coercer_from_dtype(body.dtype)
+                if body_coercer.can_coerce(zero.dtype):
+                    zero_coerced = body_coercer.coerce(zero)
+                    accum_ref = construct_variable(accum_name, zero_coerced.dtype, indices, aggregations)
+                    new_body = to_expr(f(accum_ref, elt_ref))
+                    if body_coercer.can_coerce(new_body.dtype):
+                        body = body_coercer.coerce(new_body)
+                        zero = zero_coerced
+
+        if body.dtype != zero.dtype:
+            raise ExpressionException("'StreamExpression.fold' must take function returning "
+                                      "same expression type as zero value: \n"
+                                      "    zero.dtype: {}\n"
+                                      "    f.dtype: {}".format(zero.dtype, body.dtype))
+
+        x = ir.StreamFold(self._ir, zero._ir, accum_name, elt_name, body._ir)
+
+        indices, aggregations = unify_all(self, zero, body)
+        return construct_expr(x, body.dtype, indices, aggregations)
+
+    @typecheck_method(f=func_spec(2, expr_any), zero=expr_any)
+    def scan(self, f, zero):
+        indices, aggregations = unify_all(self, zero)
+        accum_name = Env.get_uid()
+        elt_name = Env.get_uid()
+
+        accum_ref = construct_variable(accum_name, zero.dtype, indices, aggregations)
+        elt_ref = construct_variable(elt_name, self.dtype.element_type, self._indices, self._aggregations)
+        body = to_expr(f(accum_ref, elt_ref))
+
+        if body.dtype != zero.dtype:
+            zero_coercer = coercer_from_dtype(zero.dtype)
+            if zero_coercer.can_coerce(body.dtype):
+                body = zero_coercer.coerce(body)
+            else:
+                body_coercer = coercer_from_dtype(body.dtype)
+                if body_coercer.can_coerce(zero.dtype):
+                    zero_coerced = body_coercer.coerce(zero)
+                    accum_ref = construct_variable(accum_name, zero_coerced.dtype, indices, aggregations)
+                    new_body = to_expr(f(accum_ref, elt_ref))
+                    if body_coercer.can_coerce(new_body.dtype):
+                        body = body_coercer.coerce(new_body)
+                        zero = zero_coerced
+
+        if body.dtype != zero.dtype:
+            raise ExpressionException("'StreamExpression.scan' must take function returning "
+                                      "same expression type as zero value: \n"
+                                      "    zero.dtype: {}\n"
+                                      "    f.dtype: {}".format(zero.dtype, body.dtype))
+
+        x = ir.StreamScan(self._ir, zero._ir, accum_name, elt_name, body._ir)
+
+        indices, aggregations = unify_all(self, zero, body)
+        return construct_expr(x, tstream(body.dtype), indices, aggregations)
+
+    def to_array(self):
+        return construct_expr(ir.toArray(self._ir), tarray(self.dtype.element_type), self._indices, self._aggregations)
+
+    @typecheck_method(start=expr_int32, index_first=bool)
+    def zip_with_index(self, start, index_first=True):
+        indices, aggs = unify_all(self, start)
+        elt = Env.get_uid()
+        idx = Env.get_uid()
+        elt_type = self.dtype.element_type
+        if index_first:
+            tuple = ir.MakeTuple([ir.Ref(idx, tint32), ir.Ref(elt, elt_type)])
+        else:
+            tuple = ir.MakeTuple([ir.Ref(elt, elt_type), ir.Ref(idx, tint32)])
+        return construct_expr(
+            ir.StreamZip(
+                [self._ir, ir.StreamIota(start._ir, ir.I32(1))],
+                [elt, idx],
+                tuple,
+                'TakeMinLength'
+            ),
+            hl.tstream(hl.ttuple(hl.tint32, elt_type) if index_first else hl.ttuple(elt_type, hl.tint32)),
+            indices,
+            aggs
+        )
+
+    @typecheck_method(group_size=expr_int32)
+    def grouped(self, group_size):
+        indices, aggregations = unify_all(self, group_size)
+        stream_ir = ir.StreamGrouped(self._ir, group_size._ir)
+        mapping_identifier = Env.get_uid("stream_grouped_map_to_arrays")
+        mapped_to_arrays = ir.StreamMap(stream_ir, mapping_identifier, ir.toArray(ir.Ref(mapping_identifier, tstream(self._type.element_type))))
+        return construct_expr(mapped_to_arrays, tstream(tarray(self._type.element_type)), indices, aggregations)
+
+
 scalars = {tbool: BooleanExpression,
            tint32: Int32Expression,
            tint64: Int64Expression,
@@ -4482,6 +4629,7 @@ typ_to_expr = {
     tcall: CallExpression,
     tdict: DictExpression,
     tarray: ArrayExpression,
+    tstream: StreamExpression,
     tset: SetExpression,
     tstruct: StructExpression,
     ttuple: TupleExpression,
@@ -4502,7 +4650,8 @@ def construct_expr(x: ir.IR,
                    aggregations: LinkedList = LinkedList(Aggregation)):
     if type is None:
         return Expression(x, None, indices, aggregations)
-    elif isinstance(type, tarray) and is_numeric(type.element_type):
+    x.assign_type(type)
+    if isinstance(type, tarray) and is_numeric(type.element_type):
         return ArrayNumericExpression(x, type, indices, aggregations)
     elif isinstance(type, tarray):
         etype = type.element_type
@@ -4535,7 +4684,7 @@ def construct_expr(x: ir.IR,
 @typecheck(name=str, type=HailType, indices=Indices)
 def construct_reference(name, type, indices):
     assert isinstance(type, hl.tstruct)
-    x = ir.SelectFields(ir.TopLevelReference(name), list(type))
+    x = ir.SelectedTopLevelReference(name, type)
     return construct_expr(x, type, indices)
 
 
@@ -4543,4 +4692,4 @@ def construct_reference(name, type, indices):
 def construct_variable(name, type,
                        indices: Indices = Indices(),
                        aggregations: LinkedList = LinkedList(Aggregation)):
-    return construct_expr(ir.Ref(name), type, indices, aggregations)
+    return construct_expr(ir.Ref(name, type), type, indices, aggregations)

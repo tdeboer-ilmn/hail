@@ -1,23 +1,25 @@
-from typing import Set
-import os
-from aiohttp import web
-import jinja2
 import logging
+import os
+from typing import Set
+
 import aiohttp_session
+import jinja2
+from aiohttp import web
 from prometheus_async.aio.web import server_stats  # type: ignore
 
-from hailtop.config import get_deploy_config
-from hailtop.tls import internal_server_ssl_context
-from hailtop.hail_logging import AccessLogger
+from gear import AuthClient, monitor_endpoints_middleware, setup_aiohttp_session
 from hailtop import httpx
-from gear import setup_aiohttp_session, web_maybe_authenticated_user, monitor_endpoints_middleware
-from web_common import setup_aiohttp_jinja2, setup_common_static_routes, render_template, sass_compile
-
+from hailtop.config import get_deploy_config
+from hailtop.hail_logging import AccessLogger
+from hailtop.tls import internal_server_ssl_context
+from web_common import render_template, sass_compile, setup_aiohttp_jinja2, setup_common_static_routes
 
 MODULE_PATH = os.path.dirname(__file__)
 log = logging.getLogger('website')
 deploy_config = get_deploy_config()
 routes = web.RouteTableDef()
+
+auth = AuthClient()
 
 
 def redirect(from_url, to_url):
@@ -48,9 +50,7 @@ redirect('/docs/0.1/', 'index.html')
 
 
 DOCS_PATH = f'{MODULE_PATH}/docs/'
-STATIC_DOCS_PATHS = ['0.2/_static', '0.2/_sources',
-                     'batch',
-                     '0.1']
+STATIC_DOCS_PATHS = ['0.2/_static', '0.2/_sources', 'batch', '0.1']
 FQ_STATIC_DOCS_PATHS: Set[str] = set()
 
 
@@ -68,7 +68,7 @@ docs_pages = set(
 
 
 @routes.get('/docs/{tail:.*}')
-@web_maybe_authenticated_user
+@auth.web_maybe_authenticated_user
 async def serve_docs(request, userdata):
     tail = request.match_info['tail']
     if tail in docs_pages:
@@ -80,7 +80,7 @@ async def serve_docs(request, userdata):
 
 
 def make_template_handler(template_fname):
-    @web_maybe_authenticated_user
+    @auth.web_maybe_authenticated_user
     async def serve(request, userdata):
         return await render_template('www', request, userdata, template_fname, dict())
 

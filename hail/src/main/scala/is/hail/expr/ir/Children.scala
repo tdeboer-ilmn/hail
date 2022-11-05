@@ -65,9 +65,9 @@ object Children {
       Array(start, step)
     case StreamRange(start, stop, step, _, _) =>
       Array(start, stop, step)
-    case SeqSample(totalRange, numToSample, _) =>
-      Array(totalRange, numToSample)
-    case StreamDistribute(child, pivots, path, _) =>
+    case SeqSample(totalRange, numToSample, rngState, _) =>
+      Array(totalRange, numToSample, rngState)
+    case StreamDistribute(child, pivots, path, _, _) =>
       Array(child, pivots, path)
     case ArrayZeros(length) =>
       Array(length)
@@ -95,6 +95,9 @@ object Children {
       Array(orderedCollection, elem)
     case GroupByKey(collection) =>
       Array(collection)
+    case RNGStateLiteral(_) => none
+    case RNGSplit(state, split) =>
+      Array(state, split)
     case StreamLen(a) =>
       Array(a)
     case StreamTake(a, len) =>
@@ -103,7 +106,7 @@ object Children {
       Array(a, len)
     case StreamGrouped(a, size) =>
       Array(a, size)
-    case StreamGroupByKey(a, _) =>
+    case StreamGroupByKey(a, _, _) =>
       Array(a)
     case StreamMap(a, name, body) =>
       Array(a, body)
@@ -135,6 +138,8 @@ object Children {
       Array(a, query)
     case StreamAggScan(a, name, query) =>
       Array(a, query)
+    case StreamBufferedAggregate(streamChild, initAggs, newKey, seqOps, _, _, _) =>
+      Array(streamChild, initAggs, newKey, seqOps)
     case RunAggScan(array, _, init, seq, result, _) =>
       Array(array, init, seq, result)
     case RunAgg(body, result, _) =>
@@ -210,8 +215,8 @@ object Children {
       args.toFastIndexedSeq
     case Apply(_, _, args, _, _) =>
       args.toFastIndexedSeq
-    case ApplySeeded(_, args, seed, _) =>
-      args.toFastIndexedSeq
+    case ApplySeeded(_, args, rngState, seed, _) =>
+      args.toFastIndexedSeq :+ rngState
     case ApplySpecial(_, _, args, _, _) =>
       args.toFastIndexedSeq
     // from MatrixIR
@@ -233,7 +238,7 @@ object Children {
     case BlockMatrixCollect(child) => Array(child)
     case BlockMatrixWrite(child, _) => Array(child)
     case BlockMatrixMultiWrite(blockMatrices, _) => blockMatrices
-    case CollectDistributedArray(ctxs, globals, _, _, body, _) => Array(ctxs, globals, body)
+    case CollectDistributedArray(ctxs, globals, _, _, body, dynamicID, _, _) => Array(ctxs, globals, body, dynamicID)
     case ReadPartition(path, _, _) => Array(path)
     case WritePartition(stream, ctx, _) => Array(stream, ctx)
     case WriteMetadata(writeAnnotations, _) => Array(writeAnnotations)

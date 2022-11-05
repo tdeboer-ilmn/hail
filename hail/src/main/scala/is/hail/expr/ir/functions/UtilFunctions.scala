@@ -16,13 +16,25 @@ import scala.reflect.ClassTag
 
 object UtilFunctions extends RegistryFunctions {
 
-  def parseBoolean(s: String): Boolean = s.toBoolean
+  def parseBoolean(s: String, errID: Int): Boolean = try {
+    s.toBoolean
+  } catch {
+    case _: IllegalArgumentException => fatal(s"cannot parse boolean from input string '${StringEscapeUtils.escapeString(s)}'", errID)
+  }
 
-  def parseInt32(s: String): Int = s.toInt
+  def parseInt32(s: String, errID: Int): Int = try {
+    s.toInt
+  } catch {
+    case _: IllegalArgumentException => fatal(s"cannot parse int32 from input string '${StringEscapeUtils.escapeString(s)}'", errID)
+  }
 
-  def parseInt64(s: String): Long = s.toLong
+  def parseInt64(s: String, errID: Int): Long = try {
+    s.toLong
+  } catch {
+    case _: IllegalArgumentException => fatal(s"cannot parse int64 from input string '${StringEscapeUtils.escapeString(s)}'", errID)
+  }
 
-  def parseSpecialNum32(s: String): Float = {
+  def parseSpecialNum32(s: String, errID: Int): Float = {
     s.length match {
       case 3 =>
         if (s.equalsCaseInsensitive("nan")) return Float.NaN
@@ -38,10 +50,10 @@ object UtilFunctions extends RegistryFunctions {
         if (s.equalsCaseInsensitive("-infinity")) return Float.NegativeInfinity
       case _ =>
     }
-    throw new NumberFormatException(s"cannot parse float32 from $s")
+    fatal(s"cannot parse float32 from input string '${StringEscapeUtils.escapeString(s)}'", errID)
   }
 
-  def parseSpecialNum64(s: String): Double = {
+  def parseSpecialNum64(s: String, errID: Int): Double = {
     s.length match {
       case 3 =>
         if (s.equalsCaseInsensitive("nan")) return Double.NaN
@@ -57,24 +69,24 @@ object UtilFunctions extends RegistryFunctions {
         if (s.equalsCaseInsensitive("-infinity")) return Double.NegativeInfinity
       case _ =>
     }
-    throw new NumberFormatException(s"cannot parse float64 from $s")
+    fatal(s"cannot parse float64 from input string '${StringEscapeUtils.escapeString(s)}'", errID)
   }
 
-  def parseFloat32(s: String): Float = {
+  def parseFloat32(s: String, errID: Int): Float = {
     try {
       s.toFloat
     } catch {
       case _: NumberFormatException =>
-        parseSpecialNum32(s)
+        parseSpecialNum32(s, errID)
     }
   }
 
-  def parseFloat64(s: String): Double = {
+  def parseFloat64(s: String, errID: Int): Double = {
     try {
       s.toDouble
     } catch {
       case _: NumberFormatException =>
-        parseSpecialNum64(s)
+        parseSpecialNum64(s, errID)
     }
   }
 
@@ -96,17 +108,19 @@ object UtilFunctions extends RegistryFunctions {
     }
 
   def isValidFloat32(s: String): Boolean = try {
-    parseFloat32(s)
+    parseFloat32(s, -1)
     true
   } catch {
     case _: NumberFormatException => false
+    case _: HailException => false
   }
 
   def isValidFloat64(s: String): Boolean = try {
-    parseFloat64(s)
+    parseFloat64(s, -1)
     true
   } catch {
     case _: NumberFormatException => false
+    case _: HailException => false
   }
 
   def min_ignore_missing(l: Int, lMissing: Boolean, r: Int, rMissing: Boolean): Int =
@@ -176,24 +190,24 @@ object UtilFunctions extends RegistryFunctions {
     }) {
       case (er, cb, rt, l, r, tol, abs, _) =>
         assert(l.st.virtualType == r.st.virtualType, s"\n  lt=${ l.st.virtualType }\n  rt=${ r.st.virtualType }")
-        val lb = scodeToJavaValue(cb, er.region, l)
-        val rb = scodeToJavaValue(cb, er.region, r)
-        primitive(cb.memoize(er.mb.getType(l.st.virtualType).invoke[Any, Any, Double, Boolean, Boolean]("valuesSimilar", lb, rb, tol.asDouble.doubleCode(cb), abs.asBoolean.boolCode(cb))))
+        val lb = svalueToJavaValue(cb, er.region, l)
+        val rb = svalueToJavaValue(cb, er.region, r)
+        primitive(cb.memoize(er.mb.getType(l.st.virtualType).invoke[Any, Any, Double, Boolean, Boolean]("valuesSimilar", lb, rb, tol.asDouble.value, abs.asBoolean.value)))
     }
 
     registerCode1("triangle", TInt32, TInt32, (_: Type, _: SType) => SInt32) { case (cb, _, rt, nn) =>
-      val n = nn.asInt.intCode(cb)
+      val n = nn.asInt.value
       cb.memoize((n * (n + 1)) / 2)
     }
 
     registerSCode1("toInt32", TBoolean, TInt32, (_: Type, _: SType) => SInt32) { case (_, cb, _, x, _) =>
-      primitive(cb.memoize(x.asBoolean.boolCode(cb).toI)) }
+      primitive(cb.memoize(x.asBoolean.value.toI)) }
     registerSCode1("toInt64", TBoolean, TInt64, (_: Type, _: SType) => SInt64) { case (_, cb, _, x, _) =>
-      primitive(cb.memoize(x.asBoolean.boolCode(cb).toI.toL)) }
+      primitive(cb.memoize(x.asBoolean.value.toI.toL)) }
     registerSCode1("toFloat32", TBoolean, TFloat32, (_: Type, _: SType) => SFloat32) { case (_, cb, _, x, _) =>
-      primitive(cb.memoize(x.asBoolean.boolCode(cb).toI.toF)) }
+      primitive(cb.memoize(x.asBoolean.value.toI.toF)) }
     registerSCode1("toFloat64", TBoolean, TFloat64, (_: Type, _: SType) => SFloat64) { case (_, cb, _, x, _) =>
-      primitive(cb.memoize(x.asBoolean.boolCode(cb).toI.toD)) }
+      primitive(cb.memoize(x.asBoolean.value.toI.toD)) }
 
     for ((name, t, rpt, ct) <- Seq[(String, Type, SType, ClassTag[_])](
       ("Boolean", TBoolean, SBoolean, implicitly[ClassTag[Boolean]]),
@@ -204,17 +218,17 @@ object UtilFunctions extends RegistryFunctions {
     )) {
       val ctString: ClassTag[String] = implicitly[ClassTag[String]]
       registerSCode1(s"to$name", TString, t, (_: Type, _: SType) => rpt) {
-        case (r, cb, rt, x: SStringValue, _) =>
+        case (r, cb, rt, x: SStringValue, err) =>
           val s = x.loadString(cb)
-          primitive(rt.virtualType, cb.memoizeAny(Code.invokeScalaObject1(thisClass, s"parse$name", s)(ctString, ct), typeInfoFromClassTag(ct)))
+          primitive(rt.virtualType, cb.memoizeAny(Code.invokeScalaObject2(thisClass, s"parse$name", s, err)(ctString, implicitly[ClassTag[Int]], ct), typeInfoFromClassTag(ct)))
       }
       registerIEmitCode1(s"to${name}OrMissing", TString, t, (_: Type, _: EmitType) => EmitType(rpt, false)) {
-        case (cb, r, rt, _, x) =>
+        case (cb, r, rt, err, x) =>
           x.toI(cb).flatMap(cb) { case sc: SStringValue =>
             val sv = cb.newLocal[String]("s", sc.loadString(cb))
             IEmitCode(cb,
               !Code.invokeScalaObject1[String, Boolean](thisClass, s"isValid$name", sv),
-              primitive(rt.virtualType, cb.memoizeAny(Code.invokeScalaObject1(thisClass, s"parse$name", sv)(ctString, ct), typeInfoFromClassTag(ct))))
+              primitive(rt.virtualType, cb.memoizeAny(Code.invokeScalaObject2(thisClass, s"parse$name", sv, err)(ctString, implicitly[ClassTag[Int]], ct), typeInfoFromClassTag(ct))))
           }
       }
     }
@@ -227,12 +241,12 @@ object UtilFunctions extends RegistryFunctions {
     Array("min", "max").foreach { name =>
       registerCode2(name, TFloat32, TFloat32, TFloat32, (_: Type, _: SType, _: SType) => SFloat32) {
         case (cb, r, rt, v1, v2) =>
-          cb.memoize(Code.invokeStatic2[Math, Float, Float, Float](name, v1.asFloat.floatCode(cb), v2.asFloat.floatCode(cb)))
+          cb.memoize(Code.invokeStatic2[Math, Float, Float, Float](name, v1.asFloat.value, v2.asFloat.value))
       }
 
       registerCode2(name, TFloat64, TFloat64, TFloat64, (_: Type, _: SType, _: SType) => SFloat64) {
         case (cb, r, rt, v1, v2) =>
-          cb.memoize(Code.invokeStatic2[Math, Double, Double, Double](name, v1.asDouble.doubleCode(cb), v2.asDouble.doubleCode(cb)))
+          cb.memoize(Code.invokeStatic2[Math, Double, Double, Double](name, v1.asDouble.value, v2.asDouble.value))
       }
 
       val ignoreMissingName = name + "_ignore_missing"
@@ -241,12 +255,12 @@ object UtilFunctions extends RegistryFunctions {
 
       registerCode2(ignoreNanName, TFloat32, TFloat32, TFloat32, (_: Type, _: SType, _: SType) => SFloat32) {
         case (cb, r, rt, v1, v2) =>
-          cb.memoize(Code.invokeScalaObject2[Float, Float, Float](thisClass, ignoreNanName, v1.asFloat.floatCode(cb), v2.asFloat.floatCode(cb)))
+          cb.memoize(Code.invokeScalaObject2[Float, Float, Float](thisClass, ignoreNanName, v1.asFloat.value, v2.asFloat.value))
       }
 
       registerCode2(ignoreNanName, TFloat64, TFloat64, TFloat64, (_: Type, _: SType, _: SType) => SFloat64) {
         case (cb, r, rt, v1, v2) =>
-          cb.memoize(Code.invokeScalaObject2[Double, Double, Double](thisClass, ignoreNanName, v1.asDouble.doubleCode(cb), v2.asDouble.doubleCode(cb)))
+          cb.memoize(Code.invokeScalaObject2[Double, Double, Double](thisClass, ignoreNanName, v1.asDouble.value, v2.asDouble.value))
       }
 
       def ignoreMissingTriplet[T](cb: EmitCodeBuilder, rt: SType, v1: EmitCode, v2: EmitCode, name: String, f: (Code[T], Code[T]) => Code[T])(implicit ct: ClassTag[T], ti: TypeInfo[T]): IEmitCode = {
@@ -303,7 +317,7 @@ object UtilFunctions extends RegistryFunctions {
 
     registerSCode2("format", TString, tv("T", "tuple"), TString, (_: Type, _: SType, _: SType) => SJavaString) {
       case (r, cb, st: SJavaString.type, format, args, _) =>
-        val javaObjArgs = Code.checkcast[Row](scodeToJavaValue(cb, r.region, args))
+        val javaObjArgs = Code.checkcast[Row](svalueToJavaValue(cb, r.region, args))
         val formatted = Code.invokeScalaObject2[String, Row, String](thisClass, "format", format.asString.loadString(cb), javaObjArgs)
         st.construct(cb, formatted)
     }
@@ -312,8 +326,8 @@ object UtilFunctions extends RegistryFunctions {
       case (cb, _, rt,_ , l, r) =>
         if (l.required && r.required) {
           val result = cb.newLocal[Boolean]("land_result")
-          cb.ifx(l.toI(cb).get(cb).asBoolean.boolCode(cb), {
-            cb.assign(result, r.toI(cb).get(cb).asBoolean.boolCode(cb))
+          cb.ifx(l.toI(cb).get(cb).asBoolean.value, {
+            cb.assign(result, r.toI(cb).get(cb).asBoolean.value)
           }, {
             cb.assign(result, const(false))
           })
@@ -329,7 +343,7 @@ object UtilFunctions extends RegistryFunctions {
           l.toI(cb)
             .consume(cb,
               cb.assign(w, 1),
-              b1 => cb.assign(w, b1.asBoolean.boolCode(cb).mux(const(2), const(0)))
+              b1 => cb.assign(w, b1.asBoolean.value.mux(const(2), const(0)))
             )
 
           cb.ifx(w.cne(0),
@@ -337,7 +351,7 @@ object UtilFunctions extends RegistryFunctions {
               r.toI(cb).consume(cb,
                 cb.assign(w, w | const(4)),
                 { b2 =>
-                  cb.assign(w, w | b2.asBoolean.boolCode(cb).mux(const(8), const(0)))
+                  cb.assign(w, w | b2.asBoolean.value.mux(const(8), const(0)))
                 }
               )
             })
@@ -350,10 +364,10 @@ object UtilFunctions extends RegistryFunctions {
       case (cb, _, rt,_, l, r) =>
         if (l.required && r.required) {
           val result = cb.newLocal[Boolean]("land_result")
-          cb.ifx(l.toI(cb).get(cb).asBoolean.boolCode(cb), {
+          cb.ifx(l.toI(cb).get(cb).asBoolean.value, {
             cb.assign(result, const(true))
           }, {
-            cb.assign(result, r.toI(cb).get(cb).asBoolean.boolCode(cb))
+            cb.assign(result, r.toI(cb).get(cb).asBoolean.value)
           })
 
           IEmitCode.present(cb, primitive(result))
@@ -367,7 +381,7 @@ object UtilFunctions extends RegistryFunctions {
           l.toI(cb)
             .consume(cb,
               cb.assign(w, 1),
-              b1 => cb.assign(w, b1.asBoolean.boolCode(cb).mux(const(2), const(0)))
+              b1 => cb.assign(w, b1.asBoolean.value.mux(const(2), const(0)))
             )
 
           cb.ifx(w.cne(2),
@@ -375,7 +389,7 @@ object UtilFunctions extends RegistryFunctions {
               r.toI(cb).consume(cb,
                 cb.assign(w, w | const(4)),
                 { b2 =>
-                  cb.assign(w, w | b2.asBoolean.boolCode(cb).mux(const(8), const(0)))
+                  cb.assign(w, w | b2.asBoolean.value.mux(const(8), const(0)))
                 }
               )
             })

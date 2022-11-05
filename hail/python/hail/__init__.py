@@ -1,21 +1,10 @@
-import pkg_resources
-import sys
-import asyncio
-import nest_asyncio
+from typing import Optional  # noqa: E402
+import pkg_resources  # noqa: E402
+import sys  # noqa: E402
 
 if sys.version_info < (3, 6):
     raise EnvironmentError('Hail requires Python 3.6 or later, found {}.{}'.format(
         sys.version_info.major, sys.version_info.minor))
-
-if sys.version_info[:2] == (3, 6):
-    if asyncio._get_running_loop() is not None:
-        nest_asyncio.apply()
-else:
-    try:
-        asyncio.get_running_loop()
-        nest_asyncio.apply()
-    except RuntimeError as err:
-        assert 'no running event loop' in err.args[0]
 
 
 __pip_version__ = pkg_resources.resource_string(__name__, 'hail_pip_version').decode().strip()
@@ -52,6 +41,7 @@ from . import methods  # noqa: E402
 from . import stats  # noqa: E402
 from . import linalg  # noqa: E402
 from . import plot  # noqa: E402
+from . import ggplot  # noqa: E402
 from . import experimental  # noqa: E402
 from . import ir  # noqa: E402
 from . import backend  # noqa: E402
@@ -62,16 +52,17 @@ from hail.utils import (Struct, Interval, hadoop_copy, hadoop_open, hadoop_ls,  
                         hadoop_stat, hadoop_exists, hadoop_is_file,
                         hadoop_is_dir, hadoop_scheme_supported, copy_log)
 
-from .context import (init, init_local, stop, spark_context, tmp_dir, default_reference,  # noqa: E402
-                      get_reference, set_global_seed, _set_flags, _get_flags, current_backend,
-                      debug_info, citation, cite_hail, cite_hail_bibtex, version, TemporaryFilename,
-                      TemporaryDirectory)
+from .context import (init, init_local, init_batch, stop, spark_context, tmp_dir,  # noqa: E402
+                      default_reference, get_reference, set_global_seed, _set_flags, _get_flags, _with_flags,
+                      _async_current_backend, current_backend, debug_info, citation, cite_hail,
+                      cite_hail_bibtex, version, TemporaryFilename, TemporaryDirectory)
 
 scan = agg.aggregators.ScanFunctions({name: getattr(agg, name) for name in agg.__all__})
 
 __all__ = [
     'init',
     'init_local',
+    'init_batch',
     'stop',
     'spark_context',
     'tmp_dir',
@@ -82,6 +73,7 @@ __all__ = [
     'set_global_seed',
     '_set_flags',
     '_get_flags',
+    '_with_flags',
     'Table',
     'GroupedTable',
     'MatrixTable',
@@ -107,10 +99,12 @@ __all__ = [
     'linalg',
     'nd',
     'plot',
+    'ggplot',
     'experimental',
     'ir',
     'vds',
     'backend',
+    '_async_current_backend',
     'current_backend',
     'debug_info',
     'citation',
@@ -131,7 +125,8 @@ del builtins
 ir.register_functions()
 ir.register_aggregators()
 
-__version__ = None  # set in hail.init()
+__version__: Optional[str] = None  # set by hail.version()
+__revision__: Optional[str] = None  # set by hail.revision()
 
 import warnings  # noqa: E402
 

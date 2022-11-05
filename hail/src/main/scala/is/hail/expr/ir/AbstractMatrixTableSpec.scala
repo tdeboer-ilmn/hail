@@ -13,6 +13,7 @@ import org.json4s.jackson.JsonMethods
 import org.json4s.jackson.JsonMethods.parse
 
 import java.io.OutputStreamWriter
+import scala.collection.mutable
 import scala.language.{existentials, implicitConversions}
 
 abstract class ComponentSpec
@@ -20,7 +21,7 @@ abstract class ComponentSpec
 object RelationalSpec {
   implicit val formats: Formats = new DefaultFormats() {
     override val typeHints = ShortTypeHints(List(
-      classOf[ComponentSpec], classOf[RVDComponentSpec], classOf[PartitionCountsComponentSpec],
+      classOf[ComponentSpec], classOf[RVDComponentSpec], classOf[PartitionCountsComponentSpec], classOf[PropertiesSpec],
       classOf[RelationalSpec], classOf[MatrixTableSpec], classOf[TableSpec]), typeHintFieldName="name")
   } +
     new TableTypeSerializer +
@@ -88,9 +89,13 @@ abstract class RelationalSpec {
 
   def getComponent[T <: ComponentSpec](name: String): T = components(name).asInstanceOf[T]
 
+  def getOptionalComponent[T <: ComponentSpec](name: String): Option[T] = components.get(name).map(_.asInstanceOf[T])
+
   def globalsComponent: RVDComponentSpec = getComponent[RVDComponentSpec]("globals")
 
   def partitionCounts: Array[Long] = getComponent[PartitionCountsComponentSpec]("partition_counts").counts.toArray
+
+  def isDistinctlyKeyed: Boolean = getOptionalComponent[PropertiesSpec]("properties").flatMap(_.properties.values.get("distinctlyKeyed").map(_.asInstanceOf[Boolean])).getOrElse(false)
 
   def indexed: Boolean
 
@@ -102,31 +107,17 @@ abstract class RelationalSpec {
 case class RVDComponentSpec(rel_path: String) extends ComponentSpec {
   def absolutePath(path: String): String = path + "/" + rel_path
 
-  def rvdSpec(fs: FS, path: String): AbstractRVDSpec =
-    AbstractRVDSpec.read(fs, absolutePath(path))
+  private[this] val specCache = mutable.Map.empty[String, AbstractRVDSpec]
+  def rvdSpec(fs: FS, path: String): AbstractRVDSpec = {
+    specCache.getOrElseUpdate(path, AbstractRVDSpec.read(fs, absolutePath(path)))
+  }
 
   def indexed(fs: FS, path: String): Boolean = rvdSpec(fs, path).indexed
-
-  def read(
-    ctx: ExecuteContext,
-    path: String,
-    requestedType: TStruct,
-    newPartitioner: Option[RVDPartitioner] = None,
-    filterIntervals: Boolean = false
-  ): RVD = {
-    val rvdPath = path + "/" + rel_path
-    rvdSpec(ctx.fs, path)
-      .read(ctx, rvdPath, requestedType, newPartitioner, filterIntervals)
-  }
-
-  def readLocalSingleRow(ctx: ExecuteContext, path: String, requestedType: TStruct): (PStruct, Long) = {
-    val rvdPath = path + "/" + rel_path
-    rvdSpec(ctx.fs, path)
-      .readLocalSingleRow(ctx, rvdPath, requestedType)
-  }
 }
 
 case class PartitionCountsComponentSpec(counts: Seq[Long]) extends ComponentSpec
+
+case class PropertiesSpec(properties: JObject) extends ComponentSpec
 
 abstract class AbstractMatrixTableSpec extends RelationalSpec {
   def matrix_type: MatrixType
@@ -212,5 +203,5 @@ class MatrixTableSpec(
 }
 
 object FileFormat {
-  val version: SemanticVersion = SemanticVersion(1, 5, 0)
+  val version: SemanticVersion = SemanticVersion(1, 6, 0)
 }

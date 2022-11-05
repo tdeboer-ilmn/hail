@@ -92,8 +92,6 @@ def test_conversion_equivalence():
     assert svcr._same(svcr_readback)
 
 
-@fails_local_backend
-@fails_service_backend
 def test_sampleqc_old_new_equivalence():
     vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_chr22_5_samples.vds'))
     sqc = hl.vds.sample_qc(vds)
@@ -120,11 +118,33 @@ def test_sampleqc_old_new_equivalence():
         'r_insertion_deletion'
     ]
 
-    res.sample_qc.describe()
-    sqc.describe()
     assert res.aggregate_cols(hl.all(
         *(hl.agg.all(res.sample_qc[field] == res.sample_qc_new[field]) for field in fields_to_test)
     ))
+
+
+def test_sampleqc_gq_dp():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_chr22_5_samples.vds'))
+    sqc = hl.vds.sample_qc(vds)
+
+    assert hl.eval(sqc.index_globals()) == hl.Struct(gq_bins=(0, 20, 60), dp_bins=(0, 1, 10, 20, 30))
+
+    hg00320 = sqc.filter(sqc.s == 'HG00320').select('bases_over_gq_threshold', 'bases_over_dp_threshold').collect()[0]
+    assert hg00320 == hl.Struct(s='HG00320',
+                                bases_over_gq_threshold=(334822, 515, 82),
+                                bases_over_dp_threshold=(334822, 10484, 388, 111, 52))
+
+
+def test_sampleqc_singleton_r_ti_tv():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_chr22_5_samples.vds'))
+    sqc = hl.vds.sample_qc(vds)
+
+    hg00313 = sqc.filter(sqc.s == 'HG00313').select('r_ti_tv_singleton', 'n_singleton_ti', 'n_singleton_tv').collect()[0]
+    assert hg00313 == hl.Struct(s='HG00313',
+                                r_ti_tv_singleton=4.0,
+                                n_singleton_ti=4,
+                                n_singleton_tv=1)
+
 
 
 def test_filter_samples_and_merge():
@@ -152,8 +172,22 @@ def test_filter_samples_and_merge():
     assert merged.variant_data._same(vds.variant_data)
 
 
-@fails_local_backend
-@fails_service_backend
+def test_filter_samples_array():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_chr22_5_samples.vds'))
+
+    samples = ['HG00187', 'HG00190']
+    other = ['HG00308', 'HG00313', 'HG00320']
+
+    filt_in = hl.vds.filter_samples(vds, samples, keep=True)
+    filt_out = hl.vds.filter_samples(vds, samples, keep=False)
+
+    assert filt_in.reference_data.s.collect() == samples
+    assert filt_in.variant_data.s.collect() == samples
+
+    assert filt_out.reference_data.s.collect() == other
+    assert filt_out.variant_data.s.collect() == other
+
+
 def test_segment_intervals():
     vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_chr22_5_samples.vds'))
 
@@ -186,8 +220,6 @@ def test_segment_intervals():
     assert before_coverage == after_coverage
 
 
-@fails_local_backend
-@fails_service_backend
 def test_interval_coverage():
     vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_chr22_5_samples.vds'))
 
@@ -199,26 +231,35 @@ def test_interval_coverage():
         key='interval')
 
     checkpoint_path = new_temp_file()
-    r = hl.vds.interval_coverage(vds, intervals).checkpoint(checkpoint_path)
+    r = hl.vds.interval_coverage(vds, intervals, gq_thresholds=(1, 21), dp_thresholds=(0, 1, 6)).checkpoint(
+        checkpoint_path)
     assert r.aggregate_rows(hl.agg.collect((hl.format('%s:%d-%d', r.interval.start.contig, r.interval.start.position,
                                                       r.interval.end.position), r.interval_size))) == [(interval1, 10),
                                                                                                        (interval2, 9)]
 
-    r.entries().show(width=10000, n_rows=10000)
-
     observed = r.aggregate_entries(hl.agg.collect(r.entry))
     expected = [
-        hl.Struct(bases_over_gq_threshold=(10, 0), sum_dp=55, fraction_over_gq_threshold=(1.0, 0.0), mean_dp=5.5),
-        hl.Struct(bases_over_gq_threshold=(10, 0), sum_dp=45, fraction_over_gq_threshold=(1.0, 0.0), mean_dp=4.5),
-        hl.Struct(bases_over_gq_threshold=(0, 0), sum_dp=0, fraction_over_gq_threshold=(0.0, 0.0), mean_dp=0),
-        hl.Struct(bases_over_gq_threshold=(10, 0), sum_dp=30, fraction_over_gq_threshold=(1.0, 0.0), mean_dp=3.0),
-        hl.Struct(bases_over_gq_threshold=(9, 0), sum_dp=10, fraction_over_gq_threshold=(0.9, 0.0), mean_dp=1.0),
+        hl.Struct(bases_over_gq_threshold=(10, 0), bases_over_dp_threshold=(10, 10, 5), sum_dp=55,
+                  fraction_over_gq_threshold=(1.0, 0.0), fraction_over_dp_threshold=(1.0, 1.0, 0.5), mean_dp=5.5),
+        hl.Struct(bases_over_gq_threshold=(10, 0), bases_over_dp_threshold=(10, 10, 0), sum_dp=45,
+                  fraction_over_gq_threshold=(1.0, 0.0), fraction_over_dp_threshold=(1.0, 1.0, 0), mean_dp=4.5),
+        hl.Struct(bases_over_gq_threshold=(0, 0), bases_over_dp_threshold=(10, 0, 0), sum_dp=0,
+                  fraction_over_gq_threshold=(0.0, 0.0), fraction_over_dp_threshold=(1.0, 0, 0), mean_dp=0),
+        hl.Struct(bases_over_gq_threshold=(10, 0), bases_over_dp_threshold=(10, 10, 0), sum_dp=30,
+                  fraction_over_gq_threshold=(1.0, 0.0), fraction_over_dp_threshold=(1.0, 1.0, 0.0), mean_dp=3.0),
+        hl.Struct(bases_over_gq_threshold=(9, 0), bases_over_dp_threshold=(10, 10, 0), sum_dp=10,
+                  fraction_over_gq_threshold=(0.9, 0.0), fraction_over_dp_threshold=(1.0, 1.0, 0.0), mean_dp=1.0),
 
-        hl.Struct(bases_over_gq_threshold=(9, 9), sum_dp=153, fraction_over_gq_threshold=(1.0, 1.0), mean_dp=17.0),
-        hl.Struct(bases_over_gq_threshold=(9, 9), sum_dp=159, fraction_over_gq_threshold=(1.0, 1.0), mean_dp=159 / 9),
-        hl.Struct(bases_over_gq_threshold=(9, 9), sum_dp=98, fraction_over_gq_threshold=(1.0, 1.0), mean_dp=98 / 9),
-        hl.Struct(bases_over_gq_threshold=(9, 9), sum_dp=72, fraction_over_gq_threshold=(1.0, 1.0), mean_dp=8),
-        hl.Struct(bases_over_gq_threshold=(9, 0), sum_dp=20, fraction_over_gq_threshold=(1.0, 0.0), mean_dp=2 / 9),
+        hl.Struct(bases_over_gq_threshold=(9, 9), bases_over_dp_threshold=(9, 9, 9), sum_dp=153,
+                  fraction_over_gq_threshold=(1.0, 1.0), fraction_over_dp_threshold=(1.0, 1.0, 1.0), mean_dp=17.0),
+        hl.Struct(bases_over_gq_threshold=(9, 9), bases_over_dp_threshold=(9, 9, 9), sum_dp=159,
+                  fraction_over_gq_threshold=(1.0, 1.0), fraction_over_dp_threshold=(1.0, 1.0, 1.0), mean_dp=159 / 9),
+        hl.Struct(bases_over_gq_threshold=(9, 9), bases_over_dp_threshold=(9, 9, 9), sum_dp=98,
+                  fraction_over_gq_threshold=(1.0, 1.0), fraction_over_dp_threshold=(1.0, 1.0, 1.0), mean_dp=98 / 9),
+        hl.Struct(bases_over_gq_threshold=(9, 9), bases_over_dp_threshold=(9, 9, 9), sum_dp=72,
+                  fraction_over_gq_threshold=(1.0, 1.0), fraction_over_dp_threshold=(1.0, 1.0, 1.0), mean_dp=8),
+        hl.Struct(bases_over_gq_threshold=(9, 0), bases_over_dp_threshold=(9, 9, 0), sum_dp=20,
+                  fraction_over_gq_threshold=(1.0, 0.0), fraction_over_dp_threshold=(1.0, 1.0, 0.0), mean_dp=2 / 9),
     ]
 
     for i in range(len(expected)):
@@ -226,5 +267,285 @@ def test_interval_coverage():
         exp = expected[i]
         assert obs.bases_over_gq_threshold == exp.bases_over_gq_threshold, i
         assert obs.sum_dp == exp.sum_dp, i
+        assert obs.bases_over_dp_threshold == exp.bases_over_dp_threshold, i
         assert obs.fraction_over_gq_threshold == exp.fraction_over_gq_threshold, i
+        assert obs.fraction_over_dp_threshold == exp.fraction_over_dp_threshold, i
         pytest.approx(obs.mean_dp, exp.mean_dp)
+
+
+def test_impute_sex_chr_ploidy_from_interval_coverage():
+    norm_interval_1 = hl.parse_locus_interval('20:10-30', reference_genome='GRCh37')
+    norm_interval_2 = hl.parse_locus_interval('20:40-45', reference_genome='GRCh37')
+    x_interval_1 = hl.parse_locus_interval('X:10-20', reference_genome='GRCh37')
+    x_interval_2 = hl.parse_locus_interval('X:25-35', reference_genome='GRCh37')
+    y_interval_1 = hl.parse_locus_interval('Y:10-20', reference_genome='GRCh37')
+    y_interval_2 = hl.parse_locus_interval('Y:25-30', reference_genome='GRCh37')
+
+    mt = hl.Table.parallelize([hl.Struct(s='sample_xx', interval=norm_interval_1, sum_dp=195),
+                               hl.Struct(s='sample_xx', interval=norm_interval_2, sum_dp=55),
+                               hl.Struct(s='sample_xx', interval=x_interval_1, sum_dp=95),
+                               hl.Struct(s='sample_xx', interval=x_interval_2, sum_dp=85),
+                               hl.Struct(s='sample_xy', interval=norm_interval_1, sum_dp=190),
+                               hl.Struct(s='sample_xy', interval=norm_interval_2, sum_dp=85),
+                               hl.Struct(s='sample_xy', interval=x_interval_1, sum_dp=61),
+                               hl.Struct(s='sample_xy', interval=x_interval_2, sum_dp=49),
+                               hl.Struct(s='sample_xy', interval=y_interval_1, sum_dp=54),
+                               hl.Struct(s='sample_xy', interval=y_interval_2, sum_dp=45)],
+                              schema=hl.dtype(
+                                  'struct{s:str,interval:interval<locus<GRCh37>>,sum_dp:int32}')).to_matrix_table(
+        row_key=['interval'], col_key=['s'])
+
+    mt = mt.annotate_rows(interval_size=mt.interval.end.position - mt.interval.start.position)
+    r = hl.vds.impute_sex_chr_ploidy_from_interval_coverage(mt, normalization_contig='20')
+
+    assert r.collect() == [
+        hl.Struct(s='sample_xx',
+                  autosomal_mean_dp=10.0,
+                  x_mean_dp=9.0,
+                  x_ploidy=1.8,
+                  y_mean_dp=0.0,
+                  y_ploidy=0.0),
+        hl.Struct(s='sample_xy',
+                  autosomal_mean_dp=11.0,
+                  x_mean_dp=5.5,
+                  x_ploidy=1.0,
+                  y_mean_dp=6.6,
+                  y_ploidy=1.2)
+    ]
+
+
+def test_impute_sex_chromosome_ploidy():
+    x_par_end = 2699521
+    y_par_end = 2649521
+    rg = hl.get_reference('GRCh37')
+    ref_blocks = [
+        hl.Struct(s='sample_xx', ref_allele='A', locus=hl.Locus('22', 1000000, rg), END=2000000, GQ=15, DP=5),
+        hl.Struct(s='sample_xx', ref_allele='A', locus=hl.Locus('X', x_par_end-10, rg), END=x_par_end+9, GQ=18, DP=6),
+        hl.Struct(s='sample_xx', ref_allele='A', locus=hl.Locus('X', x_par_end+10, rg), END=x_par_end+29, GQ=15, DP=5),
+        hl.Struct(s='sample_xy', ref_allele='A', locus=hl.Locus('22', 1000000, rg), END=2000000, GQ=15, DP=5),
+        hl.Struct(s='sample_xy', ref_allele='A', locus=hl.Locus('X', x_par_end-10, rg), END=x_par_end+9, GQ=9, DP=3),
+        hl.Struct(s='sample_xy', ref_allele='A', locus=hl.Locus('X', x_par_end+10, rg), END=x_par_end+29, GQ=6, DP=2),
+        hl.Struct(s='sample_xy', ref_allele='A', locus=hl.Locus('Y', y_par_end-10, rg), END=y_par_end+9, GQ=12, DP=4),
+        hl.Struct(s='sample_xy', ref_allele='A', locus=hl.Locus('Y', y_par_end+10, rg), END=y_par_end+29, GQ=9, DP=3),
+    ]
+    var = [
+        hl.Struct(locus=hl.Locus('22', 2000021, rg), alleles=hl.array(["A", "C"]), s="sample_xx", LA=hl.array([0, 1]),
+                  LGT=hl.call(0, 1, phased=False), GQ=15, DP=5),
+        hl.Struct(locus=hl.Locus('X', x_par_end-11, rg), alleles=hl.array(["A", "C"]), s="sample_xx", LA=hl.array([0, 1]),
+                  LGT=hl.call(0, 1, phased=False), GQ=18, DP=6),
+        hl.Struct(locus=hl.Locus('X', x_par_end+30, rg), alleles=hl.array(["A", "C"]), s="sample_xx",
+                  LA=hl.array([0, 1]),
+                  LGT=hl.call(0, 1, phased=False), GQ=18, DP=6),
+        hl.Struct(locus=hl.Locus('X', x_par_end + 33, rg), alleles=hl.array(["A", "C", "G"]), s="sample_xx",
+                  LA=hl.array([0, 1, 2]),
+                  LGT=hl.call(0, 2, phased=False), GQ=15, DP=5),
+        hl.Struct(locus=hl.Locus('22', 2000021, rg), alleles=hl.array(["A", "C"]), s="sample_xy", LA=hl.array([0, 1]),
+                  LGT=hl.call(0, 1, phased=False), GQ=15, DP=5),
+        hl.Struct(locus=hl.Locus('X', x_par_end - 11, rg), alleles=hl.array(["A", "C"]), s="sample_xy",
+                  LA=hl.array([0, 1]),
+                  LGT=hl.call(1, 1, phased=False), GQ=5, DP=2),
+        hl.Struct(locus=hl.Locus('X', x_par_end + 30, rg), alleles=hl.array(["A", "C"]), s="sample_xy",
+                  LA=hl.array([0, 1]),
+                  LGT=hl.call(1, 1, phased=False), GQ=7, DP=4),
+        hl.Struct(locus=hl.Locus('X', x_par_end + 33, rg), alleles=hl.array(["A", "C", "G"]), s="sample_xy",
+                  LA=hl.array([0, 1, 2]),
+                  LGT=hl.call(2, 2, phased=False), GQ=5, DP=3),
+        hl.Struct(locus=hl.Locus('Y', y_par_end-11, rg), alleles=hl.array(["A", "C"]), s="sample_xy", LA=hl.array([0, 1]),
+                  LGT=hl.call(1, 1, phased=False), GQ=9, DP=2),
+        hl.Struct(locus=hl.Locus('Y', y_par_end+30, rg), alleles=hl.array(["A", "C"]), s="sample_xy", LA=hl.array([0, 1]),
+                  LGT=hl.call(1, 1, phased=False), GQ=12, DP=4),
+        hl.Struct(locus=hl.Locus('Y', y_par_end+33, rg), alleles=hl.array(["A", "C"]), s="sample_xy",
+                  LA=hl.array([0, 1]),
+                  LGT=hl.call(1, 1, phased=False), GQ=6, DP=2),
+    ]
+
+    ref_mt = hl.Table.parallelize(ref_blocks,
+                                  schema=hl.dtype('struct{s:str,locus:locus<GRCh37>,ref_allele:str,END:int32,GQ:int32,DP:int32}')) \
+        .to_matrix_table(row_key=['locus'], row_fields=['ref_allele'], col_key=['s'])
+    var_mt = hl.Table.parallelize([],
+                                  schema=hl.dtype('struct{locus:locus<GRCh37>,alleles:array<str>,s:str,LA:array<int32>,LGT:call,GQ:int32,DP:int32}'))\
+        .to_matrix_table(row_key=['locus', 'alleles'], col_key=['s'])
+
+    vds = hl.vds.VariantDataset(ref_mt, var_mt)
+
+    calling_intervals = [
+        hl.parse_locus_interval('22:1000010-1000020', reference_genome='GRCh37'),
+        hl.parse_locus_interval(f'X:{x_par_end}-{x_par_end + 20}', reference_genome='GRCh37'),
+        hl.parse_locus_interval(f'Y:{y_par_end}-{y_par_end + 20}', reference_genome='GRCh37'),
+    ]
+
+    r = hl.vds.impute_sex_chromosome_ploidy(vds, calling_intervals, normalization_contig='22')
+
+    assert r.collect() == [
+        hl.Struct(s='sample_xx',
+                  autosomal_mean_dp=5.0,
+                  x_mean_dp=5.5,
+                  x_ploidy=2.2,
+                  y_mean_dp=0.0,
+                  y_ploidy=0.0),
+        hl.Struct(s='sample_xy',
+                  autosomal_mean_dp=5.0,
+                  x_mean_dp=2.5,
+                  x_ploidy=1.0,
+                  y_mean_dp=3.5,
+                  y_ploidy=1.4)
+    ]
+
+    var_mt = hl.Table.parallelize(var,
+                                  schema=hl.dtype('struct{locus:locus<GRCh37>,alleles:array<str>,s:str,LA:array<int32>,LGT:call,GQ:int32,DP:int32}'))\
+        .to_matrix_table(row_key=['locus', 'alleles'], col_key=['s'])
+
+    vds = hl.vds.VariantDataset(ref_mt, var_mt)
+
+    calling_intervals = [
+        hl.parse_locus_interval('22:1000010-1000020', reference_genome='GRCh37'),
+        hl.parse_locus_interval('22:2000020-2000030', reference_genome='GRCh37'),
+        hl.parse_locus_interval(f'X:{x_par_end}-{x_par_end + 20}', reference_genome='GRCh37'),
+        hl.parse_locus_interval(f'X:{x_par_end + 32}-{x_par_end + 40}', reference_genome='GRCh37'),
+        hl.parse_locus_interval(f'Y:{y_par_end}-{y_par_end + 20}', reference_genome='GRCh37'),
+        hl.parse_locus_interval(f'Y:{y_par_end + 32}-{y_par_end + 40}', reference_genome='GRCh37'),
+    ]
+    r = hl.vds.impute_sex_chromosome_ploidy(vds, calling_intervals, normalization_contig='22', use_variant_dataset=True)
+
+    assert r.collect() == [
+        hl.Struct(s='sample_xx',
+                  autosomal_mean_dp=5.0,
+                  x_mean_dp=5.0,
+                  x_ploidy=2.0,
+                  y_mean_dp=0.0,
+                  y_ploidy=0.0),
+        hl.Struct(s='sample_xy',
+                  autosomal_mean_dp=5.0,
+                  x_mean_dp=3.0,
+                  x_ploidy=1.2,
+                  y_mean_dp=2.0,
+                  y_ploidy=0.8)
+    ]
+
+
+def test_filter_intervals_segment():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_2samples_starts.vds'))
+
+    intervals = [hl.parse_locus_interval('chr22:10514784-10517000', reference_genome='GRCh38')]
+    filt = hl.vds.filter_intervals(vds, intervals, split_reference_blocks=True)
+
+    assert hl.vds.to_dense_mt(filt)._same(
+        hl.filter_intervals(hl.vds.to_dense_mt(vds), intervals))
+
+    ref = filt.reference_data
+    var = filt.variant_data
+    assert ref.aggregate_rows(hl.agg.all(intervals[0].contains(ref.locus)))
+    assert var.aggregate_rows(hl.agg.all(intervals[0].contains(var.locus)))
+
+
+def test_filter_intervals_segment_table():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_2samples_starts.vds'))
+
+    intervals = [hl.parse_locus_interval('chr22:10514784-10517000', reference_genome='GRCh38')]
+    intervals_table = hl.Table.parallelize(
+        hl.array(intervals).map(lambda x: hl.struct(interval=x)),
+        key='interval')
+    filt = hl.vds.filter_intervals(vds, intervals_table, split_reference_blocks=True)
+
+    assert hl.vds.to_dense_mt(filt)._same(
+        hl.filter_intervals(hl.vds.to_dense_mt(vds), intervals))
+
+    ref = filt.reference_data
+    var = filt.variant_data
+    assert ref.aggregate_rows(hl.agg.all(intervals[0].contains(ref.locus)))
+    assert var.aggregate_rows(hl.agg.all(intervals[0].contains(var.locus)))
+
+
+def test_filter_intervals_default():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_2samples_starts.vds'))
+
+    intervals = [hl.parse_locus_interval('chr22:10514784-10517000', reference_genome='GRCh38')]
+    filt = hl.vds.filter_intervals(vds, intervals)
+
+    assert hl.vds.to_dense_mt(filt)._same(
+        hl.filter_intervals(hl.vds.to_dense_mt(vds), intervals))
+
+    var = filt.variant_data
+    assert var.aggregate_rows(hl.agg.all(intervals[0].contains(var.locus)))
+
+
+def test_filter_intervals_default_table():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_2samples_starts.vds'))
+
+    intervals = [hl.parse_locus_interval('chr22:10514784-10517000', reference_genome='GRCh38')]
+    intervals_table = hl.Table.parallelize(
+        hl.array(intervals).map(lambda x: hl.struct(interval=x)),
+        key='interval')
+    filt = hl.vds.filter_intervals(vds, intervals_table)
+
+    assert hl.vds.to_dense_mt(filt)._same(
+        hl.filter_intervals(hl.vds.to_dense_mt(vds), intervals))
+
+    var = filt.variant_data
+    assert var.aggregate_rows(hl.agg.all(intervals[0].contains(var.locus)))
+
+
+def test_filter_chromosomes():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_2samples_starts.vds'))
+
+
+    autosomes = [f'chr{i}' for i in range(1, 23)]
+    sex_chrs = ['chrX', 'chrY']
+
+    all_chrs = autosomes + sex_chrs
+    def assert_contigs(vds, expected):
+        expected_set = set(expected)
+
+        rd = vds.reference_data
+        vd = vds.variant_data
+
+        assert rd.aggregate_rows(hl.agg.collect_as_set(rd.locus.contig)) == expected_set
+        assert vd.aggregate_rows(hl.agg.collect_as_set(vd.locus.contig)) == expected_set
+
+    assert_contigs(vds, all_chrs)
+
+    vds_keep_1_5 = hl.vds.filter_chromosomes(vds, keep=['chr1', 'chr5'])
+    assert_contigs(vds_keep_1_5, ['chr1', 'chr5'])
+
+    vds_remove_1_5 = hl.vds.filter_chromosomes(vds, remove=['chr1', 'chr5'])
+    assert_contigs(vds_remove_1_5, [x for x in all_chrs if x not in ['chr1', 'chr5']])
+
+    vds_auto = hl.vds.filter_chromosomes(vds, keep_autosomes=True)
+    assert_contigs(vds_auto, autosomes)
+
+
+def test_to_dense_mt():
+    vds = hl.vds.read_vds(os.path.join(resource('vds'), '1kg_2samples_starts.vds'))
+    vds = hl.vds.filter_chromosomes(vds, keep='chr22')
+
+    dense = hl.vds.to_dense_mt(vds).select_entries('LGT', 'LA', 'GQ', 'DP')
+
+    assert dense.rows().select()._same(
+        vds.variant_data.rows().select()), "rows differ between variant data and dense mt"
+
+    assert dense.filter_entries(hl.is_defined(dense.LA))._same(
+        vds.variant_data.select_entries('LGT', 'LA', 'GQ', 'DP')), "cannot recover variant data"
+
+    as_dict = dense.aggregate_entries(
+        hl.dict(hl.zip(hl.agg.collect((hl.str(dense.locus), dense.s)), hl.agg.collect(dense.entry))))
+
+    assert as_dict.get(('chr22:10514784', 'NA12891')) == None
+    assert as_dict.get(('chr22:10514784', 'NA12878')) == hl.Struct(LGT=hl.Call([0, 1]), LA=[0, 1], GQ=23, DP=4)
+
+    assert as_dict.get(('chr22:10516102', 'NA12891')) == hl.Struct(LGT=hl.Call([0, 0]), LA=None, GQ=12, DP=7)
+    assert as_dict.get(('chr22:10516102', 'NA12878')) == hl.Struct(LGT=hl.Call([0, 1]), LA=[0, 1], GQ=26, DP=3)
+
+    assert as_dict.get(('chr22:10516150', 'NA12891')) == hl.Struct(LGT=hl.Call([0, 1]), LA=[0, 1], GQ=64, DP=4)
+    assert as_dict.get(('chr22:10516150', 'NA12878')) == hl.Struct(LGT=hl.Call([0, 1]), LA=[0, 1], GQ=99, DP=10)
+
+    assert as_dict.get(('chr22:10519088', 'NA12891')) == hl.Struct(LGT=hl.Call([0, 1]), LA=[0, 1], GQ=99, DP=21)
+    assert as_dict.get(('chr22:10519088', 'NA12878')) == None
+
+    assert as_dict.get(('chr22:10557694', 'NA12891')) == hl.Struct(LGT=hl.Call([0, 1]), LA=[0, 1], GQ=28, DP=19)
+    assert as_dict.get(('chr22:10557694', 'NA12878')) == hl.Struct(LGT=hl.Call([0, 0]), LA=None, GQ=13, DP=16)
+
+    assert as_dict.get(('chr22:10562435', 'NA12891')) == hl.Struct(LGT=hl.Call([0, 1]), LA=[0, 1], GQ=99, DP=15)
+    assert as_dict.get(('chr22:10562435', 'NA12878')) == hl.Struct(LGT=hl.Call([0, 0]), LA=None, GQ=21, DP=9)
+
+    assert as_dict.get(('chr22:10562436', 'NA12891')) == hl.Struct(LGT=hl.Call([0, 1]), LA=[0, 1], GQ=99, DP=15)
+    assert as_dict.get(('chr22:10562436', 'NA12878')) == hl.Struct(LGT=hl.Call([0, 0]), LA=None, GQ=21, DP=9)

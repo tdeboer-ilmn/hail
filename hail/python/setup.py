@@ -47,6 +47,7 @@ setup(
     package_data={
         'hail': ['hail_pip_version',
                  'hail_version',
+                 'hail_revision',
                  'experimental/datasets.json'],
         'hail.backend': ['hail-all-spark.jar'],
         'hailtop': ['hail_version', 'py.typed'],
@@ -55,7 +56,7 @@ setup(
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
     ],
-    python_requires=">=3.6",
+    python_requires=">=3.7",
     install_requires=dependencies,
     entry_points={
         'console_scripts': ['hailctl = hailtop.hailctl.__main__:main']

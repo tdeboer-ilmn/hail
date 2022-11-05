@@ -10,7 +10,10 @@ import org.apache.commons.io.IOUtils
 import org.apache.http.{HttpEntity, HttpEntityEnclosingRequest}
 import org.apache.http.client.methods.{HttpDelete, HttpGet, HttpPatch, HttpPost, HttpUriRequest}
 import org.apache.http.entity.{ByteArrayEntity, ContentType, StringEntity}
+import org.apache.http.client.config.RequestConfig
 import org.apache.http.impl.client.{CloseableHttpClient, HttpClients}
+import org.apache.http.impl.client.{CloseableHttpClient, HttpClients}
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager
 import org.apache.http.util.EntityUtils
 import org.apache.log4j.{LogManager, Logger}
 import org.json4s.{DefaultFormats, Formats, JObject, JValue}
@@ -29,17 +32,30 @@ class ClientResponseException(
 }
 
 object Requester {
-  lazy val log: Logger = LogManager.getLogger("Requester")
+  private val log: Logger = LogManager.getLogger("Requester")
+  private[this] val TIMEOUT_MS = 5 * 1000
 
   val httpClient: CloseableHttpClient = {
     log.info("creating HttpClient")
+    val requestConfig = RequestConfig.custom()
+      .setConnectTimeout(TIMEOUT_MS)
+      .setConnectionRequestTimeout(TIMEOUT_MS)
+      .setSocketTimeout(TIMEOUT_MS)
+      .build()
     try {
       HttpClients.custom()
         .setSSLContext(tls.getSSLContext)
+        .setMaxConnPerRoute(20)
+        .setMaxConnTotal(100)
+        .setDefaultRequestConfig(requestConfig)
         .build()
     } catch { case _: NoSSLConfigFound =>
       log.info("creating HttpClient with no SSL Context")
-      HttpClients.custom().build()
+      HttpClients.custom()
+        .setMaxConnPerRoute(20)
+        .setMaxConnTotal(100)
+        .setDefaultRequestConfig(requestConfig)
+        .build()
     }
   }
 }

@@ -1,19 +1,25 @@
+import asyncio
+import base64
+import json
+import logging
 import os
 import random
-import json
-import base64
-import logging
 import secrets
-import asyncio
+from typing import Optional
+
 import aiohttp
-import kubernetes_asyncio as kube
-from hailtop.utils import time_msecs, secret_alnum_string
-from hailtop.auth.sql_config import create_secret_data_from_config, SQLConfig
-from hailtop import aiotools
-from hailtop import batch_client as bc, httpx
-from gear import create_session, Database
-from gear.cloud_config import get_gcp_config, get_global_config
+import kubernetes_asyncio.client
+import kubernetes_asyncio.client.rest
+import kubernetes_asyncio.config
+
+from gear import Database, create_session
 from gear.clients import get_identity_client
+from gear.cloud_config import get_gcp_config, get_global_config
+from hailtop import aiotools
+from hailtop import batch_client as bc
+from hailtop import httpx
+from hailtop.auth.sql_config import SQLConfig, create_secret_data_from_config
+from hailtop.utils import secret_alnum_string, time_msecs
 
 log = logging.getLogger('auth.driver')
 
@@ -44,8 +50,8 @@ class EventHandler:
     async def main_loop(self):
         delay_secs = self.min_delay_secs
         while True:
+            start_time = time_msecs()
             try:
-                start_time = time_msecs()
                 while True:
                     self.event.clear()
                     should_wait = await self.handler()
@@ -111,8 +117,8 @@ class K8sSecretResource:
 
         await self.k8s_client.create_namespaced_secret(
             namespace,
-            kube.client.V1Secret(
-                metadata=kube.client.V1ObjectMeta(name=name),
+            kubernetes_asyncio.client.V1Secret(
+                metadata=kubernetes_asyncio.client.V1ObjectMeta(name=name),
                 data={k: base64.b64encode(v.encode('utf-8')).decode('utf-8') for k, v in data.items()},
             ),
         )
@@ -122,7 +128,7 @@ class K8sSecretResource:
     async def _delete(self, name, namespace):
         try:
             await self.k8s_client.delete_namespaced_secret(name, namespace)
-        except kube.client.rest.ApiException as e:
+        except kubernetes_asyncio.client.rest.ApiException as e:
             if e.status == 404:
                 pass
             else:
@@ -176,44 +182,46 @@ class GSAResource:
 
 
 class AzureServicePrincipalResource:
-    def __init__(self, graph_client, app_id=None):
+    def __init__(self, graph_client, app_obj_id=None):
         self.graph_client = graph_client
-        self.app_id = app_id
+        self.app_obj_id = app_obj_id
 
     async def create(self, username):
-        assert self.app_id is None
+        assert self.app_obj_id is None
 
         params = {'$filter': f"displayName eq '{username}'"}
         applications = await self.graph_client.get('/applications', params=params)
+        assert len(applications['value']) <= 1, applications
         for application in applications['value']:
-            await self._delete(application['appId'])
+            await self._delete(application['id'])
 
         config = {'displayName': username, 'signInAudience': 'AzureADMyOrg'}
         application = await self.graph_client.post('/applications', json=config)
 
-        self.app_id = application['appId']
+        self.app_obj_id = application['id']
 
         config = {'appId': application['appId']}
         service_principal = await self.graph_client.post('/servicePrincipals', json=config)
 
-        assert self.app_id == service_principal['appId']
+        assert application['appId'] == service_principal['appId']
 
         password = await self.graph_client.post(f'/applications/{application["id"]}/addPassword', json={})
 
         credentials = {
-            'appId': service_principal['appId'],
-            'displayName': service_principal['displayName'],
+            'appId': application['appId'],
+            'displayName': service_principal['appDisplayName'],
             'name': service_principal['servicePrincipalNames'][0],
             'password': password['secretText'],
             'tenant': service_principal['appOwnerOrganizationId'],
             'objectId': service_principal['id'],
+            'appObjectId': application['id'],
         }
 
-        return (self.app_id, credentials)
+        return (self.app_obj_id, credentials)
 
-    async def _delete(self, app_id):
+    async def _delete(self, app_obj_id):
         try:
-            await self.graph_client.delete(f'/applications/{app_id}')
+            await self.graph_client.delete(f'/applications/{app_obj_id}')
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
                 pass
@@ -221,10 +229,10 @@ class AzureServicePrincipalResource:
                 raise
 
     async def delete(self):
-        if self.app_id is None:
+        if self.app_obj_id is None:
             return
-        await self._delete(self.app_id)
-        self.app_id = None
+        await self._delete(self.app_obj_id)
+        self.app_obj_id = None
 
 
 class DatabaseResource:
@@ -253,14 +261,20 @@ GRANT ALL ON `{name}`.* TO '{name}'@'%';
         self.name = name
 
     def secret_data(self):
-        with open('/database-server-config/sql-config.json', 'r') as f:
+        with open('/database-server-config/sql-config.json', 'r', encoding='utf-8') as f:
             server_config = SQLConfig.from_json(f.read())
-        with open('/database-server-config/server-ca.pem', 'r') as f:
+        with open('/database-server-config/server-ca.pem', 'r', encoding='utf-8') as f:
             server_ca = f.read()
-        with open('/database-server-config/client-cert.pem', 'r') as f:
-            client_cert = f.read()
-        with open('/database-server-config/client-key.pem', 'r') as f:
-            client_key = f.read()
+        client_cert: Optional[str]
+        client_key: Optional[str]
+        if server_config.using_mtls():
+            with open('/database-server-config/client-cert.pem', 'r', encoding='utf-8') as f:
+                client_cert = f.read()
+            with open('/database-server-config/client-key.pem', 'r', encoding='utf-8') as f:
+                client_key = f.read()
+        else:
+            client_cert = None
+            client_key = None
 
         if is_test_deployment:
             return create_secret_data_from_config(server_config, server_ca, client_cert, client_key)
@@ -277,8 +291,8 @@ GRANT ALL ON `{name}`.* TO '{name}'@'%';
             connection_name=server_config.connection_name,
             db=self.name,
             ssl_ca='/sql-config/server-ca.pem',
-            ssl_cert='/sql-config/client-cert.pem',
-            ssl_key='/sql-config/client-key.pem',
+            ssl_cert='/sql-config/client-cert.pem' if client_cert is not None else None,
+            ssl_key='/sql-config/client-key.pem' if client_key is not None else None,
             ssl_mode='VERIFY_CA',
         )
         return create_secret_data_from_config(config, server_ca, client_cert, client_key)
@@ -307,17 +321,21 @@ class K8sNamespaceResource:
         self.name = name
 
     async def create(self, name):
+        assert name not in ('default', DEFAULT_NAMESPACE)
         assert self.name is None
 
         await self._delete(name)
 
-        await self.k8s_client.create_namespace(kube.client.V1Namespace(metadata=kube.client.V1ObjectMeta(name=name)))
+        await self.k8s_client.create_namespace(
+            kubernetes_asyncio.client.V1Namespace(metadata=kubernetes_asyncio.client.V1ObjectMeta(name=name))
+        )
         self.name = name
 
     async def _delete(self, name):
+        assert name not in ('default', DEFAULT_NAMESPACE)
         try:
             await self.k8s_client.delete_namespace(name)
-        except kube.client.rest.ApiException as e:
+        except kubernetes_asyncio.client.rest.ApiException as e:
             if e.status == 404:
                 pass
             else:
@@ -344,20 +362,20 @@ class BillingProjectResource:
 
         try:
             await self.batch_client.create_billing_project(billing_project)
-        except aiohttp.ClientResponseError as e:
-            if e.status != 403 or 'already exists' not in e.message:
+        except httpx.ClientResponseError as e:
+            if e.status != 403 or 'already exists' not in e.body:
                 raise
 
         try:
             await self.batch_client.reopen_billing_project(billing_project)
-        except aiohttp.ClientResponseError as e:
-            if e.status != 403 or 'is already open' not in e.message:
+        except httpx.ClientResponseError as e:
+            if e.status != 403 or 'is already open' not in e.body:
                 raise
 
         try:
             await self.batch_client.add_user(user, billing_project)
-        except aiohttp.ClientResponseError as e:
-            if e.status != 403 or 'already member of billing project' not in e.message:
+        except httpx.ClientResponseError as e:
+            if e.status != 403 or 'already member of billing project' not in e.body:
                 raise
 
         await self.batch_client.edit_billing_limit(billing_project, 10)
@@ -368,8 +386,8 @@ class BillingProjectResource:
     async def _delete(self, user, billing_project):
         try:
             bp = await self.batch_client.get_billing_project(billing_project)
-        except aiohttp.ClientResponseError as e:
-            if e.status == 403 and 'unknown billing project':
+        except httpx.ClientResponseError as e:
+            if e.status == 403 and 'Unknown Hail Batch billing project' in e.body:
                 return
             raise
         else:
@@ -378,8 +396,8 @@ class BillingProjectResource:
 
         try:
             await self.batch_client.remove_user(user, billing_project)
-        except aiohttp.ClientResponseError as e:
-            if e.status != 403 or 'is not in billing project' not in e.message:
+        except httpx.ClientResponseError as e:
+            if e.status != 403 or 'is not in billing project' not in e.body:
                 raise
         finally:
             await self.batch_client.close_billing_project(billing_project)
@@ -441,15 +459,17 @@ async def _create_user(app, user, skip_trial_bp, cleanup):
             gsa_email, key = await gsa.create(ident_token)
             secret_data = base64.b64decode(key['privateKeyData']).decode('utf-8')
             updates['hail_identity'] = gsa_email
+            updates['display_name'] = gsa_email
         else:
             assert CLOUD == 'azure'
 
             azure_sp = AzureServicePrincipalResource(identity_client)
             cleanup.append(azure_sp.delete)
 
-            azure_app_id, credentials = await azure_sp.create(ident_token)
+            azure_app_obj_id, credentials = await azure_sp.create(ident_token)
             secret_data = json.dumps(credentials)
-            updates['hail_identity'] = azure_app_id
+            updates['hail_identity'] = azure_app_obj_id
+            updates['display_name'] = ident_token
 
         hail_credentials_secret_name = f'{ident}-gsa-key'
         hail_identity_secret = K8sSecretResource(k8s_client)
@@ -477,9 +497,7 @@ async def _create_user(app, user, skip_trial_bp, cleanup):
         cleanup.append(db_secret.delete)
         await db_secret.create('database-server-config', namespace_name, db_resource.secret_data())
 
-    # TODO This doesn't work on azure yet because of the circular batch dependency
-    # Once this is working, bootstrap must deploy batch not just auth
-    if CLOUD == 'gcp' and not skip_trial_bp and user['is_service_account'] != 1:
+    if not skip_trial_bp and user['is_service_account'] != 1:
         trial_bp = user['trial_bp_name']
         if trial_bp is None:
             batch_client = app['batch_client']
@@ -547,7 +565,7 @@ async def delete_user(app, user):
         await hail_identity_secret.delete()
 
     namespace_name = user['namespace_name']
-    if namespace_name is not None:
+    if namespace_name is not None and namespace_name != DEFAULT_NAMESPACE:
         assert user['is_developer'] == 1
 
         # don't bother deleting database-server-config since we're
@@ -606,9 +624,8 @@ async def async_main():
         await db_instance.async_init(maxsize=50, config_file='/database-server-config/sql-config.json')
         app['db_instance'] = db_instance
 
-        kube.config.load_incluster_config()
-        k8s_client = kube.client.CoreV1Api()
-        app['k8s_client'] = k8s_client
+        kubernetes_asyncio.config.load_incluster_config()
+        app['k8s_client'] = kubernetes_asyncio.client.CoreV1Api()
 
         app['identity_client'] = get_identity_client()
 
@@ -641,4 +658,8 @@ async def async_main():
                         if user_creation_loop is not None:
                             user_creation_loop.shutdown()
                     finally:
-                        await app['identity_client'].close()
+                        try:
+                            await app['identity_client'].close()
+                        finally:
+                            k8s_client: kubernetes_asyncio.client.CoreV1Api = app['k8s_client']
+                            await k8s_client.api_client.rest_client.pool_manager.close()

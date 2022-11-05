@@ -1,28 +1,27 @@
 from hailtop.batch_client.parse import (
-    MEMORY_REGEX,
-    MEMORY_REGEXPAT,
     CPU_REGEX,
     CPU_REGEXPAT,
+    MEMORY_REGEX,
+    MEMORY_REGEXPAT,
     STORAGE_REGEX,
     STORAGE_REGEXPAT,
 )
-
 from hailtop.utils.validate import (
+    ValidationError,
     anyof,
     bool_type,
     dictof,
+    int_type,
     keyed,
     listof,
-    int_type,
+    non_empty_str_type,
     nullable,
     numeric,
     oneof,
     regex,
     required,
     str_type,
-    non_empty_str_type,
     switch,
-    ValidationError,
 )
 
 from ..globals import memory_types
@@ -39,6 +38,7 @@ image_str = str_type
 # image -> process/image
 # mount_docker_socket -> process/mount_docker_socket
 # pvc_size -> resources/storage
+# gcsfuse -> cloudfuse
 
 
 job_validator = keyed(
@@ -46,7 +46,7 @@ job_validator = keyed(
         'always_run': bool_type,
         'attributes': dictof(str_type),
         'env': listof(keyed({'name': str_type, 'value': str_type})),
-        'gcsfuse': listof(
+        'cloudfuse': listof(
             keyed(
                 {
                     required('bucket'): non_empty_str_type,
@@ -61,7 +61,9 @@ job_validator = keyed(
         'network': oneof('public', 'private'),
         'unconfined': bool_type,
         'output_files': listof(keyed({required('from'): str_type, required('to'): str_type})),
-        required('parent_ids'): listof(int_type),
+        'parent_ids': listof(int_type),
+        'absolute_parent_ids': listof(int_type),
+        'in_update_parent_ids': listof(int_type),
         'port': int_type,
         required('process'): switch(
             'type',
@@ -71,9 +73,15 @@ job_validator = keyed(
                     required('image'): image_str,
                     required('mount_docker_socket'): bool_type,
                 },
-                'jvm': {required('command'): listof(str_type)},
+                'jvm': {
+                    required('jar_spec'): keyed(
+                        {required('type'): oneof('git_revision', 'jar_url'), required('value'): str_type}
+                    ),
+                    required('command'): listof(str_type),
+                },
             },
         ),
+        'regions': listof(str_type),
         'requester_pays_project': str_type,
         'resources': keyed(
             {
@@ -104,6 +112,13 @@ batch_validator = keyed(
     }
 )
 
+batch_update_validator = keyed(
+    {
+        required('token'): str_type,
+        required('n_jobs'): numeric(**{"x > 0": lambda x: isinstance(x, int) and x > 0}),
+    }
+)
+
 
 def validate_and_clean_jobs(jobs):
     if not isinstance(jobs, list):
@@ -111,6 +126,7 @@ def validate_and_clean_jobs(jobs):
     for i, job in enumerate(jobs):
         handle_deprecated_job_keys(i, job)
         job_validator.validate(f"jobs[{i}]", job)
+        handle_job_backwards_compatibility(job)
 
 
 def handle_deprecated_job_keys(i, job):
@@ -171,6 +187,20 @@ def handle_deprecated_job_keys(i, job):
                 f"Please remove deprecated keys."
             )
 
+    if 'gcsfuse' in job:
+        job['cloudfuse'] = job.pop('gcsfuse')
+
+
+def handle_job_backwards_compatibility(job):
+    if 'cloudfuse' in job:
+        job['gcsfuse'] = job.pop('cloudfuse')
+    if 'parent_ids' in job:
+        job['absolute_parent_ids'] = job.pop('parent_ids')
+
 
 def validate_batch(batch):
     batch_validator.validate('batch', batch)
+
+
+def validate_batch_update(update):
+    batch_update_validator.validate('batch_update', update)

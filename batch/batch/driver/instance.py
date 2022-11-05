@@ -1,20 +1,20 @@
-from typing import Optional
-import json
 import base64
-import aiohttp
 import datetime
+import json
 import logging
 import secrets
+from typing import Dict, Optional
+
+import aiohttp
 import humanize
 
-from hailtop.utils import time_msecs, time_msecs_str, retry_transient_errors
+from gear import Database, transaction
 from hailtop import httpx
-from gear import Database
+from hailtop.utils import retry_transient_errors, time_msecs, time_msecs_str
 
-from ..database import check_call_procedure
+from ..cloud.utils import instance_config_from_config_dict
 from ..globals import INSTANCE_VERSION
 from ..instance_config import InstanceConfig
-from ..cloud.utils import instance_config_from_config_dict
 
 log = logging.getLogger('instance')
 
@@ -37,60 +37,73 @@ class Instance:
             record['location'],
             record['machine_type'],
             record['preemptible'],
-            instance_config_from_config_dict(
-                json.loads(base64.b64decode(record['instance_config']).decode())
-            )
+            instance_config_from_config_dict(json.loads(base64.b64decode(record['instance_config']).decode())),
         )
 
     @staticmethod
-    async def create(app,
-                     inst_coll,
-                     name: str,
-                     activation_token,
-                     cores: int,
-                     location: str,
-                     machine_type: str,
-                     preemptible: bool,
-                     instance_config: InstanceConfig,
-                     ) -> 'Instance':
+    async def create(
+        app,
+        inst_coll,
+        name: str,
+        activation_token,
+        cores: int,
+        location: str,
+        machine_type: str,
+        preemptible: bool,
+        instance_config: InstanceConfig,
+    ) -> 'Instance':
         db: Database = app['db']
 
         state = 'pending'
         now = time_msecs()
         token = secrets.token_urlsafe(32)
 
-        cores_mcpu = cores * 1000
+        worker_cores_mcpu = cores * 1000
 
-        await db.just_execute(
-            '''
-INSERT INTO instances (name, state, activation_token, token, cores_mcpu, free_cores_mcpu,
+        @transaction(db)
+        async def insert(tx):
+            await tx.just_execute(
+                '''
+INSERT INTO instances (name, state, activation_token, token, cores_mcpu,
   time_created, last_updated, version, location, inst_coll, machine_type, preemptible, instance_config)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
 ''',
-            (
-                name,
-                state,
-                activation_token,
-                token,
-                cores_mcpu,
-                cores_mcpu,
-                now,
-                now,
-                INSTANCE_VERSION,
-                location,
-                inst_coll.name,
-                machine_type,
-                preemptible,
-                base64.b64encode(json.dumps(instance_config.to_dict()).encode()).decode(),
-            ),
-        )
+                (
+                    name,
+                    state,
+                    activation_token,
+                    token,
+                    worker_cores_mcpu,
+                    now,
+                    now,
+                    INSTANCE_VERSION,
+                    location,
+                    inst_coll.name,
+                    machine_type,
+                    preemptible,
+                    base64.b64encode(json.dumps(instance_config.to_dict()).encode()).decode(),
+                ),
+            )
+            await tx.just_execute(
+                '''
+INSERT INTO instances_free_cores_mcpu (name, free_cores_mcpu)
+VALUES (%s, %s);
+''',
+                (
+                    name,
+                    worker_cores_mcpu,
+                ),
+            )
+
+        await insert()  # pylint: disable=no-value-for-parameter
+
         return Instance(
             app,
             inst_coll,
             name,
             state,
-            cores_mcpu,
-            cores_mcpu,
+            worker_cores_mcpu,
+            worker_cores_mcpu,
             now,
             0,
             now,
@@ -145,8 +158,8 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
     async def activate(self, ip_address, timestamp):
         assert self._state == 'pending'
 
-        rv = await check_call_procedure(
-            self.db, 'CALL activate_instance(%s, %s, %s);', (self.name, ip_address, timestamp)
+        rv = await self.db.check_call_procedure(
+            'CALL activate_instance(%s, %s, %s);', (self.name, ip_address, timestamp), 'activate_instance'
         )
 
         self.inst_coll.adjust_for_remove_instance(self)
@@ -164,7 +177,9 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
         if not timestamp:
             timestamp = time_msecs()
 
-        rv = await self.db.execute_and_fetchone('CALL deactivate_instance(%s, %s, %s);', (self.name, reason, timestamp))
+        rv = await self.db.execute_and_fetchone(
+            'CALL deactivate_instance(%s, %s, %s);', (self.name, reason, timestamp), 'deactivate_instance'
+        )
 
         if rv['rc'] == 1:
             log.info(f'{self} with in-memory state {self._state} was already deactivated; {rv}')
@@ -184,8 +199,8 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                 return
             try:
                 await self.client_session.post(
-                    f'http://{self.ip_address}:5000/api/v1alpha/kill',
-                    timeout=aiohttp.ClientTimeout(total=30))
+                    f'http://{self.ip_address}:5000/api/v1alpha/kill', timeout=aiohttp.ClientTimeout(total=30)
+                )
             except aiohttp.ClientResponseError as err:
                 if err.status == 403:
                     log.info(f'cannot kill {self} -- does not exist at {self.ip_address}')
@@ -212,7 +227,51 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
 
     @property
     def free_cores_mcpu(self):
+        """A possibly negative measure of the free cores in millicpu.
+
+        See free_cores_mcpu_nonnegative for a more useful property.
+        """
         return self._free_cores_mcpu
+
+    @property
+    def free_cores_mcpu_nonnegative(self):
+        """A nonnegative measure of the free cores in millicpu.
+
+        free_cores_mcpu can be negative temporarily if the worker is oversubscribed.
+        """
+        return max(0, self.free_cores_mcpu)
+
+    @property
+    def used_cores_mcpu_nonnegative(self):
+        """A nonnegative measure of the used cores in millicpu.
+
+        The free_cores_mcpu can be negative temporarily if the worker is oversubscribed, so this
+        property uses free_cores_mcpu_nonnegative to calculate used cores.
+
+        """
+        return self.cores_mcpu - self.free_cores_mcpu_nonnegative
+
+    @property
+    def percent_cores_used(self) -> float:
+        """The percent of cores currently in use."""
+        return self.used_cores_mcpu_nonnegative / self.cores_mcpu
+
+    def cost_per_hour(self, resource_rates: Dict[str, float]) -> float:
+        """The instantaneous cost (in USD per hour) generated by this instance (WITH CAVEATS).
+
+        The instantaneous cost of this instance, ignoring attached disks.
+
+        """
+        return self.instance_config.actual_cost_per_hour(resource_rates)
+
+    def revenue_per_hour(self, resource_rates: Dict[str, float]) -> float:
+        """The instantaneous revenue (in USD per hour) generated by this instance (WITH CAVEATS).
+
+        The instantaneous revenue this instance generates, ignoring attached disks, based on the
+        cores in use.
+
+        """
+        return self.instance_config.cost_per_hour_from_cores(resource_rates, self.used_cores_mcpu_nonnegative)
 
     def adjust_free_cores_in_memory(self, delta_mcpu):
         self.inst_coll.adjust_for_remove_instance(self)
@@ -233,7 +292,8 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                 await self.mark_healthy()
                 return True
             except Exception:
-                log.exception(f'while requesting {self} /healthcheck')
+                if (time_msecs() - self.last_updated) / 1000 > 300:
+                    log.exception(f'while requesting {self} /healthcheck')
                 await self.incr_failed_request_count()
         return False
 
@@ -246,6 +306,11 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
         if not changed:
             return
 
+        self.inst_coll.adjust_for_remove_instance(self)
+        self._failed_request_count = 0
+        self._last_updated = now
+        self.inst_coll.adjust_for_add_instance(self)
+
         await self.db.execute_update(
             '''
 UPDATE instances
@@ -254,12 +319,8 @@ SET last_updated = %s,
 WHERE name = %s;
 ''',
             (now, self.name),
+            'mark_healthy',
         )
-
-        self.inst_coll.adjust_for_remove_instance(self)
-        self._failed_request_count = 0
-        self._last_updated = now
-        self.inst_coll.adjust_for_add_instance(self)
 
     async def incr_failed_request_count(self):
         await self.db.execute_update(
@@ -291,6 +352,10 @@ SET failed_request_count = failed_request_count + 1 WHERE name = %s;
 
     def last_updated_str(self):
         return humanize.naturaldelta(datetime.timedelta(milliseconds=(time_msecs() - self.last_updated)))
+
+    @property
+    def region(self):
+        return self.instance_config.region_for(self.location)
 
     def __str__(self):
         return f'instance {self.name}'

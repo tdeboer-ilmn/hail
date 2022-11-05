@@ -5,12 +5,12 @@ import is.hail.asm4s._
 import is.hail.expr.ir._
 import is.hail.expr.{Nat, NatVariable}
 import is.hail.linalg.{LAPACK, LinalgCodeUtils}
-import is.hail.types.coerce
+import is.hail.types.tcoerce
 import is.hail.types.physical.stypes.EmitType
 import is.hail.types.physical.stypes.concrete.{SBaseStructPointer, SNDArrayPointer}
 import is.hail.types.physical.stypes.interfaces._
-import is.hail.types.physical.stypes.primitives.{SBooleanCode, SBooleanValue}
-import is.hail.types.physical.{PBooleanRequired, PCanonicalNDArray, PCanonicalStruct, PFloat64Required, PType}
+import is.hail.types.physical.stypes.primitives.SBooleanValue
+import is.hail.types.physical._
 import is.hail.types.virtual._
 
 object  NDArrayFunctions extends RegistryFunctions {
@@ -30,8 +30,8 @@ object  NDArrayFunctions extends RegistryFunctions {
       registerIR2(stringOp, TNDArray(argType, nDimVar), TNDArray(argType, nDimVar), TNDArray(retType, nDimVar)) { (_, l, r, errorID) =>
         val lid = genUID()
         val rid = genUID()
-        val lElemRef = Ref(lid, coerce[TNDArray](l.typ).elementType)
-        val rElemRef = Ref(rid, coerce[TNDArray](r.typ).elementType)
+        val lElemRef = Ref(lid, tcoerce[TNDArray](l.typ).elementType)
+        val rElemRef = Ref(rid, tcoerce[TNDArray](r.typ).elementType)
 
         NDArrayMap2(l, r, lid, rid, irOp(lElemRef, rElemRef, errorID), errorID)
       }
@@ -48,11 +48,11 @@ object  NDArrayFunctions extends RegistryFunctions {
       cb.ifx(ndCoefRow  cne ndDepRow, cb._fatalWithError(errorID,"hail.nd.solve_triangular: Solve dimensions incompatible"))
 
       val uplo = cb.newLocal[String]("dtrtrs_uplo")
-      cb.ifx(lower.boolCode(cb), cb.assign(uplo, const("L")), cb.assign(uplo, const("U")))
+      cb.ifx(lower.value, cb.assign(uplo, const("L")), cb.assign(uplo, const("U")))
 
       val infoDTRTRSResult = cb.newLocal[Int]("dtrtrs_result")
 
-      val outputPType = coerce[PCanonicalNDArray](outputPt)
+      val outputPType = tcoerce[PCanonicalNDArray](outputPt)
       val output = outputPType.constructByActuallyCopyingData(ndDepColMajor, cb, region)
 
       cb.assign(infoDTRTRSResult, Code.invokeScalaObject9[String, String, String, Int, Int, Long, Int, Long, Int, Int](LAPACK.getClass, "dtrtrs",
@@ -95,7 +95,7 @@ object  NDArrayFunctions extends RegistryFunctions {
 
       cb.append(Region.copyFrom(aColMajorFirstElement, aCopy, aNumBytes))
 
-      val outputPType = coerce[PCanonicalNDArray](outputPt)
+      val outputPType = tcoerce[PCanonicalNDArray](outputPt)
       val outputShape = IndexedSeq(n, nrhs)
       val (outputAddress, outputFinisher) = outputPType.constructDataFunction(outputShape, outputPType.makeColumnMajorStrides(outputShape, region, cb), cb, region)
 

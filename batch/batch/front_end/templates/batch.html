@@ -12,7 +12,6 @@
   <li>User: {{ batch['user'] }}</li>
   <li>Billing Project: {{ batch['billing_project'] }}</li>
   <li>Time Created: {% if 'time_created' in batch and batch['time_created'] is not none %}{{ batch['time_created'] }}{% endif %}</li>
-  <li>Time Closed: {% if 'time_closed' in batch and batch['time_closed'] is not none %}{{ batch['time_closed'] }}{% endif %}</li>
   <li>Time Completed: {% if 'time_completed' in batch and batch['time_completed'] is not none %}{{ batch['time_completed'] }}{% endif %}</li>
   <li>Total Jobs: {{ batch['n_jobs'] }}</li>
   <ul>
@@ -24,6 +23,16 @@
   <li>Duration: {% if 'duration' in batch and batch['duration'] is not none %}{{ batch['duration'] }}{% endif %}</li>
   <li>Cost: {% if 'cost' in batch and batch['cost'] is not none %}{{ batch['cost'] }}{% endif %}</li>
 </ul>
+
+{% if not batch['complete'] and batch['state'] != 'Cancelled' %}
+<form action="{{ base_path }}/batches/{{ batch['id'] }}/cancel" method="post">
+  <input type="hidden" name="_csrf" value="{{ csrf_token }}"/>
+  {% if q is not none %}
+  <input type="hidden" name="q" value="{{ q }}"/>
+  {% endif %}
+  <button>Cancel</button>
+</form>
+{% endif %}
 
 <h2>Attributes</h2>
 {% if 'attributes' in batch %}

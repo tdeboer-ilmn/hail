@@ -1,30 +1,37 @@
-import datetime
-import calendar
 import asyncio
-import os
+import calendar
+import datetime
 import json
-from aiohttp import web
-import aiohttp_session
 import logging
+import os
 from collections import defaultdict, namedtuple
-from prometheus_async.aio.web import server_stats  # type: ignore
-import prometheus_client as pc  # type: ignore
 
+import aiohttp_session
+import prometheus_client as pc  # type: ignore
+from aiohttp import web
+from prometheus_async.aio.web import server_stats  # type: ignore
+
+from gear import (
+    AuthClient,
+    Database,
+    setup_aiohttp_session,
+    transaction,
+)
+from hailtop import aiotools, httpx
 from hailtop.aiocloud import aiogoogle
 from hailtop.config import get_deploy_config
 from hailtop.hail_logging import AccessLogger
 from hailtop.tls import internal_server_ssl_context
-from hailtop.utils import (run_if_changed_idempotent, retry_long_running, time_msecs, cost_str, parse_timestamp_msecs,
-                           url_basename, periodically_call)
-from hailtop import aiotools, httpx
-from gear import (
-    Database,
-    setup_aiohttp_session,
-    web_authenticated_developers_only,
-    rest_authenticated_developers_only,
-    transaction,
+from hailtop.utils import (
+    cost_str,
+    parse_timestamp_msecs,
+    periodically_call,
+    retry_long_running,
+    run_if_changed_idempotent,
+    time_msecs,
+    url_basename,
 )
-from web_common import setup_aiohttp_jinja2, setup_common_static_routes, render_template, set_message
+from web_common import render_template, set_message, setup_aiohttp_jinja2, setup_common_static_routes
 
 from .configuration import HAIL_USE_FULL_QUERY
 
@@ -34,6 +41,8 @@ routes = web.RouteTableDef()
 
 deploy_config = get_deploy_config()
 
+auth = AuthClient()
+
 GCP_REGION = os.environ['HAIL_GCP_REGION']
 BATCH_GCP_REGIONS = set(json.loads(os.environ['HAIL_BATCH_GCP_REGIONS']))
 BATCH_GCP_REGIONS.add(GCP_REGION)
@@ -41,7 +50,9 @@ BATCH_GCP_REGIONS.add(GCP_REGION)
 PROJECT = os.environ['PROJECT']
 
 DISK_SIZES_GB = pc.Summary('batch_disk_size_gb', 'Batch disk sizes (GB)', ['namespace', 'zone', 'state'])
-INSTANCES = pc.Gauge('batch_instances', 'Batch instances', ['namespace', 'zone', 'status', 'machine_type', 'preemptible'])
+INSTANCES = pc.Gauge(
+    'batch_instances', 'Batch instances', ['namespace', 'zone', 'status', 'machine_type', 'preemptible']
+)
 
 DiskLabels = namedtuple('DiskLabels', ['zone', 'namespace', 'state'])
 InstanceLabels = namedtuple('InstanceLabels', ['namespace', 'zone', 'status', 'machine_type', 'preemptible'])
@@ -121,7 +132,7 @@ async def _billing(request):
 
 
 @routes.get('/api/v1alpha/billing')
-@rest_authenticated_developers_only
+@auth.rest_authenticated_developers_only
 async def get_billing(request: web.Request, userdata) -> web.Response:  # pylint: disable=unused-argument
     cost_by_service, compute_cost_breakdown, cost_by_sku_label, time_period_query = await _billing(request)
     resp = {
@@ -134,7 +145,7 @@ async def get_billing(request: web.Request, userdata) -> web.Response:  # pylint
 
 
 @routes.get('/billing')
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def billing(request: web.Request, userdata) -> web.Response:  # pylint: disable=unused-argument
     cost_by_service, compute_cost_breakdown, cost_by_sku_label, time_period_query = await _billing(request)
     context = {
@@ -180,7 +191,7 @@ CASE
   ELSE NULL
 END AS source
 FROM `broad-ctsa.hail_billing.gcp_billing_export_v1_0055E5_9CA197_B9B894`
-WHERE DATE(_PARTITIONTIME) >= "{start_str}" AND DATE(_PARTITIONTIME) <= "{end_str}" AND project.name = "hail-vdc" AND invoice.month = "{invoice_month}"
+WHERE DATE(_PARTITIONTIME) >= "{start_str}" AND DATE(_PARTITIONTIME) <= "{end_str}" AND project.name = "{PROJECT}" AND invoice.month = "{invoice_month}"
 GROUP BY service_id, service_description, sku_id, sku_description, source;
 '''
 
@@ -287,13 +298,15 @@ async def monitor_instances(app):
     instance_counts = defaultdict(int)
 
     for zone in app['zones']:
-        async for instance in await compute_client.list(f'/zones/{zone}/instances', params={'filter': '(labels.role = batch2-agent)'}):
+        async for instance in await compute_client.list(
+            f'/zones/{zone}/instances', params={'filter': '(labels.role = batch2-agent)'}
+        ):
             instance_labels = InstanceLabels(
                 status=instance['status'],
                 zone=zone,
                 namespace=instance['labels']['namespace'],
                 machine_type=instance['machineType'].rsplit('/', 1)[1],
-                preemptible=instance['scheduling']['preemptible']
+                preemptible=instance['scheduling']['preemptible'],
             )
             instance_counts[instance_labels] += 1
 

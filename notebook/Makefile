@@ -1,7 +1,5 @@
 include ../config.mk
 
-TOKEN = $(shell cat /dev/urandom | LC_ALL=C tr -dc 'a-z0-9' | head -c 12)
-
 NOTEBOOK_IMAGE := $(DOCKER_PREFIX)/notebook:$(TOKEN)
 NOTEBOOK_NGINX_IMAGE := $(DOCKER_PREFIX)/notebook_nginx:$(TOKEN)
 
@@ -13,6 +11,7 @@ BLACK := $(PYTHON) -m black . --line-length=120 --skip-string-normalization
 check:
 	$(PYTHON) -m flake8 notebook
 	$(PYTHON) -m pylint --rcfile ../pylintrc notebook --score=n
+	$(PYTHON) -m isort . --check-only --diff
 	$(BLACK) --check --diff
 	curlylint .
 	bash ../check-sql.sh

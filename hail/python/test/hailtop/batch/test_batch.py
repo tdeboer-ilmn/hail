@@ -1,5 +1,7 @@
+import asyncio
 import secrets
 import unittest
+import pytest
 import os
 import subprocess as sp
 import tempfile
@@ -13,12 +15,14 @@ from hailtop.batch.globals import arg_max
 from hailtop.utils import grouped, async_to_blocking
 from hailtop.config import get_user_config
 from hailtop.batch.utils import concatenate
-from hailtop.aiocloud import aiogoogle
-from hailtop.aiotools import RouterAsyncFS
+from hailtop.aiotools.router_fs import RouterAsyncFS
+from hailtop.test_utils import skip_in_azure
 
 
 DOCKER_ROOT_IMAGE = os.environ['DOCKER_ROOT_IMAGE']
-PYTHON_DILL_IMAGE = os.environ['PYTHON_DILL_IMAGE']
+PYTHON_DILL_IMAGE = 'hailgenetics/python-dill:3.7-slim'
+HAIL_GENETICS_HAIL_IMAGE = os.environ['HAIL_GENETICS_HAIL_IMAGE']
+CLOUD = os.environ['HAIL_CLOUD']
 
 
 class LocalTests(unittest.TestCase):
@@ -405,9 +409,11 @@ class ServiceTests(unittest.TestCase):
         self.remote_tmpdir = remote_tmpdir
 
         if remote_tmpdir.startswith('gs://'):
-            self.bucket_name = re.fullmatch('gs://(?P<bucket_name>[^/]+).*', remote_tmpdir).groupdict()['bucket_name']
+            self.bucket = re.fullmatch('gs://(?P<bucket_name>[^/]+).*', remote_tmpdir).groupdict()['bucket_name']
         else:
-            self.bucket_name = None
+            assert remote_tmpdir.startswith('hail-az://')
+            storage_account, container_name = re.fullmatch('hail-az://(?P<storage_account>[^/]+)/(?P<container_name>[^/]+).*', remote_tmpdir).groups()
+            self.bucket = f'{storage_account}/{container_name}'
 
         self.cloud_input_dir = f'{self.remote_tmpdir}batch-tests/resources'
 
@@ -419,10 +425,9 @@ class ServiceTests(unittest.TestCase):
         if not os.path.exists(in_cluster_key_file):
             in_cluster_key_file = None
 
-        # FIXME: Make this lazy
-        router_fs = RouterAsyncFS('gs', [
-            aiogoogle.GoogleStorageAsyncFS(project='hail-vdc', credentials_file=in_cluster_key_file),
-        ])
+        router_fs = RouterAsyncFS('gs',
+                                  gcs_kwargs={'project': 'hail-vdc', 'credentials_file': in_cluster_key_file},
+                                  azure_kwargs={'credential_file': in_cluster_key_file})
 
         def sync_exists(url):
             return async_to_blocking(router_fs.exists(url))
@@ -576,6 +581,14 @@ class ServiceTests(unittest.TestCase):
         res_status = res.status()
         assert res_status['state'] == 'success', str((res_status, res.debug_info()))
 
+    def test_local_paths_error(self):
+        b = self.batch()
+        j = b.new_job()
+        for input in ["hi.txt", "~/hello.csv", "./hey.tsv", "/sup.json", "file://yo.yaml"]:
+            with pytest.raises(ValueError) as e:
+                b.read_input(input)
+            assert str(e.value).startswith("Local filepath detected")
+
     def test_dry_run(self):
         b = self.batch()
         j = b.new_job()
@@ -593,64 +606,94 @@ class ServiceTests(unittest.TestCase):
         res_status = res.status()
         assert res_status['state'] == 'success', str((res_status, res.debug_info()))
 
-    def test_gcsfuse(self):
-        assert self.bucket_name
-        path = f'/{self.bucket_name}{self.cloud_output_path}'
+    def test_cloudfuse(self):
+        assert self.bucket
+        path = f'/{self.bucket}{self.cloud_output_path}'
 
         b = self.batch()
         head = b.new_job()
-        head.command(f'mkdir -p {path}; echo head > {path}/gcsfuse_test_1')
-        head.gcsfuse(self.bucket_name, f'/{self.bucket_name}', read_only=False)
+        head.command(f'mkdir -p {path}; echo head > {path}/cloudfuse_test_1')
+        head.cloudfuse(self.bucket, f'/{self.bucket}', read_only=False)
 
         tail = b.new_job()
-        tail.command(f'cat {path}/gcsfuse_test_1')
-        tail.gcsfuse(self.bucket_name, f'/{self.bucket_name}', read_only=True)
+        tail.command(f'cat {path}/cloudfuse_test_1')
+        tail.cloudfuse(self.bucket, f'/{self.bucket}', read_only=True)
         tail.depends_on(head)
 
         res = b.run()
         res_status = res.status()
         assert res_status['state'] == 'success', str((res_status, res.debug_info()))
 
-    def test_gcsfuse_read_only(self):
-        assert self.bucket_name
-        path = f'/{self.bucket_name}{self.cloud_output_path}'
+    def test_cloudfuse_read_only(self):
+        assert self.bucket
+        path = f'/{self.bucket}{self.cloud_output_path}'
 
         b = self.batch()
         j = b.new_job()
-        j.command(f'mkdir -p {path}; echo head > {path}/gcsfuse_test_1')
-        j.gcsfuse(self.bucket_name, f'/{self.bucket_name}', read_only=True)
+        j.command(f'mkdir -p {path}; echo head > {path}/cloudfuse_test_1')
+        j.cloudfuse(self.bucket, f'/{self.bucket}', read_only=True)
 
         res = b.run()
         res_status = res.status()
         assert res_status['state'] == 'failure', str((res_status, res.debug_info()))
 
-    def test_gcsfuse_implicit_dirs(self):
-        assert self.bucket_name
-        path = f'/{self.bucket_name}{self.cloud_output_path}'
+    def test_cloudfuse_implicit_dirs(self):
+        assert self.bucket
+        path = f'/{self.bucket}{self.cloud_output_path}'
 
         b = self.batch()
         head = b.new_job()
-        head.command(f'mkdir -p {path}/gcsfuse/; echo head > {path}/gcsfuse/data')
-        head.gcsfuse(self.bucket_name, f'/{self.bucket_name}', read_only=False)
+        head.command(f'mkdir -p {path}/cloudfuse/; echo head > {path}/cloudfuse/data')
+        head.cloudfuse(self.bucket, f'/{self.bucket}', read_only=False)
 
         tail = b.new_job()
-        tail.command(f'cat {path}/gcsfuse/data')
-        tail.gcsfuse(self.bucket_name, f'/{self.bucket_name}', read_only=True)
+        tail.command(f'cat {path}/cloudfuse/data')
+        tail.cloudfuse(self.bucket, f'/{self.bucket}', read_only=True)
         tail.depends_on(head)
 
         res = b.run()
         res_status = res.status()
         assert res_status['state'] == 'success', str((res_status, res.debug_info()))
 
-    def test_gcsfuse_empty_string_bucket_fails(self):
-        assert self.bucket_name
+    def test_cloudfuse_empty_string_bucket_fails(self):
+        assert self.bucket
         b = self.batch()
         j = b.new_job()
         with self.assertRaises(BatchException):
-            j.gcsfuse('', '/empty_bucket')
+            j.cloudfuse('', '/empty_bucket')
         with self.assertRaises(BatchException):
-            j.gcsfuse(self.bucket_name, '')
+            j.cloudfuse(self.bucket, '')
 
+    @skip_in_azure
+    def test_fuse_requester_pays(self):
+        b = self.batch(requester_pays_project='hail-vdc')
+        j = b.new_job()
+        j.cloudfuse('hail-services-requester-pays', '/fuse-bucket')
+        j.command('cat /fuse-bucket/hello')
+        res = b.run()
+        res_status = res.status()
+        assert res_status['state'] == 'success', str((res_status, res.debug_info()))
+
+    @skip_in_azure
+    def test_fuse_non_requester_pays_bucket_when_requester_pays_project_specified(self):
+        assert self.bucket
+        path = f'/{self.bucket}{self.cloud_output_path}'
+
+        b = self.batch(requester_pays_project='hail-vdc')
+        head = b.new_job()
+        head.command(f'mkdir -p {path}; echo head > {path}/cloudfuse_test_1')
+        head.cloudfuse(self.bucket, f'/{self.bucket}', read_only=False)
+
+        tail = b.new_job()
+        tail.command(f'cat {path}/cloudfuse_test_1')
+        tail.cloudfuse(self.bucket, f'/{self.bucket}', read_only=True)
+        tail.depends_on(head)
+
+        res = b.run()
+        res_status = res.status()
+        assert res_status['state'] == 'success', str((res_status, res.debug_info()))
+
+    @skip_in_azure
     def test_requester_pays(self):
         b = self.batch(requester_pays_project='hail-vdc')
         input = b.read_input('gs://hail-services-requester-pays/hello')
@@ -885,3 +928,75 @@ class ServiceTests(unittest.TestCase):
         long_str = secrets.token_urlsafe(15 * 1024)
         j1.command(f'echo "{long_str}"')
         b.run()
+
+    def test_big_batch_which_uses_slow_path(self):
+        backend = ServiceBackend(remote_tmpdir=f'{self.remote_tmpdir}/temporary-files')
+        b = Batch(backend=backend)
+        # 8 * 256 * 1024 = 2 MiB > 1 MiB max bunch size
+        for i in range(8):
+            j1 = b.new_job()
+            long_str = secrets.token_urlsafe(256 * 1024)
+            j1.command(f'echo "{long_str}" > /dev/null')
+        batch = b.run()
+        assert not batch.submission_info.used_fast_create
+        batch_status = batch.status()
+        assert batch_status['state'] == 'success', str((batch.debug_info()))
+
+    def test_query_on_batch_in_batch(self):
+        sb = ServiceBackend(remote_tmpdir=f'{self.remote_tmpdir}/temporary-files')
+        bb = Batch(backend=sb, default_python_image=HAIL_GENETICS_HAIL_IMAGE)
+
+        tmp_ht_path = self.remote_tmpdir + '/' + secrets.token_urlsafe(32)
+
+        def qob_in_batch():
+            import hail as hl
+            hl.utils.range_table(10).write(tmp_ht_path, overwrite=True)
+
+        j = bb.new_python_job()
+        j.env('HAIL_QUERY_BACKEND', 'batch')
+        j.env('HAIL_BATCH_BILLING_PROJECT', get_user_config().get('batch', 'billing_project'))
+        j.env('HAIL_BATCH_REMOTE_TMPDIR', self.remote_tmpdir)
+        j.call(qob_in_batch)
+
+        bb.run()
+
+    def test_basic_async_fun(self):
+        backend = ServiceBackend(remote_tmpdir=f'{self.remote_tmpdir}/temporary-files')
+        b = Batch(backend=backend)
+
+        j = b.new_python_job()
+        j.call(asyncio.sleep, 1)
+
+        batch = b.run()
+        batch_status = batch.status()
+        assert batch_status['state'] == 'success', str((batch.debug_info()))
+
+    def test_async_fun_returns_value(self):
+        backend = ServiceBackend(remote_tmpdir=f'{self.remote_tmpdir}/temporary-files')
+        b = Batch(backend=backend)
+
+        async def foo(i, j):
+            await asyncio.sleep(1)
+            return i * j
+
+        j = b.new_python_job()
+        result = j.call(foo, 2, 3)
+
+        j = b.new_job()
+        j.command(f'cat {result.as_str()}')
+
+        batch = b.run()
+        batch_status = batch.status()
+        assert batch_status['state'] == 'success', str((batch_status, batch.debug_info()))
+        job_log_2 = batch.get_job_log(2)
+        assert job_log_2['main'] == "6\n", str((job_log_2, batch.debug_info()))
+
+    def test_specify_job_region(self):
+        b = self.batch(cancel_after_n_failures=1)
+        j = b.new_job('region')
+        possible_regions = self.backend.supported_regions()
+        j.regions(possible_regions)
+        j.command('true')
+        res = b.run()
+        res_status = res.status()
+        assert res_status['state'] == 'success', str((res_status, res.debug_info()))

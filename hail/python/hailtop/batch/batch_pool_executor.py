@@ -10,7 +10,7 @@ import sys
 from hailtop.utils import secret_alnum_string, partition
 import hailtop.batch_client.aioclient as low_level_batch_client
 from hailtop.batch_client.parse import parse_cpu_in_mcpu
-from hailtop.aiocloud import aiogoogle
+from hailtop.aiotools.router_fs import RouterAsyncFS
 
 from .batch import Batch
 from .backend import ServiceBackend
@@ -93,7 +93,7 @@ class BatchPoolExecutor:
         Backend used to execute the jobs. Must be a :class:`.ServiceBackend`.
     image:
         The name of a Docker image used for each submitted job. The image must
-        include Python 3.6 or later and must have the ``dill`` Python package
+        include Python 3.7 or later and must have the ``dill`` Python package
         installed. If you intend to use ``numpy``, ensure that OpenBLAS is also
         installed. If unspecified, an image with a matching Python verison and
         ``numpy``, ``scipy``, and ``sklearn`` installed is used.
@@ -132,15 +132,15 @@ class BatchPoolExecutor:
         self.directory = self.backend.remote_tmpdir + f'batch-pool-executor/{self.name}/'
         self.inputs = self.directory + 'inputs/'
         self.outputs = self.directory + 'outputs/'
-        self.fs = aiogoogle.GoogleStorageAsyncFS(project=project)
+        self.fs = RouterAsyncFS('file', gcs_kwargs={'project': project})
         self.futures: List[BatchPoolFuture] = []
         self.finished_future_count = 0
         self._shutdown = False
         version = sys.version_info
         if image is None:
-            if version.major != 3 or version.minor not in (6, 7, 8):
+            if version.major != 3 or version.minor not in (7, 8, 9, 10):
                 raise ValueError(
-                    f'You must specify an image if you are using a Python version other than 3.6, 3.7, or 3.8 (you are using {version})')
+                    f'You must specify an image if you are using a Python version other than 3.7, 3.8, 3.9 or 3.10 (you are using {version})')
             self.image = f'hailgenetics/python-dill:{version.major}.{version.minor}-slim'
         else:
             self.image = image
@@ -345,6 +345,14 @@ class BatchPoolExecutor:
         except AttributeError:
             name = '<anonymous>'
         name = f'{name}-{secret_alnum_string(4)}'
+
+        if asyncio.iscoroutinefunction(unapplied):
+            unapplied_copy = unapplied
+
+            def run_async(*args, **kwargs):
+                return asyncio.run(unapplied_copy(*args, **kwargs))
+            unapplied = run_async
+
         batch = Batch(name=self.name + '-' + name,
                       backend=self.backend,
                       default_image=self.image)
@@ -487,7 +495,7 @@ class BatchPoolFuture:
         """
         return self.fetch_coro.cancelled()
 
-    def running(self):  # pylint: disable=no-self-use
+    def running(self):
         """Always returns False.
 
         This future can always be cancelled, so this function always returns False.

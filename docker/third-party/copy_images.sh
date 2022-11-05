@@ -2,6 +2,8 @@
 
 set -ex
 
+source ../copy_image.sh
+
 images=$(cat images.txt)
 
 if [ -z "${DOCKER_PREFIX}" ]
@@ -13,7 +15,5 @@ fi
 for image in ${images}
 do
     dest="${DOCKER_PREFIX}/${image}"
-    docker pull $image
-    docker tag $image $dest
-    docker push $dest
+    copy_image $image $dest
 done

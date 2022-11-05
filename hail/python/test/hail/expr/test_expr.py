@@ -55,6 +55,11 @@ class Tests(unittest.TestCase):
             self.assertTrue(ht.aggregate(hl.agg.all((ht.x == ht.y)) & ~hl.agg.all((ht.x == ht.z))))
 
         test_random_function(lambda: hl.rand_unif(0, 1))
+        test_random_function(lambda: hl.rand_int32(10))
+        test_random_function(lambda: hl.rand_int32(5, 15))
+        test_random_function(lambda: hl.rand_int64(23))
+        test_random_function(lambda: hl.rand_int64(5, 15))
+        test_random_function(lambda: hl.rand_int64(1 << 33, 1 << 35))
         test_random_function(lambda: hl.rand_bool(0.5))
         test_random_function(lambda: hl.rand_norm(0, 1))
         test_random_function(lambda: hl.rand_pois(1))
@@ -576,8 +581,6 @@ class Tests(unittest.TestCase):
         for aggregation, expected in tests:
             self.assertEqual(t.aggregate(aggregation), expected)
 
-    @fails_service_backend()
-    @fails_local_backend()
     def test_agg_densify(self):
         mt = hl.utils.range_matrix_table(5, 5, 3)
         mt = mt.filter_entries(mt.row_idx == mt.col_idx)
@@ -609,7 +612,6 @@ class Tests(unittest.TestCase):
                                               None]),
         ]
 
-    @fails_service_backend(reason='service backend needs to support flags')
     @with_flags('distributed_scan_comb_op')
     def test_densify_table(self):
         ht = hl.utils.range_table(100, n_partitions=33)
@@ -1076,13 +1078,11 @@ class Tests(unittest.TestCase):
             self.assertTrue(r.sum_x == -15 and r.sum_y == 10 and r.sum_empty == 0 and
                             r.prod_x == -120 and r.prod_y == 0 and r.prod_empty == 1)
 
-    @fails_service_backend
     def test_aggregators_hist(self):
         table = hl.utils.range_table(11)
         r = table.aggregate(hl.agg.hist(table.idx - 1, 0, 8, 4))
         self.assertTrue(r.bin_edges == [0, 2, 4, 6, 8] and r.bin_freq == [2, 2, 2, 3] and r.n_smaller == 1 and r.n_larger == 1)
 
-    @fails_service_backend()
     def test_aggregators_hist_neg0(self):
         table = hl.utils.range_table(32)
         table = table.annotate(d=hl.if_else(table.idx == 11, -0.0, table.idx / 3))
@@ -1092,7 +1092,6 @@ class Tests(unittest.TestCase):
         self.assertEqual(r.n_smaller, 0)
         self.assertEqual(r.n_larger, 1)
 
-    @fails_service_backend()
     def test_aggregators_hist_nan(self):
         ht = hl.utils.range_table(3).annotate(x=hl.float('nan'))
         r = ht.aggregate(hl.agg.hist(ht.x, 0, 10, 2))
@@ -1128,7 +1127,6 @@ class Tests(unittest.TestCase):
     # r2adj = sumfit$adj.r.squared
     # f = sumfit$fstatistic
     # p = pf(f[1],f[2],f[3],lower.tail=F)
-    @fails_service_backend()
     def test_aggregators_linreg(self):
         t = hl.Table.parallelize([
             {"y": None, "x": 1.0},
@@ -1186,7 +1184,6 @@ class Tests(unittest.TestCase):
         self.assertAlmostEqual(r.multiple_p_value, 0.56671386)
         self.assertAlmostEqual(r.n, 5)
 
-    @fails_service_backend()
     def test_linreg_no_data(self):
         ht = hl.utils.range_table(1).filter(False)
         r = ht.aggregate(hl.agg.linreg(ht.idx, 0))
@@ -1302,7 +1299,6 @@ class Tests(unittest.TestCase):
         table2 = hl.utils.range_table(10)
         self.assertEqual(table.aggregate(hl.agg.count_where(hl.is_defined(table2[table.idx]))), 10)
 
-    @fails_service_backend()
     def test_switch(self):
         x = hl.literal('1')
         na = hl.missing(tint32)
@@ -1347,7 +1343,6 @@ class Tests(unittest.TestCase):
             hl.eval(hl.switch(x).when('0', 0).or_error("foo"))
         assert '.or_error("foo")' in str(exc.value)
 
-    @fails_service_backend()
     def test_case(self):
         def make_case(x):
             x = hl.literal(x)
@@ -2206,7 +2201,6 @@ class Tests(unittest.TestCase):
             (hl.literal(None, dtype='int32'), None),
             (hl.literal(None, dtype='int64'), None)])
 
-    @fails_service_backend()
     def test_is_transition(self):
         _test_many_equal([
             (hl.is_transition("A", "G"), True),
@@ -2216,7 +2210,6 @@ class Tests(unittest.TestCase):
             (hl.is_transition("ACA", "AGA"), False),
             (hl.is_transition("A", "T"), False)])
 
-    @fails_service_backend()
     def test_is_transversion(self):
         _test_many_equal([
             (hl.is_transversion("A", "T"), True),
@@ -2225,7 +2218,6 @@ class Tests(unittest.TestCase):
             (hl.is_transversion("AA", "T"), False),
             (hl.is_transversion("ACCC", "ACCT"), False)])
 
-    @fails_service_backend()
     def test_is_snp(self):
         _test_many_equal([
             (hl.is_snp("A", "T"), True),
@@ -2235,36 +2227,30 @@ class Tests(unittest.TestCase):
             (hl.is_snp("AT", "AG"), True),
             (hl.is_snp("ATCCC", "AGCCC"), True)])
 
-    @fails_service_backend()
     def test_is_mnp(self):
         _test_many_equal([
             (hl.is_mnp("ACTGAC", "ATTGTT"), True),
             (hl.is_mnp("CA", "TT"), True)])
 
-    @fails_service_backend()
     def test_is_insertion(self):
         _test_many_equal([
             (hl.is_insertion("A", "ATGC"), True),
             (hl.is_insertion("ATT", "ATGCTT"), True)])
 
-    @fails_service_backend()
     def test_is_deletion(self):
         self.assertTrue(hl.eval(hl.is_deletion("ATGC", "A")))
         self.assertTrue(hl.eval(hl.is_deletion("GTGTA", "GTA")))
 
-    @fails_service_backend()
     def test_is_indel(self):
         self.assertTrue(hl.eval(hl.is_indel("A", "ATGC")))
         self.assertTrue(hl.eval(hl.is_indel("ATT", "ATGCTT")))
         self.assertTrue(hl.eval(hl.is_indel("ATGC", "A")))
         self.assertTrue(hl.eval(hl.is_indel("GTGTA", "GTA")))
 
-    @fails_service_backend()
     def test_is_complex(self):
         self.assertTrue(hl.eval(hl.is_complex("CTA", "ATTT")))
         self.assertTrue(hl.eval(hl.is_complex("A", "TATGC")))
 
-    @fails_service_backend()
     def test_is_star(self):
         self.assertTrue(hl.eval(hl.is_star("ATC", "*")))
         self.assertTrue(hl.eval(hl.is_star("A", "*")))
@@ -2273,7 +2259,6 @@ class Tests(unittest.TestCase):
         self.assertTrue(hl.eval(hl.is_strand_ambiguous("A", "T")))
         self.assertFalse(hl.eval(hl.is_strand_ambiguous("G", "T")))
 
-    @fails_service_backend()
     def test_allele_type(self):
         self.assertEqual(
             hl.eval(hl.tuple((
@@ -2406,6 +2391,55 @@ class Tests(unittest.TestCase):
             (call_expr_4[1], 1, tint32),
             (call_expr_4.ploidy, 2, tint32)])
 
+    def test_call_unphase(self):
+
+        calls = [
+            hl.Call([0], phased=True),
+            hl.Call([0], phased=False),
+            hl.Call([1], phased=True),
+            hl.Call([1], phased=False),
+            hl.Call([0, 0], phased=True),
+            hl.Call([3, 0], phased=True),
+            hl.Call([1, 1], phased=False),
+            hl.Call([0, 0], phased=False),
+        ]
+
+        expected = [
+            hl.Call([0], phased=False),
+            hl.Call([0], phased=False),
+            hl.Call([1], phased=False),
+            hl.Call([1], phased=False),
+            hl.Call([0, 0], phased=False),
+            hl.Call([0, 3], phased=False),
+            hl.Call([1, 1], phased=False),
+            hl.Call([0, 0], phased=False),
+        ]
+
+        assert hl.eval(hl.literal(calls).map(lambda x: x.unphase())) == expected
+
+    def test_call_contains_allele(self):
+        c1 = hl.call(1, phased=True)
+        c2 = hl.call(1, phased=False)
+        c3 = hl.call(3,1, phased=True)
+        c4 = hl.call(1,3, phased=False)
+
+        for i, b in enumerate(hl.eval(tuple([
+            c1.contains_allele(1),
+            ~c1.contains_allele(0),
+            ~c1.contains_allele(2),
+            c2.contains_allele(1),
+            ~c2.contains_allele(0),
+            ~c2.contains_allele(2),
+            c3.contains_allele(1),
+            c3.contains_allele(3),
+            ~c3.contains_allele(0),
+            ~c3.contains_allele(2),
+            c4.contains_allele(1),
+            c4.contains_allele(3),
+            ~c4.contains_allele(0),
+            ~c4.contains_allele(2),
+        ]))):
+            assert b, i
     def test_call_unphase_diploid_gt_index(self):
         calls_and_indices = [
             (hl.call(0, 0), 0),
@@ -2773,51 +2807,6 @@ class Tests(unittest.TestCase):
 |       2 |
 +---------+
 '''
-
-    @fails_service_backend()
-    @fails_local_backend()
-    def test_export(self):
-        for delimiter in ['\t', ',', '@']:
-            for missing in ['NA', 'null']:
-                for header in [True, False]:
-                    self._test_export_entry(delimiter, missing, header)
-
-    def _test_export_entry(self, delimiter, missing, header):
-        mt = hl.utils.range_matrix_table(3, 3)
-        mt = mt.key_cols_by(col_idx = mt.col_idx + 1)
-        mt = mt.annotate_entries(x = mt.row_idx * mt.col_idx)
-        mt = mt.annotate_entries(x = hl.or_missing(mt.x != 4, mt.x))
-        with hl.TemporaryFilename() as f:
-            mt.x.export(f,
-                        delimiter=delimiter,
-                        header=header,
-                        missing=missing)
-            if header:
-                actual = hl.import_matrix_table(f,
-                                                row_fields={'row_idx': hl.tint32},
-                                                row_key=['row_idx'],
-                                                sep=delimiter,
-                                                missing=missing)
-            else:
-                actual = hl.import_matrix_table(f,
-                                                row_fields={'f0': hl.tint32},
-                                                row_key=['f0'],
-                                                sep=delimiter,
-                                                no_header=True,
-                                                missing=missing)
-                actual = actual.rename({'f0': 'row_idx'})
-            actual = actual.key_cols_by(col_idx = hl.int(actual.col_id))
-            actual = actual.drop('col_id')
-            if not header:
-                actual = actual.key_cols_by(col_idx = actual.col_idx + 1)
-            mt.show()
-            actual.show()
-            assert mt._same(actual)
-
-            expected_collect = [0, 0, 0,
-                                1, 2, 3,
-                                2, None, 6]
-            assert expected_collect == actual.x.collect()
 
     @fails_service_backend()
     @fails_local_backend()
@@ -3243,7 +3232,6 @@ class Tests(unittest.TestCase):
         self.assert_evals_to(hl.set([1, 2, 3]) ^ set([3, 4, 5]), set([1, 2, 4, 5]))
         self.assert_evals_to(set([1, 2, 3]) ^ hl.set([3, 4, 5]), set([1, 2, 4, 5]))
 
-    @fails_service_backend()
     def test_uniroot(self):
         tol = 1.220703e-4
 
@@ -3520,6 +3508,10 @@ class Tests(unittest.TestCase):
         fd = hl.utils.frozendict({"a": 4, "b": 8})
         assert hl.eval(hl.literal(fd)) == hl.utils.frozendict({"a": 4, "b": 8})
 
+    def test_literal_with_empty_struct_key(self):
+        original = {hl.Struct(): 4}
+        assert hl.eval(hl.literal(original)) == original
+
     def test_nan_roundtrip(self):
         a = [math.nan, math.inf, -math.inf, 0, 1]
         round_trip = hl.eval(hl.literal(a))
@@ -3624,6 +3616,9 @@ class Tests(unittest.TestCase):
         assert hl.bit_not(1).dtype == hl.tint32
         assert hl.bit_not(hl.int64(1)).dtype == hl.tint64
 
+        assert hl.bit_count(1).dtype == hl.tint32
+        assert hl.bit_count(hl.int64(1)).dtype == hl.tint32
+
     def test_bit_shifts(self):
         assert hl.eval(hl.bit_lshift(hl.int(8), 2)) == 32
         assert hl.eval(hl.bit_rshift(hl.int(8), 2)) == 2
@@ -3646,7 +3641,6 @@ class Tests(unittest.TestCase):
         assert hl.eval(hl.bit_rshift(hl.int64(-1), 64)) == -1
         assert hl.eval(hl.bit_rshift(hl.int64(-11), 64, logical=True)) == 0
 
-    @fails_service_backend()
     def test_bit_shift_errors(self):
         with pytest.raises(hl.utils.HailUserError):
             hl.eval(hl.bit_lshift(1, -1))
@@ -3789,7 +3783,6 @@ class Tests(unittest.TestCase):
         ]
         assert hl.eval(hl._compare(hl.tuple(values), hl.tuple(hl.parse_json(hl.json(v), v.dtype) for v in values)) == 0)
 
-    @fails_service_backend()
     def test_expr_persist(self):
         # need to test laziness, so we will overwrite a file
         ht2 = hl.utils.range_table(100)
@@ -3851,3 +3844,55 @@ class Tests(unittest.TestCase):
             [('foo', 10), ('bar', 11), ('baz', 12)],
             []
         )
+
+    def test_split_line(self):
+        s1 = '1 2 3 4 5 6 7'
+        s2 = '1 2 "3 4" "a b c d"'
+        s3 = '"1" "2"'
+
+        assert hl.eval(hl.str(s1)._split_line(' ', ['NA'], quote=None, regex=False)) == s1.split(' ')
+        assert hl.eval(hl.str(s1)._split_line(r'\s+', ['NA'], quote=None, regex=True)) == s1.split(' ')
+        assert hl.eval(hl.str(s3)._split_line(' ', ['1'], quote='"', regex=False)) == [None, '2']
+        assert hl.eval(hl.str(s2)._split_line(' ', ['1', '2'], quote='"', regex=False)) == [None, None, '3 4', 'a b c d']
+        assert hl.eval(hl.str(s2)._split_line(r'\s+', ['1', '2'], quote='"', regex=True)) == [None, None, '3 4', 'a b c d']
+
+
+@pytest.mark.parametrize("delimiter", ['\t', ',', '@'])
+@pytest.mark.parametrize("missing", ['NA', 'null'])
+@pytest.mark.parametrize("header", [True, False])
+def test_export_entry(delimiter, missing, header):
+    mt = hl.utils.range_matrix_table(3, 3)
+    mt = mt.key_cols_by(col_idx = mt.col_idx + 1)
+    mt = mt.annotate_entries(x = mt.row_idx * mt.col_idx)
+    mt = mt.annotate_entries(x = hl.or_missing(mt.x != 4, mt.x))
+    with hl.TemporaryFilename() as f:
+        mt.x.export(f,
+                    delimiter=delimiter,
+                    header=header,
+                    missing=missing)
+        if header:
+            actual = hl.import_matrix_table(f,
+                                            row_fields={'row_idx': hl.tint32},
+                                            row_key=['row_idx'],
+                                            sep=delimiter,
+                                            missing=missing)
+        else:
+            actual = hl.import_matrix_table(f,
+                                            row_fields={'f0': hl.tint32},
+                                            row_key=['f0'],
+                                            sep=delimiter,
+                                            no_header=True,
+                                            missing=missing)
+            actual = actual.rename({'f0': 'row_idx'})
+        actual = actual.key_cols_by(col_idx = hl.int(actual.col_id))
+        actual = actual.drop('col_id')
+        if not header:
+            actual = actual.key_cols_by(col_idx = actual.col_idx + 1)
+        mt.show()
+        actual.show()
+        assert mt._same(actual)
+
+        expected_collect = [0, 0, 0,
+                            1, 2, 3,
+                            2, None, 6]
+        assert expected_collect == actual.x.collect()

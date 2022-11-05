@@ -11,7 +11,6 @@ import is.hail.methods.ForceCountTable
 import is.hail.types._
 import is.hail.types.physical.PStruct
 import is.hail.types.virtual._
-import is.hail.rvd.RVDPartitioner
 import is.hail.utils._
 import is.hail.{ExecStrategy, HailSuite}
 import org.apache.spark.sql.Row
@@ -47,7 +46,11 @@ class TableIRSuite extends HailSuite {
     val read = TableIR.read(fs, path, false, None)
     val droppedRows = TableIR.read(fs, path, true, None)
 
-    val expectedRows = Array.tabulate(10)(i => Row(i)).toFastIndexedSeq
+    val uids = for {
+      (partSize, partIndex) <- partition(10, 3).zipWithIndex
+      i <- 0 until partSize
+    } yield Row(partIndex.toLong, i.toLong)
+    val expectedRows = (0 until 10, uids).zipped.map { (i, uid) => Row(i, uid) }
     val expectedGlobals = Row(57)
 
     assertEvalsTo(TableCollect(read), Row(expectedRows, expectedGlobals))
@@ -73,8 +76,9 @@ class TableIRSuite extends HailSuite {
     implicit val execStrats = ExecStrategy.allRelational
 
     val r = TableRange(2, 2)
-    val tc = GetField(collect(r), "rows")
-    val m = TableMapRows(r, InsertFields(Ref("row", r.typ.rowType), FastIndexedSeq("collected" -> tc)))
+
+    val tc = GetField(collect(TableRange(2, 2)), "rows")
+    val m = TableMapRows(TableRange(2, 2), InsertFields(Ref("row", r.typ.rowType), FastIndexedSeq("collected" -> tc)))
     assertEvalsTo(collect(m),
       Row(FastIndexedSeq(
         Row(0, FastIndexedSeq(Row(0), Row(1))),
@@ -577,7 +581,7 @@ class TableIRSuite extends HailSuite {
     val keyNames = FastIndexedSeq("field1", "field2")
     val tt = TableType(rowType = signature, key = keyNames, globalType = TStruct.empty)
     val base = TableLiteral(
-      TableValue(ctx, tt.rowType, tt.key, rdd))
+      TableValue(ctx, tt.rowType, tt.key, rdd), theHailClassLoader)
 
     // construct the table with a longer key, then copy the table to shorten the key in type, but not rvd
     val distinctCount = TableCount(TableDistinct(TableLiteral(tt.copy(key = FastIndexedSeq("field1")), base.rvd, base.enc, base.encodedGlobals)))
@@ -758,9 +762,60 @@ class TableIRSuite extends HailSuite {
     val path = ctx.createTmpPath("test-table-write", "ht")
     Interpret[Unit](ctx, TableWrite(table, TableNativeWriter(path)))
     val before = table.analyzeAndExecute(ctx).asTableValue(ctx)
-    val after = Interpret(TableIR.read(fs, path), ctx, false)
+    val read = TableIR.read(fs, path, requestedType = Some(table.typ))
+    assert(read.isDistinctlyKeyed)
+    val after = Interpret(read, ctx, false)
     assert(before.globals.javaValue == after.globals.javaValue)
     assert(before.rdd.collect().toFastIndexedSeq == after.rdd.collect().toFastIndexedSeq)
+  }
+
+  @Test def testWriteKeyDistinctness(): Unit = {
+    implicit val execStrats = ExecStrategy.interpretOnly
+    val rt = TableRange(40, 4)
+    val idxRef =  GetField(Ref("row", rt.typ.rowType), "idx")
+    val at = TableMapRows(rt, MakeStruct(Seq(
+      "idx" -> idxRef,
+      "const" -> 5,
+      "half" ->  idxRef.floorDiv(2),
+      "oneRepeat" -> If(idxRef ceq I32(10), I32(9), idxRef),
+      "oneMissing" -> If(idxRef ceq I32(4), NA(TInt32), idxRef),
+      "twoMissing" -> If((idxRef ceq 10) || (idxRef ceq 2), NA(TInt32), idxRef)
+    )))
+    val keyedByConst = TableKeyBy(at, IndexedSeq("const"))
+    val pathConst = ctx.createTmpPath("test-table-write-distinctness", "ht")
+    Interpret[Unit](ctx, TableWrite(keyedByConst, TableNativeWriter(pathConst)))
+    val readConst = TableIR.read(fs, pathConst)
+    assert(!readConst.isDistinctlyKeyed)
+
+    val keyedByHalf = TableKeyBy(at, IndexedSeq("half"))
+    val pathHalf = ctx.createTmpPath("test-table-write-distinctness", "ht")
+    Interpret[Unit](ctx, TableWrite(keyedByHalf, TableNativeWriter(pathHalf)))
+    val readHalf = TableIR.read(fs, pathHalf)
+    assert(!readHalf.isDistinctlyKeyed)
+
+    val keyedByIdxAndHalf = TableKeyBy(at, IndexedSeq("idx", "half"))
+    val pathIdxAndHalf = ctx.createTmpPath("test-table-write-distinctness", "ht")
+    Interpret[Unit](ctx, TableWrite(keyedByIdxAndHalf, TableNativeWriter(pathIdxAndHalf)))
+    val readIdxAndHalf = TableIR.read(fs, pathIdxAndHalf)
+    assert(readIdxAndHalf.isDistinctlyKeyed)
+
+    val keyedByOneRepeat = TableKeyBy(at, IndexedSeq("oneRepeat"))
+    val pathOneRepeat = ctx.createTmpPath("test-table-write-distinctness", "ht")
+    Interpret[Unit](ctx, TableWrite(keyedByOneRepeat, TableNativeWriter(pathOneRepeat)))
+    val readOneRepeat = TableIR.read(fs, pathOneRepeat)
+    assert(!readOneRepeat.isDistinctlyKeyed)
+
+    val keyedByOneMissing = TableKeyBy(at, IndexedSeq("oneMissing"))
+    val pathOneMissing = ctx.createTmpPath("test-table-write-distinctness", "ht")
+    Interpret[Unit](ctx, TableWrite(keyedByOneMissing, TableNativeWriter(pathOneMissing)))
+    val readOneMissing = TableIR.read(fs, pathOneMissing)
+    assert(readOneMissing.isDistinctlyKeyed)
+
+    val keyedByTwoMissing = TableKeyBy(at, IndexedSeq("twoMissing"))
+    val pathTwoMissing = ctx.createTmpPath("test-table-write-distinctness", "ht")
+    Interpret[Unit](ctx, TableWrite(keyedByTwoMissing, TableNativeWriter(pathTwoMissing)))
+    val readTwoMissing = TableIR.read(fs, pathTwoMissing)
+    assert(!readTwoMissing.isDistinctlyKeyed)
   }
 
   @Test def testPartitionCountsWithDropRows() {
@@ -769,13 +824,19 @@ class TableIRSuite extends HailSuite {
 
       def pathsUsed: Seq[String] = FastSeq()
 
-      override def apply(tr: TableRead, ctx: ExecuteContext): TableValue = ???
+      override def apply(ctx: ExecuteContext, requestedType: TableType, dropRows: Boolean): TableValue = ???
 
       override def partitionCounts: Option[IndexedSeq[Long]] = Some(FastIndexedSeq(1, 2, 3, 4))
 
-      def rowAndGlobalPTypes(ctx: ExecuteContext, requestedType: TableType): (PStruct, PStruct) = ???
+      override def concreteRowRequiredness(ctx: ExecuteContext, requestedType: TableType): VirtualTypeWithReq = ???
 
-      override def fullType: TableType = TableType(TStruct.empty, FastIndexedSeq(), TStruct.empty)
+      override def uidRequiredness: VirtualTypeWithReq = ???
+
+      override def globalRequiredness(ctx: ExecuteContext, requestedType: TableType): VirtualTypeWithReq = ???
+
+      override def uidType = TInt64
+
+      override def fullTypeWithoutUIDs: TableType = TableType(TStruct(), FastIndexedSeq(), TStruct.empty)
     }
     val tir = TableRead(tr.fullType, true, tr)
     assert(tir.partitionCounts.forall(_.sum == 0))
@@ -923,13 +984,12 @@ class TableIRSuite extends HailSuite {
   }
 
   @Test def testTableKeyByAndAggregate(): Unit = {
-    implicit val execStrats = ExecStrategy.interpretOnly //FIXME: Lowering is implemented, will work when method splitting is fixed.
     val tir: TableIR = TableRead.native(fs, "src/test/resources/three_key.ht")
     val unkeyed = TableKeyBy(tir, IndexedSeq[String]())
     val rowRef = Ref("row", unkeyed.typ.rowType)
     val aggSignature = AggSignature(Sum(), FastIndexedSeq(), FastIndexedSeq(TInt64))
     val aggExpression = MakeStruct(FastSeq("y_sum" -> ApplyAggOp(FastIndexedSeq(), FastIndexedSeq(Cast(GetField(rowRef, "y"), TInt64)), aggSignature)))
-    val keyByXAndAggregateSum = TableKeyByAndAggregate(unkeyed, aggExpression, MakeStruct(FastSeq("x" -> GetField(rowRef, "x"))))
+    val keyByXAndAggregateSum = TableKeyByAndAggregate(unkeyed, aggExpression, MakeStruct(FastSeq("x" -> GetField(rowRef, "x"))), bufferSize = 50)
 
     assertEvalsTo(
       collect(keyByXAndAggregateSum),
@@ -937,14 +997,14 @@ class TableIRSuite extends HailSuite {
     )
 
     // Keying by a newly computed field.
-    val keyByXPlusTwoAndAggregateSum = TableKeyByAndAggregate(unkeyed, aggExpression, MakeStruct(FastSeq("xPlusTwo" -> (GetField(rowRef, "x") + 2))))
+    val keyByXPlusTwoAndAggregateSum = TableKeyByAndAggregate(unkeyed, aggExpression, MakeStruct(FastSeq("xPlusTwo" -> (GetField(rowRef, "x") + 2))), bufferSize = 50)
     assertEvalsTo(
       collect(keyByXPlusTwoAndAggregateSum),
       Row(FastIndexedSeq(Row(4, 1L), Row(5,5L), Row(6, 14L), Row(7, 30L), Row(8, 55L), Row(9, 91L), Row(10, 140L), Row(11, 204L)), Row())
     )
 
     // Keying by just Z when original is keyed by x,y,z, naming it x anyway.
-    val keyByZAndAggregateSum =  TableKeyByAndAggregate(tir, aggExpression, MakeStruct(FastSeq("x" -> GetField(rowRef, "z"))))
+    val keyByZAndAggregateSum =  TableKeyByAndAggregate(tir, aggExpression, MakeStruct(FastSeq("x" -> GetField(rowRef, "z"))), bufferSize = 50)
     assertEvalsTo(
       collect(keyByZAndAggregateSum),
       Row(FastIndexedSeq(Row(0, 120L), Row(1, 112L), Row(2, 98L), Row(3, 80L), Row(4, 60L), Row(5, 40L), Row(6, 22L), Row(7, 8L)), Row())
@@ -1021,14 +1081,14 @@ class TableIRSuite extends HailSuite {
     val mnrSpec = mnr.getSpec()
 
     val reader = TableNativeZippedReader(rowsPath, entriesPath, None, mnrSpec.rowsSpec, mnrSpec.entriesSpec)
-    val tableType = mnr.fullMatrixType.canonicalTableType.copy(globalType = TStruct(), key=IndexedSeq("locus"))
+    val tableType = mnr.matrixToTableType(mnr.fullMatrixType).copy(globalType = TStruct(), key=IndexedSeq("locus"))
     val irToLower = TableAggregate(TableRead(tableType, false, reader),
       MakeTuple.ordered(FastSeq(
         ApplyAggOp(Collect())(GetField(Ref("row", tableType.rowType), "rsid"))
       )))
     val optimized = Optimize(irToLower, "foo", ctx)
-    val requirednessAnalysis = Requiredness.apply(optimized, ctx)
-    LowerTableIR(optimized, DArrayLowering.All, ctx, requirednessAnalysis, Map.empty)
+    val analyses = Analyses.apply(optimized, ctx)
+    LowerTableIR(optimized, DArrayLowering.All, ctx, analyses, Map.empty)
   }
 
   @Test def testTableMapPartitions() {
@@ -1099,7 +1159,9 @@ class TableIRSuite extends HailSuite {
         Row((i / 5) * 5)
       }, Row("Hello")))
 
-    val e = intercept[HailException](TypeCheck(collect(TableMapPartitions(table, "g", "part", StreamFlatMap(StreamRange(0, 2, 1), "_", part)))))
+    val e = intercept[HailException](TypeCheck(
+      ctx,
+      collect(TableMapPartitions(table, "g", "part", StreamFlatMap(StreamRange(0, 2, 1), "_", part)))))
     assert("must iterate over the partition exactly once".r.findFirstIn(e.getCause.getMessage).isDefined)
   }
 }

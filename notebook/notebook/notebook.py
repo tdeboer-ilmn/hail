@@ -1,31 +1,26 @@
+import asyncio
 import logging
 import os
 import secrets
 from functools import wraps
-import asyncio
-import pymysql
+
 import aiohttp
-from aiohttp import web
 import aiohttp_session
 import aiohttp_session.cookie_storage
-from kubernetes_asyncio import client, config
-import kubernetes_asyncio as kube
+import kubernetes_asyncio.client
+import kubernetes_asyncio.client.rest
+import kubernetes_asyncio.config
+import pymysql
+from aiohttp import web
 from prometheus_async.aio.web import server_stats  # type: ignore
 
+from gear import AuthClient, check_csrf_token, create_database_pool, monitor_endpoints_middleware, setup_aiohttp_session
+from gear.cloud_config import get_global_config
+from hailtop import httpx
 from hailtop.config import get_deploy_config
 from hailtop.hail_logging import AccessLogger
 from hailtop.tls import internal_server_ssl_context
-from hailtop import httpx
-from gear import (
-    setup_aiohttp_session,
-    create_database_pool,
-    web_authenticated_users_only,
-    web_maybe_authenticated_user,
-    web_authenticated_developers_only,
-    check_csrf_token,
-    monitor_endpoints_middleware,
-)
-from web_common import sass_compile, setup_aiohttp_jinja2, setup_common_static_routes, set_message, render_template
+from web_common import render_template, sass_compile, set_message, setup_aiohttp_jinja2, setup_common_static_routes
 
 log = logging.getLogger('notebook')
 
@@ -34,6 +29,8 @@ NOTEBOOK_NAMESPACE = os.environ['HAIL_NOTEBOOK_NAMESPACE']
 deploy_config = get_deploy_config()
 
 routes = web.RouteTableDef()
+
+auth = AuthClient()
 
 # Must be int for Kubernetes V1 api timeout_seconds property
 KUBERNETES_TIMEOUT_IN_SECONDS = float(os.environ.get('KUBERNETES_TIMEOUT_IN_SECONDS', 5))
@@ -118,27 +115,33 @@ async def start_pod(k8s, service, userdata, notebook_token, jupyter_token):
 
         image = DEFAULT_WORKER_IMAGE
 
-        env = [kube.client.V1EnvVar(name='HAIL_DEPLOY_CONFIG_FILE', value='/deploy-config/deploy-config.json')]
+        env = [
+            kubernetes_asyncio.client.V1EnvVar(
+                name='HAIL_DEPLOY_CONFIG_FILE', value='/deploy-config/deploy-config.json'
+            )
+        ]
 
         tokens_secret_name = userdata['tokens_secret_name']
         hail_credentials_secret_name = userdata['hail_credentials_secret_name']
         volumes = [
-            kube.client.V1Volume(
-                name='deploy-config', secret=kube.client.V1SecretVolumeSource(secret_name='deploy-config')
+            kubernetes_asyncio.client.V1Volume(
+                name='deploy-config', secret=kubernetes_asyncio.client.V1SecretVolumeSource(secret_name='deploy-config')
             ),
-            kube.client.V1Volume(
-                name='gsa-key', secret=kube.client.V1SecretVolumeSource(secret_name=hail_credentials_secret_name)
+            kubernetes_asyncio.client.V1Volume(
+                name='gsa-key',
+                secret=kubernetes_asyncio.client.V1SecretVolumeSource(secret_name=hail_credentials_secret_name),
             ),
-            kube.client.V1Volume(
-                name='user-tokens', secret=kube.client.V1SecretVolumeSource(secret_name=tokens_secret_name)
+            kubernetes_asyncio.client.V1Volume(
+                name='user-tokens',
+                secret=kubernetes_asyncio.client.V1SecretVolumeSource(secret_name=tokens_secret_name),
             ),
         ]
         volume_mounts = [
-            kube.client.V1VolumeMount(mount_path='/deploy-config', name='deploy-config', read_only=True),
-            kube.client.V1VolumeMount(mount_path='/gsa-key', name='gsa-key', read_only=True),
-            kube.client.V1VolumeMount(mount_path='/user-tokens', name='user-tokens', read_only=True),
+            kubernetes_asyncio.client.V1VolumeMount(mount_path='/deploy-config', name='deploy-config', read_only=True),
+            kubernetes_asyncio.client.V1VolumeMount(mount_path='/gsa-key', name='gsa-key', read_only=True),
+            kubernetes_asyncio.client.V1VolumeMount(mount_path='/user-tokens', name='user-tokens', read_only=True),
         ]
-        resources = kube.client.V1ResourceRequirements(requests={'cpu': '1.601', 'memory': '1.601G'})
+        resources = kubernetes_asyncio.client.V1ResourceRequirements(requests={'cpu': '1.601', 'memory': '1.601G'})
     else:
         workshop = userdata['workshop']
 
@@ -150,20 +153,20 @@ async def start_pod(k8s, service, userdata, notebook_token, jupyter_token):
 
         cpu = workshop['cpu']
         memory = workshop['memory']
-        resources = kube.client.V1ResourceRequirements(
+        resources = kubernetes_asyncio.client.V1ResourceRequirements(
             requests={'cpu': cpu, 'memory': memory}, limits={'cpu': cpu, 'memory': memory}
         )
 
-    pod_spec = kube.client.V1PodSpec(
+    pod_spec = kubernetes_asyncio.client.V1PodSpec(
         node_selector={'preemptible': 'false'},
         service_account_name=service_account_name,
         containers=[
-            kube.client.V1Container(
+            kubernetes_asyncio.client.V1Container(
                 command=command,
                 name='default',
                 image=image,
                 env=env,
-                ports=[kube.client.V1ContainerPort(container_port=POD_PORT)],
+                ports=[kubernetes_asyncio.client.V1ContainerPort(container_port=POD_PORT)],
                 resources=resources,
                 volume_mounts=volume_mounts,
             )
@@ -172,8 +175,8 @@ async def start_pod(k8s, service, userdata, notebook_token, jupyter_token):
     )
 
     user_id = str(userdata['id'])
-    pod_template = kube.client.V1Pod(
-        metadata=kube.client.V1ObjectMeta(
+    pod_template = kubernetes_asyncio.client.V1Pod(
+        metadata=kubernetes_asyncio.client.V1ObjectMeta(
             generate_name='notebook-worker-', labels={'app': 'notebook-worker', 'user_id': user_id}
         ),
         spec=pod_spec,
@@ -207,7 +210,7 @@ async def k8s_notebook_status_from_notebook(k8s, notebook):
             name=notebook['pod_name'], namespace=NOTEBOOK_NAMESPACE, _request_timeout=KUBERNETES_TIMEOUT_IN_SECONDS
         )
         return notebook_status_from_pod(pod)
-    except kube.client.rest.ApiException as e:
+    except kubernetes_asyncio.client.rest.ApiException as e:
         if e.status == 404:
             log.exception(f"404 for pod: {notebook['pod_name']}")
             return None
@@ -230,7 +233,7 @@ async def notebook_status_from_notebook(client_session: httpx.ClientSession, k8s
                 service, f'/instance/{notebook["notebook_token"]}/?token={notebook["jupyter_token"]}'
             )
             try:
-                async with client_session.get(ready_url, headers=headers, cookes=cookies) as resp:
+                async with client_session.get(ready_url, headers=headers, cookies=cookies) as resp:
                     if resp.status >= 200 and resp.status < 300:
                         log.info(f'GET on jupyter pod {pod_name} succeeded: {resp}')
                         status['state'] = 'Ready'
@@ -274,7 +277,7 @@ async def get_user_notebook(dbpool, user_id):
 async def delete_worker_pod(k8s, pod_name):
     try:
         await k8s.delete_namespaced_pod(pod_name, NOTEBOOK_NAMESPACE, _request_timeout=KUBERNETES_TIMEOUT_IN_SECONDS)
-    except kube.client.rest.ApiException as e:
+    except kubernetes_asyncio.client.rest.ApiException as e:
         log.info(f'pod {pod_name} already deleted {e}')
 
 
@@ -285,7 +288,7 @@ async def healthcheck(request):  # pylint: disable=unused-argument
 
 @routes.get('')
 @routes.get('/')
-@web_maybe_authenticated_user
+@auth.web_maybe_authenticated_user
 async def index(request, userdata):  # pylint: disable=unused-argument
     return await render_template('notebook', request, userdata, 'index.html', {})
 
@@ -361,10 +364,10 @@ async def _wait_websocket(service, request, userdata):
         headers['X-Hail-Internal-Authorization'] = request.headers['X-Hail-Internal-Authorization']
 
     cookies = {}
-    if 'session' in request.cookies:
-        cookies['session'] = request.cookies['session']
-    if 'sesh' in request.cookies:
-        cookies['sesh'] = request.cookies['sesh']
+    cloud = get_global_config()['cloud']
+    for k in (f'{cloud}_session', f'{cloud}_sesh'):
+        if k in request.cookies:
+            cookies[k] = request.cookies[k]
 
     ready = notebook['state'] == 'Ready'
     count = 0
@@ -436,27 +439,27 @@ async def _get_auth(request, userdata):
 
 
 @routes.get('/notebook')
-@web_authenticated_users_only()
+@auth.web_authenticated_users_only()
 async def get_notebook(request, userdata):
     return await _get_notebook('notebook', request, userdata)
 
 
 @routes.post('/notebook/delete')
 @check_csrf_token
-@web_authenticated_users_only(redirect=False)
+@auth.web_authenticated_users_only(redirect=False)
 async def delete_notebook(request, userdata):  # pylint: disable=unused-argument
     return await _delete_notebook('notebook', request, userdata)
 
 
 @routes.post('/notebook')
 @check_csrf_token
-@web_authenticated_users_only(redirect=False)
+@auth.web_authenticated_users_only(redirect=False)
 async def post_notebook(request, userdata):
     return await _post_notebook('notebook', request, userdata)
 
 
 @routes.get('/auth/{requested_notebook_token}')
-@web_authenticated_users_only(redirect=False)
+@auth.web_authenticated_users_only(redirect=False)
 async def get_auth(request, userdata):
     return await _get_auth(request, userdata)
 
@@ -478,19 +481,19 @@ async def get_images(request):
 
 
 @routes.get('/notebook/wait')
-@web_authenticated_users_only(redirect=False)
+@auth.web_authenticated_users_only(redirect=False)
 async def wait_websocket(request, userdata):
     return await _wait_websocket('notebook', request, userdata)
 
 
 @routes.get('/error')
-@web_maybe_authenticated_user
+@auth.web_maybe_authenticated_user
 async def get_error(request, userdata):
     return await _get_error('notebook', request, userdata)
 
 
 @routes.get('/workshop-admin')
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def workshop_admin(request, userdata):
     dbpool = request.app['dbpool']
     async with dbpool.acquire() as conn:
@@ -504,7 +507,7 @@ async def workshop_admin(request, userdata):
 
 @routes.post('/workshop-admin-create')
 @check_csrf_token
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def create_workshop(request, userdata):  # pylint: disable=unused-argument
     dbpool = request.app['dbpool']
     session = await aiohttp_session.get_session(request)
@@ -537,7 +540,7 @@ INSERT INTO workshops (name, image, cpu, memory, password, active, token) VALUES
 
 @routes.post('/workshop-admin-update')
 @check_csrf_token
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def update_workshop(request, userdata):  # pylint: disable=unused-argument
     app = request.app
     dbpool = app['dbpool']
@@ -570,7 +573,7 @@ UPDATE workshops SET name = %s, image = %s, cpu = %s, memory = %s, password = %s
 
 @routes.post('/workshop-admin-delete')
 @check_csrf_token
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def delete_workshop(request, userdata):  # pylint: disable=unused-argument
     app = request.app
     dbpool = app['dbpool']
@@ -716,17 +719,17 @@ async def workshop_wait_websocket(request, userdata):
 
 
 @workshop_routes.get('/error')
-@web_maybe_authenticated_user
+@auth.web_maybe_authenticated_user
 async def workshop_get_error(request, userdata):
     return await _get_error('workshop', request, userdata)
 
 
 async def on_startup(app):
     if 'BATCH_USE_KUBE_CONFIG' in os.environ:
-        await config.load_kube_config()
+        await kubernetes_asyncio.config.load_kube_config()
     else:
-        config.load_incluster_config()
-    app['k8s_client'] = client.CoreV1Api()
+        kubernetes_asyncio.config.load_incluster_config()
+    app['k8s_client'] = kubernetes_asyncio.client.CoreV1Api()
 
     app['dbpool'] = await create_database_pool()
 

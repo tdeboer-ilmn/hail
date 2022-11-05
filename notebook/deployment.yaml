@@ -35,7 +35,13 @@ spec:
   selector:
     matchLabels:
       app: notebook
+{% if scope == "deploy" %}
   replicas: 3
+{% elif scope == "test" or scope == "dev" %}
+  replicas: 1
+{% else %}
+!!! unexpected scope {{ scope }} !!!
+{% endif %}
   template:
     metadata:
       labels:
@@ -57,6 +63,8 @@ spec:
       tolerations:
        - key: preemptible
          value: "true"
+       - key: "kubernetes.azure.com/scalesetpriority"
+         value: "spot"
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -72,11 +80,11 @@ spec:
          image: "{{ notebook_image.image }}"
          resources:
            requests:
-             memory: 20M
-             cpu: 20m
+             cpu: "5m"
+             memory: "20M"
            limits:
-             memory: 200M
              cpu: "1"
+             memory: "200M"
          env:
           - name: HAIL_DEPLOY_CONFIG_FILE
             value: /deploy-config/deploy-config.json
@@ -95,6 +103,9 @@ spec:
           - name: deploy-config
             mountPath: /deploy-config
             readOnly: true
+          - name: global-config
+            mountPath: /global-config
+            readOnly: true
           - name: session-secret-key
             mountPath: /session-secret-key
             readOnly: true
@@ -108,7 +119,7 @@ spec:
          image: {{ notebook_nginx_image.image }}
          resources:
            requests:
-             cpu: "20m"
+             cpu: "5m"
              memory: "20M"
            limits:
              cpu: "1"
@@ -129,6 +140,10 @@ spec:
          secret:
            optional: false
            secretName: deploy-config
+       - name: global-config
+         secret:
+           optional: false
+           secretName: global-config
        - name: session-secret-key
          secret:
            optional: false
@@ -155,8 +170,15 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: notebook
+{% if scope == "deploy" %}
   minReplicas: 3
   maxReplicas: 10
+{% elif scope == "test" or scope == "dev" %}
+  minReplicas: 1
+  maxReplicas: 3
+{% else %}
+!!! unexpected scope {{ scope }} !!!
+{% endif %}
   metrics:
    - type: Resource
      resource:
@@ -168,7 +190,13 @@ kind: PodDisruptionBudget
 metadata:
   name: notebook
 spec:
+{% if scope == "deploy" %}
   minAvailable: 2
+{% elif scope == "test" or scope == "dev" %}
+  minAvailable: 0
+{% else %}
+!!! unexpected scope {{ scope }} !!!
+{% endif %}
   selector:
     matchLabels:
       app: notebook

@@ -1,14 +1,15 @@
 package is.hail.types.physical
 
-import is.hail.annotations._
 import is.hail.asm4s.{Code, Value}
-import is.hail.expr.ir.orderings.CodeOrdering
-import is.hail.expr.ir.{EmitCodeBuilder, EmitMethodBuilder, SortOrder}
-import is.hail.types.physical.stypes.interfaces.{SBaseStructCode, SBaseStructValue}
+import is.hail.expr.ir.EmitCodeBuilder
+import is.hail.types.physical.stypes.interfaces.{SBaseStruct, SBaseStructValue}
 import is.hail.types.virtual.{Field, TStruct}
 
 trait PStruct extends PBaseStruct {
-  lazy val virtualType: TStruct = TStruct(fields.map(f => Field(f.name, f.typ.virtualType, f.index)))
+  override lazy val virtualType: TStruct =
+    TStruct(fields.map(f => Field(f.name, f.typ.virtualType, f.index)))
+
+  override def sType: SBaseStruct
 
   final def deleteField(key: String): PCanonicalStruct = {
     assert(fieldIdx.contains(key))

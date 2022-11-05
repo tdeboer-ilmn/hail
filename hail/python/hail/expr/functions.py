@@ -2,12 +2,13 @@ import operator
 import builtins
 import functools
 from typing import Union, Optional, Any, Callable, Iterable, TypeVar
+import pandas as pd
 
 from deprecated import deprecated
 
 import hail
 import hail as hl
-from hail.expr.expressions import (Expression, ArrayExpression, SetExpression,
+from hail.expr.expressions import (Expression, ArrayExpression, StreamExpression, SetExpression,
                                    Int32Expression, Int64Expression, Float32Expression, Float64Expression,
                                    DictExpression, StructExpression, LocusExpression, StringExpression,
                                    IntervalExpression, ArrayNumericExpression, BooleanExpression,
@@ -15,13 +16,14 @@ from hail.expr.expressions import (Expression, ArrayExpression, SetExpression,
                                    unify_all, construct_expr, to_expr, unify_exprs, impute_type,
                                    construct_variable, apply_expr, coercer_from_dtype, unify_types_limited,
                                    expr_array, expr_any, expr_struct, expr_int32, expr_int64, expr_float32,
-                                   expr_float64, expr_oneof, expr_bool, expr_tuple, expr_dict, expr_str,
+                                   expr_float64, expr_oneof, expr_bool, expr_tuple, expr_dict, expr_str, expr_stream,
                                    expr_set, expr_call, expr_locus, expr_interval, expr_ndarray, expr_numeric,
                                    cast_expr)
 from hail.expr.types import (HailType, hail_type, tint32, tint64, tfloat32,
-                             tfloat64, tstr, tbool, tarray, tset, tdict,
+                             tfloat64, tstr, tbool, tarray, tstream, tset, tdict,
                              tstruct, tlocus, tinterval, tcall, ttuple,
-                             tndarray, is_primitive, is_numeric)
+                             tndarray, trngstate, is_primitive, is_numeric,
+                             is_int32, is_int64, is_float32, is_float64)
 from hail.genetics.reference_genome import reference_genome_type, ReferenceGenome
 import hail.ir as ir
 from hail.typecheck import (typecheck, nullable, anytype, enumeration, tupleof,
@@ -43,7 +45,17 @@ def _func(name, ret_type, *args, type_args=()):
 def _seeded_func(name, ret_type, seed, *args):
     seed = seed if seed is not None else Env.next_seed()
     indices, aggregations = unify_all(*args)
-    return construct_expr(ir.ApplySeeded(name, seed, ret_type, *(a._ir for a in args)), ret_type, indices, aggregations)
+    rng_state = ir.RNGSplit(ir.Ref('__rng_state', trngstate), ir.MakeTuple([]))
+    return construct_expr(ir.ApplySeeded(name, seed, rng_state, ret_type, *(a._ir for a in args)), ret_type, indices, aggregations)
+
+
+def ndarray_broadcasting(func):
+    def broadcast_or_not(x):
+        if isinstance(x.dtype, tndarray):
+            return x.map(lambda term: func(term))
+        else:
+            return func(x)
+    return broadcast_or_not
 
 
 @typecheck(a=expr_array(), x=expr_any)
@@ -225,7 +237,7 @@ def literal(x: Any, dtype: Optional[Union[HailType, str]] = None):
                     raise ExpressionException(f"'literal' can only accept scalar or global expression arguments,"
                                               f" found indices {x._indices.axes}")
             return False
-        elif x is None:
+        elif x is None or x is pd.NA:
             return False
         else:
             t._typecheck_one_level(x)
@@ -248,22 +260,22 @@ def literal(x: Any, dtype: Optional[Union[HailType, str]] = None):
     if wrapper['has_expr']:
         return literal(hl.eval(to_expr(x, dtype)), dtype)
 
-    if x is None:
+    if x is None or x is pd.NA:
         return hl.missing(dtype)
     elif is_primitive(dtype):
         if dtype == tint32:
-            assert isinstance(x, builtins.int)
+            assert is_int32(x)
             assert tint32.min_value <= x <= tint32.max_value
             return construct_expr(ir.I32(x), tint32)
         elif dtype == tint64:
-            assert isinstance(x, builtins.int)
+            assert is_int64(x)
             assert tint64.min_value <= x <= tint64.max_value
             return construct_expr(ir.I64(x), tint64)
         elif dtype == tfloat32:
-            assert isinstance(x, (builtins.float, builtins.int))
+            assert is_float32(x)
             return construct_expr(ir.F32(x), tfloat32)
         elif dtype == tfloat64:
-            assert isinstance(x, (builtins.float, builtins.int))
+            assert is_float64(x)
             return construct_expr(ir.F64(x), tfloat64)
         elif dtype == tbool:
             assert isinstance(x, builtins.bool)
@@ -648,8 +660,8 @@ def dict(collection) -> DictExpression:
     Examples
     --------
 
-    >>> hl.eval(hl.dict([('foo', 1), ('bar', 2), ('baz', 3)]))  # doctest: +SKIP_OUTPUT_CHECK
-    {u'bar': 2, u'baz': 3, u'foo': 1}
+    >>> hl.eval(hl.dict([('foo', 1), ('bar', 2), ('baz', 3)]))
+    {'bar': 2, 'baz': 3, 'foo': 1}
 
     Notes
     -----
@@ -808,7 +820,8 @@ def dpois(x, lamb, log_p=False) -> Float64Expression:
     return _func("dpois", tfloat64, x, lamb, log_p)
 
 
-@typecheck(x=expr_float64)
+@typecheck(x=oneof(expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def exp(x) -> Float64Expression:
     """Computes `e` raised to the power `x`.
 
@@ -820,11 +833,11 @@ def exp(x) -> Float64Expression:
 
     Parameters
     ----------
-    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.Expression` of type :py:data:`.tfloat64`
+    :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
     """
     return _func("exp", tfloat64, x)
 
@@ -879,7 +892,8 @@ def fisher_exact_test(c1, c2, c3, c4) -> StructExpression:
     return _func("fisher_exact_test", ret_type, c1, c2, c3, c4)
 
 
-@typecheck(x=expr_oneof(expr_float32, expr_float64))
+@typecheck(x=expr_oneof(expr_float32, expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def floor(x):
     """The largest integral value that is less than or equal to `x`.
 
@@ -891,16 +905,17 @@ def floor(x):
 
     Parameters
     ----------
-    x : :class:`.Float32Expression` or :class:`.Float64Expression`
+    x : :class:`.Float32Expression`, :class:`.Float64Expression`, or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.Float32Expression` or :class:`.Float64Expression`
+    :class:`.Float32Expression`, :class:`.Float64Expression`, or :class:`.NDArrayNumericExpression`
     """
     return _func("floor", x.dtype, x)
 
 
-@typecheck(x=expr_oneof(expr_float32, expr_float64))
+@typecheck(x=expr_oneof(expr_float32, expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def ceil(x):
     """The smallest integral value that is greater than or equal to `x`.
 
@@ -912,11 +927,11 @@ def ceil(x):
 
     Parameters
     ----------
-    x : :class:`.Float32Expression` or :class:`.Float64Expression`
+    x : :class:`.Float32Expression`,:class:`.Float64Expression` or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.Float32Expression` or :class:`.Float64Expression`
+    :class:`.Float32Expression`, :class:`.Float64Expression`,  or :class:`.NDArrayNumericExpression`
     """
     return _func("ceil", x.dtype, x)
 
@@ -1568,7 +1583,8 @@ def is_missing(expression) -> BooleanExpression:
     return apply_expr(lambda x: ir.IsNA(x), tbool, expression)
 
 
-@typecheck(x=expr_oneof(expr_float32, expr_float64))
+@typecheck(x=expr_oneof(expr_float32, expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def is_nan(x) -> BooleanExpression:
     """Returns ``True`` if the argument is ``nan`` (not a number).
 
@@ -1593,17 +1609,19 @@ def is_nan(x) -> BooleanExpression:
     Parameters
     ----------
     x : float or :class:`.Expression` of type :py:data:`.tfloat64`
-        Expression to test.
+        Expression to test or  or :class:`.NDArrayNumericExpression`.
 
     Returns
     -------
     :class:`.BooleanExpression`
-        ``True`` if `x` is ``nan``, ``False`` otherwise.
+        ``True`` if `x` is ``nan``, ``False`` otherwise or
+         :class:`.NDArrayNumericExpression` filled with such values
     """
     return _func("isnan", tbool, x)
 
 
-@typecheck(x=expr_oneof(expr_float32, expr_float64))
+@typecheck(x=expr_oneof(expr_float32, expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def is_finite(x) -> BooleanExpression:
     """Returns ``True`` if the argument is a finite floating-point number.
 
@@ -1627,16 +1645,18 @@ def is_finite(x) -> BooleanExpression:
 
     Parameters
     ----------
-    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
+
 
     Returns
     -------
-    :class:`.BooleanExpression`
+    :class:`.BooleanExpression`  or :class:`.NDArrayNumericExpression` filled with such expressions
     """
     return _func("is_finite", tbool, x)
 
 
-@typecheck(x=expr_oneof(expr_float32, expr_float64))
+@typecheck(x=expr_oneof(expr_float32, expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def is_infinite(x) -> BooleanExpression:
     """Returns ``True`` if the argument is positive or negative infinity.
 
@@ -1660,11 +1680,11 @@ def is_infinite(x) -> BooleanExpression:
 
     Parameters
     ----------
-    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.BooleanExpression`
+    :class:`.BooleanExpression` or :class:`.NDArrayNumericExpression` filled with such expressions
     """
     return _func("is_infinite", tbool, x)
 
@@ -1679,8 +1699,8 @@ def json(x) -> StringExpression:
     >>> hl.eval(hl.json([1,2,3,4,5]))
     '[1,2,3,4,5]'
 
-    >>> hl.eval(hl.json(hl.struct(a='Hello', b=0.12345, c=[1,2], d={'hi', 'bye'})))  # doctest: +SKIP_OUTPUT_CHECK
-    '{"a":"Hello","c":[1,2],"b":0.12345,"d":["bye","hi"]}'
+    >>> hl.eval(hl.json(hl.struct(a='Hello', b=0.12345, c=[1,2], d={'hi', 'bye'})))
+    '{"a":"Hello","b":0.12345,"c":[1,2],"d":["bye","hi"]}'
 
     Parameters
     ----------
@@ -1756,7 +1776,8 @@ def log(x, base=None) -> Float64Expression:
         return _func("log", tfloat64, x)
 
 
-@typecheck(x=expr_float64)
+@typecheck(x=oneof(expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def log10(x) -> Float64Expression:
     """Take the logarithm of the `x` with base 10.
 
@@ -1771,16 +1792,17 @@ def log10(x) -> Float64Expression:
 
     Parameters
     ----------
-    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.Expression` of type :py:data:`.tfloat64`
+    :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
     """
     return _func("log10", tfloat64, x)
 
 
-@typecheck(x=expr_float64)
+@typecheck(x=oneof(expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def logit(x) -> Float64Expression:
     """The logistic function.
 
@@ -1793,16 +1815,17 @@ def logit(x) -> Float64Expression:
 
     Parameters
     ----------
-    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.Expression` of type :py:data:`.tfloat64`
+    :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
     """
     return hl.log(x / (1 - x))
 
 
-@typecheck(x=expr_float64)
+@typecheck(x=oneof(expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def expit(x) -> Float64Expression:
     """The logistic sigmoid function.
 
@@ -1816,11 +1839,11 @@ def expit(x) -> Float64Expression:
 
     Parameters
     ----------
-    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.Expression` of type :py:data:`.tfloat64`
+    :class:`.Expression` of type :py:data:`.tfloat64` or :class:`.NDArrayNumericExpression`
     """
     return hl.if_else(x >= 0, 1 / (1 + hl.exp(-x)), hl.rbind(hl.exp(x), lambda exped: exped / (exped + 1)))
 
@@ -2377,7 +2400,15 @@ def range(start, stop=None, step=1) -> ArrayNumericExpression:
     if stop is None:
         stop = start
         start = hl.literal(0)
-    return apply_expr(lambda sta, sto, ste: ir.ToArray(ir.StreamRange(sta, sto, ste)), tarray(tint32), start, stop, step)
+    return apply_expr(lambda sta, sto, ste: ir.toArray(ir.StreamRange(sta, sto, ste)), tarray(tint32), start, stop, step)
+
+
+@typecheck(start=expr_int32, stop=nullable(expr_int32), step=expr_int32)
+def _stream_range(start, stop=None, step=1) -> StreamExpression:
+    if stop is None:
+        stop = start
+        start = hl.literal(0)
+    return apply_expr(lambda sta, sto, ste: ir.StreamRange(sta, sto, ste), tstream(tint32), start, stop, step)
 
 
 @typecheck(length=expr_int32)
@@ -2410,11 +2441,12 @@ def rand_bool(p, seed=None) -> BooleanExpression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_bool(0.5))  # doctest: +SKIP_OUTPUT_CHECK
-    True
-
-    >>> hl.eval(hl.rand_bool(0.5))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_bool(0.5))
     False
+
+    >>> hl.eval(hl.rand_bool(0.5))
+    True
 
     Parameters
     ----------
@@ -2438,11 +2470,12 @@ def rand_norm(mean=0, sd=1, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_norm())  # doctest: +SKIP_OUTPUT_CHECK
-    1.5388475315213386
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_norm())
+    0.30971254606692267
 
-    >>> hl.eval(hl.rand_norm())  # doctest: +SKIP_OUTPUT_CHECK
-    -0.3006188509144124
+    >>> hl.eval(hl.rand_norm())
+    -1.6120679347033475
 
     Parameters
     ----------
@@ -2467,11 +2500,12 @@ def rand_norm2d(mean=None, cov=None, seed=None) -> ArrayNumericExpression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_norm2d())  # doctest: +SKIP_OUTPUT_CHECK
-    [0.5515477294463427, -1.1782691532205807]
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_norm2d())
+    [0.30971254606692267, -1.266553783097155]
 
-    >>> hl.eval(hl.rand_norm2d())  # doctest: +SKIP_OUTPUT_CHECK
-    [-1.127240906867922, 1.4495317887283203]
+    >>> hl.eval(hl.rand_norm2d())
+    [-1.6120679347033475, 1.6121791827078364]
 
     Notes
     -----
@@ -2528,11 +2562,12 @@ def rand_pois(lamb, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_pois(1))  # doctest: +SKIP_OUTPUT_CHECK
-    2.0
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_pois(1))
+    1.0
 
-    >>> hl.eval(hl.rand_pois(1))  # doctest: +SKIP_OUTPUT_CHECK
-    3.0
+    >>> hl.eval(hl.rand_pois(1))
+    1.0
 
     Parameters
     ----------
@@ -2549,25 +2584,29 @@ def rand_pois(lamb, seed=None) -> Float64Expression:
 
 
 @typecheck(lower=expr_float64, upper=expr_float64, seed=nullable(int))
-def rand_unif(lower, upper, seed=None) -> Float64Expression:
+def rand_unif(lower=0.0, upper=1.0, seed=None) -> Float64Expression:
     """Samples from a uniform distribution within the interval
     [`lower`, `upper`].
 
     Examples
     --------
 
-    >>> hl.eval(hl.rand_unif(0, 1))  # doctest: +SKIP_OUTPUT_CHECK
-    0.7983073825816226
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_unif())
+    0.6830630912401323
 
-    >>> hl.eval(hl.rand_unif(0, 1))  # doctest: +SKIP_OUTPUT_CHECK
-    0.5161799497741769
+    >>> hl.eval(hl.rand_unif(0, 1))
+    0.4035978197966855
+
+    >>> hl.eval(hl.rand_unif(0, 1))
+    0.26020045338162423
 
     Parameters
     ----------
     lower : :obj:`float` or :class:`.Float64Expression`
-        Left boundary of range.
+        Left boundary of range. Defaults to 0.0.
     upper : :obj:`float` or :class:`.Float64Expression`
-        Right boundary of range.
+        Right boundary of range. Defaults to 1.0.
     seed : :obj:`int`, optional
         Random seed.
 
@@ -2576,6 +2615,83 @@ def rand_unif(lower, upper, seed=None) -> Float64Expression:
     :class:`.Float64Expression`
     """
     return _seeded_func("rand_unif", tfloat64, seed, lower, upper)
+
+
+@typecheck(a=expr_int32, b=nullable(expr_int32), seed=nullable(int))
+def rand_int32(a, b=None, *, seed=None) -> Int32Expression:
+    """Samples from a uniform distribution of 32-bit integers.
+
+    If b is `None`, samples from the uniform distribution over [0, a). Otherwise, sample from the
+    uniform distribution over [a, b).
+
+    Examples
+    --------
+
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_int32(10))
+    0
+
+    >>> hl.eval(hl.rand_int32(10, 15))
+    11
+
+    >>> hl.eval(hl.rand_int32(10, 15))
+    12
+
+    Parameters
+    ----------
+    a : :obj:`int` or :class:`.Int32Expression`
+        If b is `None`, the right boundary of the range; otherwise, the left boundary of range.
+    b : :obj:`int` or :class:`.Int32Expression`
+        If specified, the right boundary of the range.
+    seed : :obj:`int`, optional
+        Random seed.
+
+    Returns
+    -------
+    :class:`.Int32Expression`
+
+    """
+    if b is None:
+        return _seeded_func("rand_int32", tint32, seed, a)
+    return _seeded_func("rand_int32", tint32, seed, b - a) + a
+
+
+@typecheck(a=expr_int64, b=nullable(expr_int64), seed=nullable(int))
+def rand_int64(a, b=None, *, seed=None) -> Int64Expression:
+    """Samples from a uniform distribution of 64-bit integers.
+
+    If b is `None`, samples from the uniform distribution over [0, a). Otherwise, sample from the
+    uniform distribution over [a, b).
+
+    Examples
+    --------
+
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_int64(10))
+    2
+
+    >>> hl.eval(hl.rand_int64(1 << 33, 1 << 35))
+    13313179445
+
+    >>> hl.eval(hl.rand_int64(1 << 33, 1 << 35))
+    18981019040
+
+    Parameters
+    ----------
+    a : :obj:`int` or :class:`.Int64Expression`
+        If b is `None`, the right boundary of the range; otherwise, the left boundary of range.
+    b : :obj:`int` or :class:`.Int64Expression`
+        If specified, the right boundary of the range.
+    seed : :obj:`int`, optional
+        Random seed.
+
+    Returns
+    -------
+    :class:`.Int64Expression`
+    """
+    if b is None:
+        return _seeded_func("rand_int64", tint64, seed, a)
+    return _seeded_func("rand_int64", tint64, seed, b - a) + a
 
 
 @typecheck(a=expr_float64,
@@ -2599,11 +2715,12 @@ def rand_beta(a, b, lower=None, upper=None, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_beta(0, 1))  # doctest: +SKIP_OUTPUT_CHECK
-    0.6696807666871818
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_beta(0.5, 0.5))
+    0.3483677318466065
 
-    >>> hl.eval(hl.rand_beta(0, 1))  # doctest: +SKIP_OUTPUT_CHECK
-    0.8512985039011525
+    >>> hl.eval(hl.rand_beta(2, 5))
+    0.23894608018057753
 
     Parameters
     ----------
@@ -2641,11 +2758,12 @@ def rand_gamma(shape, scale, seed=None) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_gamma(1, 1))  # doctest: +SKIP_OUTPUT_CHECK
-    2.3915947710237537
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_gamma(1, 1))
+    0.8934929450909811
 
-    >>> hl.eval(hl.rand_gamma(1, 1))  # doctest: +SKIP_OUTPUT_CHECK
-    0.1339939936379711
+    >>> hl.eval(hl.rand_gamma(1, 1))
+    0.3423233699402248
 
     Parameters
     ----------
@@ -2680,10 +2798,11 @@ def rand_cat(prob, seed=None) -> Int32Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_cat([0, 1.7, 2]))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_cat([0, 1.7, 2]))
     2
 
-    >>> hl.eval(hl.rand_cat([0, 1.7, 2]))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.rand_cat([0, 1.7, 2]))
     1
 
     Parameters
@@ -2708,11 +2827,12 @@ def rand_dirichlet(a, seed=None) -> ArrayExpression:
     Examples
     --------
 
-    >>> hl.eval(hl.rand_dirichlet([1, 1, 1]))  # doctest: +SKIP_OUTPUT_CHECK
-    [0.4630197581640282,0.18207753442497876,0.3549027074109931]
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.rand_dirichlet([1, 1, 1]))
+    [0.31600799564679466, 0.22921566396520351, 0.45477634038800185]
 
-    >>> hl.eval(hl.rand_dirichlet([1, 1, 1]))  # doctest: +SKIP_OUTPUT_CHECK
-    [0.20851948405364765,0.7873859423649898,0.004094573581362475]
+    >>> hl.eval(hl.rand_dirichlet([1, 1, 1]))
+    [0.28935842257116556, 0.40020478428981887, 0.31043679313901557]
 
     Parameters
     ----------
@@ -2732,7 +2852,8 @@ def rand_dirichlet(a, seed=None) -> ArrayExpression:
                                     hl.rand_gamma(p, 1, seed=seed))))
 
 
-@typecheck(x=expr_float64)
+@typecheck(x=oneof(expr_float64, expr_ndarray(expr_float64)))
+@ndarray_broadcasting
 def sqrt(x) -> Float64Expression:
     """Returns the square root of `x`.
 
@@ -2749,11 +2870,11 @@ def sqrt(x) -> Float64Expression:
 
     Parameters
     ----------
-    x : float or :class:`.Expression` of type :py:data:`.tfloat64`
+    x : float or :class:`.Expression` of type :py:data:`.tfloat64`  or :class:`.NDArrayNumericExpression`
 
     Returns
     -------
-    :class:`.Expression` of type :py:data:`.tfloat64`
+    :class:`.Expression` of type :py:data:`.tfloat64`  or :class:`.NDArrayNumericExpression`
     """
     return _func("sqrt", tfloat64, x)
 
@@ -2766,7 +2887,7 @@ def corr(x, y) -> Float64Expression:
 
     Examples
     --------
-    >>> hl.eval(hl.corr([1, 2, 4], [2, 3, 1]))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.corr([1, 2, 4], [2, 3, 1]))
     -0.6546536707079772
 
     Notes
@@ -3314,7 +3435,7 @@ def filter(f: Callable, collection):
     [2, 4]
 
     >>> hl.eval(hl.filter(lambda x: ~(x[-1] == 'e'), s))
-    frozenset({'Bob'})
+    {'Bob'}
 
     Notes
     -----
@@ -3574,9 +3695,8 @@ def group_by(f: Callable, collection) -> DictExpression:
     --------
 
     >>> a = ['The', 'quick', 'brown', 'fox']
-
-    >>> hl.eval(hl.group_by(lambda x: hl.len(x), a))  # doctest: +SKIP_OUTPUT_CHECK
-    {5: ['quick', 'brown'], 3: ['The', 'fox']}
+    >>> hl.eval(hl.group_by(lambda x: hl.len(x), a))
+    {3: ['The', 'fox'], 5: ['quick', 'brown']}
 
     Parameters
     ----------
@@ -3652,6 +3772,20 @@ def array_scan(f: Callable, zero, a) -> ArrayExpression:
     return a.scan(lambda x, y: f(x, y), zero)
 
 
+@typecheck(streams=expr_stream(), fill_missing=bool)
+def _zip_streams(*streams, fill_missing: bool = False) -> StreamExpression:
+    n_streams = builtins.len(streams)
+    uids = [Env.get_uid() for _ in builtins.range(n_streams)]
+    types = [stream._type.element_type for stream in streams]
+    body_ir = ir.MakeTuple([ir.Ref(uid, type) for uid, type in builtins.zip(uids, types)])
+    indices, aggregations = unify_all(*streams)
+    behavior = 'ExtendNA' if fill_missing else 'TakeMinLength'
+    return construct_expr(ir.StreamZip([s._ir for s in streams], uids, body_ir, behavior),
+                          tstream(ttuple(*(s.dtype.element_type for s in streams))),
+                          indices,
+                          aggregations)
+
+
 @typecheck(arrays=expr_array(), fill_missing=bool)
 def zip(*arrays, fill_missing: bool = False) -> ArrayExpression:
     """Zip together arrays into a single array.
@@ -3689,28 +3823,20 @@ def zip(*arrays, fill_missing: bool = False) -> ArrayExpression:
     -------
     :class:`.ArrayExpression`
     """
-    n_arrays = builtins.len(arrays)
-    uids = [Env.get_uid() for _ in builtins.range(n_arrays)]
-    body_ir = ir.MakeTuple([ir.Ref(uid) for uid in uids])
-    indices, aggregations = unify_all(*arrays)
-    behavior = 'ExtendNA' if fill_missing else 'TakeMinLength'
-    return construct_expr(ir.ToArray(ir.StreamZip([ir.ToStream(a._ir) for a in arrays], uids, body_ir, behavior)),
-                          tarray(ttuple(*(a.dtype.element_type for a in arrays))),
-                          indices,
-                          aggregations)
+    return _zip_streams(*(a._to_stream() for a in arrays), fill_missing=fill_missing).to_array()
 
 
 def _zip_func(*arrays, fill_missing=False, f):
     n_arrays = builtins.len(arrays)
     uids = [Env.get_uid() for _ in builtins.range(n_arrays)]
-    refs = [construct_expr(ir.Ref(uid), a.dtype.element_type, a._indices, a._aggregations) for uid, a in
+    refs = [construct_expr(ir.Ref(uid, a.dtype.element_type), a.dtype.element_type, a._indices, a._aggregations) for uid, a in
             builtins.zip(uids, arrays)]
     body_result = f(*refs)
     indices, aggregations = unify_all(*arrays, body_result)
     behavior = 'ExtendNA' if fill_missing else 'TakeMinLength'
     return construct_expr(
-        ir.ToArray(ir.StreamZip([ir.ToStream(a._ir) for a in arrays], uids, body_result._ir, behavior)),
-        tarray(ttuple(*(a.dtype.element_type for a in arrays))),
+        ir.toArray(ir.StreamZip([ir.toStream(a._ir) for a in arrays], uids, body_result._ir, behavior)),
+        tarray(body_result.dtype),
         indices,
         aggregations)
 
@@ -3746,27 +3872,7 @@ def enumerate(a, start=0, *, index_first=True):
     :class:`.ArrayExpression`
         Array of (index, element) or (element, index) tuples.
     """
-    a_ir = a._ir
-    elt = Env.get_uid()
-    idx = Env.get_uid()
-    if index_first:
-        tuple = ir.MakeTuple([ir.Ref(idx), ir.Ref(elt)])
-    else:
-        tuple = ir.MakeTuple([ir.Ref(elt), ir.Ref(idx)])
-    indices, aggs = unify_all(a, start)
-    return construct_expr(
-        ir.ToArray(
-            ir.StreamZip(
-                [ir.ToStream(a_ir), ir.StreamIota(start._ir, ir.I32(1))],
-                [elt, idx],
-                tuple,
-                'TakeMinLength'
-            )
-        ),
-        hl.tarray(hl.ttuple(hl.tint32, a.dtype.element_type) if index_first else hl.ttuple(a.dtype.element_type, hl.tint32)),
-        indices,
-        aggs
-    )
+    return a._to_stream().zip_with_index(start, index_first=index_first).to_array()
 
 
 @deprecated(version='0.2.56', reason="Replaced by hl.enumerate")
@@ -4209,7 +4315,7 @@ def sign(x):
     >>> hl.eval(hl.sign([0.0, 3.14]))
     [0.0, 1.0]
 
-    >>> hl.eval(hl.sign(float('nan')))  # doctest: +SKIP
+    >>> hl.eval(hl.sign(float('nan')))
     nan
 
     Notes
@@ -4439,7 +4545,7 @@ def set(collection) -> SetExpression:
     --------
 
     >>> s = hl.set(['Bob', 'Charlie', 'Alice', 'Bob', 'Bob'])
-    >>> hl.eval(s)  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(s) # doctest: +SKIP
     {'Alice', 'Bob', 'Charlie'}
 
     Returns
@@ -4449,7 +4555,7 @@ def set(collection) -> SetExpression:
     """
     if isinstance(collection.dtype, tset):
         return collection
-    return apply_expr(lambda c: ir.ToSet(ir.ToStream(c)), tset(collection.dtype.element_type), collection)
+    return apply_expr(lambda c: ir.ToSet(ir.toStream(c)), tset(collection.dtype.element_type), collection)
 
 
 @typecheck(t=hail_type)
@@ -4460,7 +4566,7 @@ def empty_set(t: Union[HailType, builtins.str]) -> SetExpression:
     --------
 
     >>> hl.eval(hl.empty_set(hl.tstr))
-    frozenset()
+    set()
 
     Parameters
     ----------
@@ -4636,7 +4742,7 @@ def empty_dict(key_type: Union[HailType, builtins.str], value_type: Union[HailTy
     --------
 
     >>> hl.eval(hl.empty_dict(hl.tstr, hl.tint32))
-    frozendict({})
+    {}
 
     Parameters
     ----------
@@ -4724,10 +4830,11 @@ def _compare(left, right):
 def _sort_by(collection, less_than):
     left_id = Env.get_uid()
     right_id = Env.get_uid()
-    left = construct_expr(ir.Ref(left_id), collection.dtype.element_type, collection._indices, collection._aggregations)
-    right = construct_expr(ir.Ref(right_id), collection.dtype.element_type, collection._indices, collection._aggregations)
+    elt_type = collection.dtype.element_type
+    left = construct_expr(ir.Ref(left_id, elt_type), elt_type, collection._indices, collection._aggregations)
+    right = construct_expr(ir.Ref(right_id, elt_type), elt_type, collection._indices, collection._aggregations)
     return construct_expr(
-        ir.ArraySort(ir.ToStream(collection._ir), left_id, right_id, less_than(left, right)._ir),
+        ir.ArraySort(ir.toStream(collection._ir), left_id, right_id, less_than(left, right)._ir),
         collection.dtype,
         collection._indices,
         collection._aggregations)
@@ -4888,13 +4995,13 @@ def float64(x) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.float64('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.float64('1.1'))
     1.1
 
-    >>> hl.eval(hl.float64(1))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.float64(1))
     1.0
 
-    >>> hl.eval(hl.float64(True))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.float64(True))
     1.0
 
     Parameters
@@ -4918,7 +5025,7 @@ def parse_float64(x) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.parse_float64('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.parse_float64('1.1'))
     1.1
 
     >>> hl.eval(hl.parse_float64('asdf'))
@@ -4947,13 +5054,13 @@ def float32(x) -> Float32Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.float32('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
-    1.1
+    >>> hl.eval(hl.float32('1.1'))
+    1.100000023841858
 
-    >>> hl.eval(hl.float32(1))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.float32(1))
     1.0
 
-    >>> hl.eval(hl.float32(True))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.float32(True))
     1.0
 
     Parameters
@@ -4977,8 +5084,8 @@ def parse_float32(x) -> Float32Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.parse_float32('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
-    1.1
+    >>> hl.eval(hl.parse_float32('1.1'))
+    1.100000023841858
 
     >>> hl.eval(hl.parse_float32('asdf'))
     None
@@ -5224,7 +5331,7 @@ def parse_float(x) -> Float64Expression:
     Examples
     --------
 
-    >>> hl.eval(hl.parse_float('1.1'))  # doctest: +SKIP_OUTPUT_CHECK
+    >>> hl.eval(hl.parse_float('1.1'))
     1.1
 
     >>> hl.eval(hl.parse_float('asdf'))
@@ -6080,6 +6187,28 @@ def bit_not(x):
     return construct_expr(ir.ApplyUnaryPrimOp('~', x._ir), x.dtype, x._indices, x._aggregations)
 
 
+@typecheck(x=expr_oneof(expr_int32, expr_int64))
+def bit_count(x):
+    """Count the number of 1s in the in the `two's complement <https://en.wikipedia.org/wiki/Two%27s_complement>`__ binary representation of `x`.
+
+    Examples
+    --------
+    The binary representation of `7` is `111`, so:
+
+    >>> hl.eval(hl.bit_count(7))
+    3
+
+    Parameters
+    ----------
+    x : :class:`.Int32Expression` or :class:`.Int64Expression`
+
+    Returns
+    ----------
+    :class:`.Int32Expression`
+    """
+    return construct_expr(ir.ApplyUnaryPrimOp('BitCount', x._ir), tint32, x._indices, x._aggregations)
+
+
 @typecheck(array=expr_array(expr_numeric), elem=expr_numeric)
 def binary_search(array, elem) -> Int32Expression:
     """Binary search `array` for the insertion point of `elem`.
@@ -6155,8 +6284,9 @@ def shuffle(a, seed: builtins.int = None) -> ArrayExpression:
     Example
     -------
 
-    >>> hl.eval(hl.shuffle(hl.range(5)))  # doctest: +SKIP_OUTPUT_CHECK
-    [4, 2, 0, 3, 1]
+    >>> hl.set_global_seed(0)
+    >>> hl.eval(hl.shuffle(hl.range(5)))
+    [3, 2, 0, 4, 1]
 
     Parameters
     ----------

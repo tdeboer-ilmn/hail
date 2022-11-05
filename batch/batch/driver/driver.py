@@ -1,13 +1,13 @@
-from typing import Callable, Awaitable
 import abc
 import datetime
+from typing import Awaitable, Callable
 
 from gear import Database
 from hailtop import aiotools
 
-from .resource_manager import CloudResourceManager
-from .instance_collection import InstanceCollectionManager
 from ..inst_coll_config import InstanceCollectionConfigs
+from .billing_manager import CloudBillingManager
+from .instance_collection import InstanceCollectionManager
 
 
 async def process_outstanding_events(db: Database, process_events_since: Callable[[str], Awaitable[str]]):
@@ -25,21 +25,26 @@ async def process_outstanding_events(db: Database, process_events_since: Callabl
 
 
 class CloudDriver(abc.ABC):
-    resource_manager: CloudResourceManager
     inst_coll_manager: InstanceCollectionManager
+    billing_manager: CloudBillingManager
 
     @staticmethod
     @abc.abstractmethod
-    async def create(app,
-                     db: Database,
-                     machine_name_prefix: str,
-                     namespace: str,
-                     inst_coll_configs: InstanceCollectionConfigs,
-                     credentials_file: str,
-                     task_manager: aiotools.BackgroundTaskManager,
-                     ) -> 'CloudDriver':
+    async def create(
+        app,
+        db: Database,
+        machine_name_prefix: str,
+        namespace: str,
+        inst_coll_configs: InstanceCollectionConfigs,
+        credentials_file: str,
+        task_manager: aiotools.BackgroundTaskManager,
+    ) -> 'CloudDriver':
         raise NotImplementedError
 
     @abc.abstractmethod
     async def shutdown(self):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_quotas(self):
         raise NotImplementedError

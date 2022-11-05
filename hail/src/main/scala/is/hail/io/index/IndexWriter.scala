@@ -51,6 +51,10 @@ case class IndexMetadataUntypedJSON(
     fileVersion, branchingFactor,
     height, keyType, annotationType,
     nKeys, indexPath, rootOffset, attributes)
+
+  def toFileMetadata: VariableMetadata = VariableMetadata(
+    branchingFactor, height, nKeys, rootOffset, attributes
+  )
 }
 
 case class IndexMetadata(
@@ -104,7 +108,7 @@ class IndexWriterArrayBuilder(name: String, maxSize: Int, sb: SettableBuilder, r
   private val aoff = sb.newSettable[Long](s"${name}_aoff")
   private val len = sb.newSettable[Int](s"${name}_len")
 
-  val eltType: PCanonicalStruct = types.coerce[PCanonicalStruct](arrayType.elementType.setRequired((false)))
+  val eltType: PCanonicalStruct = types.tcoerce[PCanonicalStruct](arrayType.elementType.setRequired((false)))
   private val elt = new SBaseStructPointerSettable(SBaseStructPointer(eltType), sb.newSettable[Long](s"${name}_elt_off"))
 
   def length: Code[Int] = len
@@ -257,10 +261,12 @@ object StagedIndexWriter {
 
     val makeFB = fb.resultWithIndex()
 
-    val fsBc = ctx.fsBc;
+    val fsBc = ctx.fsBc
+
     { (path: String, pool: RegionPool) =>
       pool.scopedRegion { r =>
-        val f = makeFB(fsBc.value, 0, r)
+        // FIXME: This seems wrong? But also, anywhere we use broadcasting for the FS is wrong.
+        val f = makeFB(theHailClassLoaderForSparkWorkers, fsBc.value, 0, r)
         f.init(path)
         f
       }
@@ -323,7 +329,7 @@ class StagedIndexWriter(branchingFactor: Int, keyType: PType, annotationType: PT
     val m = cb.genEmitMethod[Unit]("writeLeafNode")
 
     val parentBuilder = new StagedInternalNodeBuilder(branchingFactor, keyType, annotationType, m.localBuilder)
-    m.emitWithBuilder { cb =>
+    m.voidWithBuilder { cb =>
       val idxOff = cb.newLocal[Long]("indexOff")
       cb.assign(idxOff, utils.bytesWritten)
       cb += ob.writeByte(0.toByte)
@@ -335,10 +341,9 @@ class StagedIndexWriter(branchingFactor: Int, keyType: PType, annotationType: PT
       parentBuilder.loadFrom(cb, utils, 0)
 
       leafBuilder.loadChild(cb, 0)
-      parentBuilder.add(cb, idxOff, leafBuilder.firstIdx(cb).asLong.longCode(cb), leafBuilder.getLoadedChild)
+      parentBuilder.add(cb, idxOff, leafBuilder.firstIdx(cb).asLong.value, leafBuilder.getLoadedChild)
       parentBuilder.store(cb, utils, 0)
       leafBuilder.reset(cb, elementIdx)
-      Code._empty
     }
     m
   }

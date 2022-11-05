@@ -125,7 +125,6 @@ class Tests(unittest.TestCase):
         assert mt1.tail(1, None).count() == (1, 10)
         assert mt1.tail(None, 1).count() == (10, 1)
 
-    @fails_service_backend()
     def test_tail_entries(self):
         mt = hl.utils.range_matrix_table(100, 30)
         mt = mt.filter_cols(mt.col_idx != 29)
@@ -141,7 +140,6 @@ class Tests(unittest.TestCase):
         assert tail(30, None) == expected(30, 29)
         assert tail(30, 10) == expected(30, 10)
 
-    @fails_service_backend()
     def test_tail_scan(self):
         mt = hl.utils.range_matrix_table(30, 40)
         mt = mt.annotate_rows(i = hl.scan.count())
@@ -164,7 +162,6 @@ class Tests(unittest.TestCase):
         mt = mt.filter_entries((mt.z1 < 5) & (mt.y1 == 3) & (mt.x1 == 5) & (mt.foo == 2))
         mt.count_rows()
 
-    @fails_service_backend()
     def test_aggregate(self):
         mt = self.get_mt()
 
@@ -388,6 +385,13 @@ class Tests(unittest.TestCase):
              hl.Struct(row_idx=2, col_idx=1, bar=[4, 6]),
              hl.Struct(row_idx=2, col_idx=2, bar=[8, 10, 12])])
 
+    def test_collect_cols_by_key_with_rand(self):
+        mt = hl.utils.range_matrix_table(3, 3)
+        mt = mt.annotate_cols(x = hl.rand_norm())
+        mt = mt.collect_cols_by_key()
+        mt = mt.annotate_cols(x = hl.rand_norm())
+        mt.cols().collect()
+
     def test_weird_names(self):
         ds = self.get_mt()
         exprs = {'a': 5, '   a    ': 5, r'\%!^!@#&#&$%#$%': [5], '$': 5, 'ß': 5}
@@ -418,18 +422,49 @@ class Tests(unittest.TestCase):
     def test_semi_anti_join_rows(self):
         mt = hl.utils.range_matrix_table(10, 3)
         ht = hl.utils.range_table(3)
+        mt2 = mt.key_rows_by(k1 = mt.row_idx, k2 = hl.str(mt.row_idx * 2))
+        ht2 = ht.key_by(k1 = ht.idx, k2 = hl.str(ht.idx * 2))
 
         assert mt.semi_join_rows(ht).count() == (3, 3)
         assert mt.anti_join_rows(ht).count() == (7, 3)
+        assert mt2.semi_join_rows(ht).count() == (3, 3)
+        assert mt2.anti_join_rows(ht).count() == (7, 3)
+        assert mt2.semi_join_rows(ht2).count() == (3, 3)
+        assert mt2.anti_join_rows(ht2).count() == (7, 3)
+
+        with pytest.raises(ValueError, match='semi_join_rows: cannot join'):
+            mt.semi_join_rows(ht2)
+        with pytest.raises(ValueError, match='semi_join_rows: cannot join'):
+            mt.semi_join_rows(ht.key_by())
+
+        with pytest.raises(ValueError, match='anti_join_rows: cannot join'):
+            mt.anti_join_rows(ht2)
+        with pytest.raises(ValueError, match='anti_join_rows: cannot join'):
+            mt.anti_join_rows(ht.key_by())
 
     def test_semi_anti_join_cols(self):
         mt = hl.utils.range_matrix_table(3, 10)
         ht = hl.utils.range_table(3)
+        mt2 = mt.key_cols_by(k1 = mt.col_idx, k2 = hl.str(mt.col_idx * 2))
+        ht2 = ht.key_by(k1 = ht.idx, k2 = hl.str(ht.idx * 2))
 
         assert mt.semi_join_cols(ht).count() == (3, 3)
         assert mt.anti_join_cols(ht).count() == (3, 7)
+        assert mt2.semi_join_cols(ht).count() == (3, 3)
+        assert mt2.anti_join_cols(ht).count() == (3, 7)
+        assert mt2.semi_join_cols(ht2).count() == (3, 3)
+        assert mt2.anti_join_cols(ht2).count() == (3, 7)
 
-    @fails_service_backend()
+        with pytest.raises(ValueError, match='semi_join_cols: cannot join'):
+            mt.semi_join_cols(ht2)
+        with pytest.raises(ValueError, match='semi_join_cols: cannot join'):
+            mt.semi_join_cols(ht.key_by())
+
+        with pytest.raises(ValueError, match='anti_join_cols: cannot join'):
+            mt.anti_join_cols(ht2)
+        with pytest.raises(ValueError, match='anti_join_cols: cannot join'):
+            mt.anti_join_cols(ht.key_by())
+
     def test_joins(self):
         mt = self.get_mt().select_rows(x1=1, y1=1)
         mt2 = mt.select_rows(x2=1, y2=2)
@@ -448,7 +483,6 @@ class Tests(unittest.TestCase):
         self.assertTrue(rt.all(rt.y2 == 2))
         self.assertTrue(ct.all(ct.c2 == 2))
 
-    @fails_service_backend()
     def test_joins_with_key_structs(self):
         mt = self.get_mt()
 
@@ -475,10 +509,6 @@ class Tests(unittest.TestCase):
         self.assertTrue(ds.union_cols(ds.drop(ds.info))
                         .count_rows(), 346)
 
-    @skip_when_service_backend('''The Service and Shuffler have no way of knowing the order in which rows appear in the original
-dataset, as such it is impossible to guarantee the ordering in `matches`.
-
-https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/235425714''')
     def test_table_product_join(self):
         left = hl.utils.range_matrix_table(5, 1)
         right = hl.utils.range_table(5)
@@ -487,8 +517,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         rows = left.rows()
         self.assertTrue(rows.all(rows.matches.map(lambda x: x.idx) == hl.range(0, rows.row_idx)))
 
-    @fails_service_backend()
-    @fails_local_backend()
     def test_naive_coalesce(self):
         mt = self.get_mt(min_partitions=8)
         self.assertEqual(mt.n_partitions(), 8)
@@ -504,7 +532,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         mt = mt.annotate_rows(x=hl.if_else(hl.literal([1,2,3])[mt.row_idx] < hl.rand_unif(10, 11), mt.globals, hl.struct()))
         mt._force_count_rows()
 
-    @fails_service_backend()
     def test_globals_lowering(self):
         mt = hl.utils.range_matrix_table(1, 1).annotate_globals(x=1)
         lit = hl.literal(hl.utils.Struct(x = 0))
@@ -523,7 +550,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
          .aggregate(bar=hl.agg.collect(mt.globals == lit))
          ._force_count_rows())
 
-    @skip_when_service_backend('ShuffleRead non-deterministically causes segfaults')
     def test_unions(self):
         dataset = hl.import_vcf(resource('sample2.vcf'))
 
@@ -545,7 +571,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         for s, count in ds.aggregate_cols(agg.counter(ds.s)).items():
             self.assertEqual(count, 3)
 
-    @skip_when_service_backend('Shuffler encoding/decoding is broken.')
     def test_union_cols_example(self):
         joined = hl.import_vcf(resource('joined.vcf'))
 
@@ -559,22 +584,27 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         mt = mt.key_rows_by(x = mt.row_idx // 2)
         assert mt.union_cols(mt).count_rows() == 5
 
-    @skip_when_service_backend('flaky https://hail.zulipchat.com/#narrow/stream/127527-team/topic/CI.20Deploy.20Failure/near/237593731')
     def test_union_cols_outer(self):
         r, c = 10, 10
         mt = hl.utils.range_matrix_table(2*r, c)
         mt = mt.annotate_entries(entry=hl.tuple([mt.row_idx, mt.col_idx]))
+        mt = mt.annotate_rows(left=mt.row_idx)
         mt2 = hl.utils.range_matrix_table(2*r, c)
         mt2 = mt2.key_rows_by(row_idx=mt2.row_idx + r)
         mt2 = mt2.key_cols_by(col_idx=mt2.col_idx + c)
         mt2 = mt2.annotate_entries(entry=hl.tuple([mt2.row_idx, mt2.col_idx]))
+        mt2 = mt2.annotate_rows(right=mt2.row_idx)
         expected = hl.utils.range_matrix_table(3*r, 2*c)
         missing = hl.missing(hl.ttuple(hl.tint, hl.tint))
         expected = expected.annotate_entries(entry=hl.if_else(
             expected.col_idx < c,
             hl.if_else(expected.row_idx < 2*r, hl.tuple([expected.row_idx, expected.col_idx]), missing),
             hl.if_else(expected.row_idx >= r, hl.tuple([expected.row_idx, expected.col_idx]), missing)))
-        assert mt.union_cols(mt2, row_join_type='outer')._same(expected)
+        expected = expected.annotate_rows(
+            left=hl.if_else(expected.row_idx < 2*r, expected.row_idx, hl.missing(hl.tint)),
+            right=hl.if_else(expected.row_idx >= r, expected.row_idx, hl.missing(hl.tint)),
+        )
+        assert mt.union_cols(mt2, row_join_type='outer', drop_right_row_fields=False)._same(expected)
 
     def test_union_rows_different_col_schema(self):
         mt = hl.utils.range_matrix_table(10, 10)
@@ -607,7 +637,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         self.assertEqual(ds.choose_cols(list(range(10))).s.collect(),
                          old_order[:10])
 
-    @skip_when_service_backend('Shuffler encoding/decoding is broken.')
     def test_choose_cols_vs_explode(self):
         ds = self.get_mt()
 
@@ -634,7 +663,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         self.assertEqual(mt.group_rows_by(mt.row_idx).aggregate().count_rows(), 3)
         self.assertEqual(mt.group_cols_by(mt.col_idx).aggregate().count_cols(), 3)
 
-    @fails_service_backend()
     def test_computed_key_join_1(self):
         ds = self.get_mt()
         kt = hl.Table.parallelize(
@@ -648,7 +676,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         self.assertTrue(
             rt.all(((rt.locus.position % 2) == 0) == rt['value']))
 
-    @fails_service_backend()
     def test_computed_key_join_2(self):
         # multiple keys
         ds = self.get_mt()
@@ -665,7 +692,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         self.assertTrue(
             rt.all((rt.locus.position % 2) - 2 * (rt.info.DP % 2) == rt['value']))
 
-    @fails_service_backend()
     def test_computed_key_join_3(self):
         # duplicate row keys
         ds = self.get_mt()
@@ -685,8 +711,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
                 rt['value'] == "IB",
                 hl.is_missing(rt['value']))))
 
-    @fails_service_backend()
-    @fails_local_backend()
     def test_interval_join(self):
         left = hl.utils.range_matrix_table(50, 1, n_partitions=10)
         intervals = hl.utils.range_table(4)
@@ -722,7 +746,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
 
         self.assertTrue(mt_join_entries.all(mt_join_entries.x == mt_join_entries.x2))
 
-    @fails_service_backend()
     def test_entry_join_const(self):
         mt1 = hl.utils.range_matrix_table(10, 10, n_partitions=4)
         mt1 = mt1.annotate_entries(x=mt1.row_idx + mt1.col_idx)
@@ -772,7 +795,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         assert mt.key_rows_by().key_cols_by().entries().collect() == original_order
         assert mt.key_rows_by().entries().collect() == sorted(original_order, key=lambda x: x.col_idx)
 
-    @fails_service_backend()
     def test_entries_table_with_out_of_order_row_key_fields(self):
         mt = hl.utils.range_matrix_table(10, 10, 1)
         mt = mt.select_rows(key2=0, key1=mt.row_idx)
@@ -814,8 +836,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
               (df.GT == df.entry_struct.GT)) &
              (df.AD == df.entry_struct.AD))))
 
-    @fails_service_backend()
-    @fails_local_backend()
     def test_filter_partitions(self):
         ds = self.get_mt(min_partitions=8)
         self.assertEqual(ds.n_partitions(), 8)
@@ -827,7 +847,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
                 ds._filter_partitions([0, 3, 7]),
                 ds._filter_partitions([0, 3, 7], keep=False))))
 
-    @skip_when_service_backend('Shuffler encoding/decoding is broken.')
     def test_from_rows_table(self):
         mt = hl.import_vcf(resource('sample.vcf'))
         mt = mt.annotate_globals(foo='bar')
@@ -840,7 +859,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         ds_small = ds.sample_rows(0.01)
         self.assertTrue(ds_small.count_rows() < ds.count_rows())
 
-    @fails_service_backend()
     def test_read_stored_cols(self):
         ds = self.get_mt()
         ds = ds.annotate_globals(x='foo')
@@ -849,7 +867,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         t = hl.read_table(f + '/cols')
         self.assertTrue(ds.cols().key_by()._same(t))
 
-    @skip_when_service_backend('Shuffler encoding/decoding is broken.')
     def test_read_stored_rows(self):
         ds = self.get_mt()
         ds = ds.annotate_globals(x='foo')
@@ -866,26 +883,25 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         t = hl.read_table(f + '/globals')
         self.assertTrue(ds.globals_table()._same(t))
 
-    @fails_service_backend()
     def test_indexed_read(self):
         mt = hl.utils.range_matrix_table(2000, 100, 10)
         f = new_temp_file(extension='mt')
         mt.write(f)
+        mt1 = hl.read_matrix_table(f)
         mt2 = hl.read_matrix_table(f, _intervals=[
             hl.Interval(start=150, end=250, includes_start=True, includes_end=False),
             hl.Interval(start=250, end=500, includes_start=True, includes_end=False),
         ])
         self.assertEqual(mt2.n_partitions(), 2)
-        self.assertTrue(mt.filter_rows((mt.row_idx >= 150) & (mt.row_idx < 500))._same(mt2))
+        self.assertTrue(mt1.filter_rows((mt1.row_idx >= 150) & (mt1.row_idx < 500))._same(mt2))
 
         mt2 = hl.read_matrix_table(f, _intervals=[
             hl.Interval(start=150, end=250, includes_start=True, includes_end=False),
             hl.Interval(start=250, end=500, includes_start=True, includes_end=False),
         ], _filter_intervals=True)
         self.assertEqual(mt2.n_partitions(), 3)
-        self.assertTrue(mt.filter_rows((mt.row_idx >= 150) & (mt.row_idx < 500))._same(mt2))
+        self.assertTrue(mt1.filter_rows((mt1.row_idx >= 150) & (mt1.row_idx < 500))._same(mt2))
 
-    @fails_service_backend()
     def test_indexed_read_vcf(self):
         vcf = self.get_mt(10)
         f = new_temp_file(extension='mt')
@@ -899,6 +915,34 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         p = (vcf.locus >= l1) & (vcf.locus < l2)
         q = (vcf.locus >= l3) & (vcf.locus < l4)
         self.assertTrue(vcf.filter_rows(p | q)._same(mt))
+
+    def test_interval_filter_partitions(self):
+        mt = hl.utils.range_matrix_table(100, 3, 3)
+        path = new_temp_file()
+        mt.write(path)
+        intervals = [
+            hl.Interval(hl.Struct(idx=5), hl.Struct(idx=10)),
+            hl.Interval(hl.Struct(idx=12), hl.Struct(idx=13)),
+            hl.Interval(hl.Struct(idx=15), hl.Struct(idx=17)),
+            hl.Interval(hl.Struct(idx=19), hl.Struct(idx=20))
+        ]
+        assert hl.read_matrix_table(path, _intervals=intervals, _filter_intervals = True).n_partitions() == 1
+
+        intervals = [
+            hl.Interval(hl.Struct(idx=5), hl.Struct(idx=10)),
+            hl.Interval(hl.Struct(idx=12), hl.Struct(idx=13)),
+            hl.Interval(hl.Struct(idx=15), hl.Struct(idx=17)),
+
+            hl.Interval(hl.Struct(idx=45), hl.Struct(idx=50)),
+            hl.Interval(hl.Struct(idx=52), hl.Struct(idx=53)),
+            hl.Interval(hl.Struct(idx=55), hl.Struct(idx=57)),
+
+            hl.Interval(hl.Struct(idx=75), hl.Struct(idx=80)),
+            hl.Interval(hl.Struct(idx=82), hl.Struct(idx=83)),
+            hl.Interval(hl.Struct(idx=85), hl.Struct(idx=87)),
+        ]
+
+        assert hl.read_matrix_table(path, _intervals=intervals, _filter_intervals = True).n_partitions() == 3
 
     @fails_service_backend()
     def test_codecs_matrix(self):
@@ -922,16 +966,16 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
             rt2 = hl.read_table(temp)
             self.assertTrue(rt._same(rt2))
 
-    @fails_service_backend()
     def test_fix3307_read_mt_wrong(self):
         mt = hl.import_vcf(resource('sample2.vcf'))
         mt = hl.split_multi_hts(mt)
-        mt.write('/tmp/foo.mt', overwrite=True)
-        mt2 = hl.read_matrix_table('/tmp/foo.mt')
-        t = hl.read_table('/tmp/foo.mt/rows')
-        self.assertTrue(mt.rows()._same(t))
-        self.assertTrue(mt2.rows()._same(t))
-        self.assertTrue(mt._same(mt2))
+        with hl.TemporaryDirectory(suffix='.mt', ensure_exists=False) as mt_path:
+            mt.write(mt_path)
+            mt2 = hl.read_matrix_table(mt_path)
+            t = hl.read_table(mt_path + '/rows')
+            self.assertTrue(mt.rows()._same(t))
+            self.assertTrue(mt2.rows()._same(t))
+            self.assertTrue(mt._same(mt2))
 
     def test_rename(self):
         dataset = self.get_mt()
@@ -978,7 +1022,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         self.assertEqual(mt.filter_cols(hl.missing(hl.tbool)).count_cols(), 0)
         self.assertEqual(mt.filter_entries(hl.missing(hl.tbool)).entries().count(), 0)
 
-    @fails_service_backend()
     def test_to_table_on_various_fields(self):
         mt = hl.utils.range_matrix_table(3, 4)
 
@@ -1027,7 +1070,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         self.assertEqual(mt.rows().r.collect(), sorted_rows)
         self.assertEqual(mt.rows().r.take(1), [sorted_rows[0]])
 
-    @fails_service_backend()
     def test_order_by(self):
         ht = hl.utils.range_table(10)
         self.assertEqual(ht.order_by('idx').idx.collect(), list(range(10)))
@@ -1038,7 +1080,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         ht = hl.utils.range_table(10)
         assert ht.order_by(-ht.idx).idx.collect() == list(range(10))[::-1]
 
-    @fails_service_backend()
     def test_order_by_intervals(self):
         intervals = {0: hl.Interval(0, 3, includes_start=True, includes_end=False),
                      1: hl.Interval(0, 4, includes_start=True, includes_end=True),
@@ -1170,8 +1211,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         self.assertTrue(hl.Table.parallelize([actual]),
                         hl.Table.parallelize([expected]))
 
-    @fails_service_backend()
-    @fails_local_backend()
     def test_hardy_weinberg_test(self):
         mt = hl.import_vcf(resource('HWE_test.vcf'))
         mt_two_sided = mt.select_rows(**hl.agg.hardy_weinberg_test(mt.GT, one_sided=False))
@@ -1260,7 +1299,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         mt2 = hl.read_matrix_table(f)
         self.assertTrue(mt._same(mt2))
 
-    @skip_when_service_backend('ShuffleRead non-deterministically causes segfaults')
     def test_write_checkpoint_file(self):
         mt = self.get_mt()
         f = new_temp_file(extension='mt')
@@ -1270,7 +1308,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         mt2 = hl.read_matrix_table(f)
         self.assertTrue(mt._same(mt2))
 
-    @fails_service_backend()
     def test_write_no_parts(self):
         mt = hl.utils.range_matrix_table(10, 10, 2).filter_rows(False)
         path = new_temp_file(extension='mt')
@@ -1316,8 +1353,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
 
         self.assertTrue(matrix1.union_cols(matrix2)._same(expected))
 
-    @fails_service_backend()
-    @fails_local_backend()
     def test_row_joins_into_table(self):
         rt = hl.utils.range_matrix_table(9, 13, 3)
         mt1 = rt.key_rows_by(idx=rt.row_idx)
@@ -1617,7 +1652,6 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         ],
                    mt.filter_rows((mt.row_idx >= 5) & (mt.row_idx < 35)))
 
-    @skip_when_service_backend('Shuffler encoding/decoding is broken.')
     def test_partitioned_write_coerce(self):
         mt = hl.import_vcf(resource('sample.vcf'))
         parts = [
@@ -1627,6 +1661,7 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         mt.write(tmp, _partitions=parts)
 
         mt2 = hl.read_matrix_table(tmp)
+        assert mt2.aggregate_rows(hl.agg.all(hl.literal(hl.Interval(hl.Locus('20', 10277621), hl.Locus('20', 11898992))).contains(mt2.locus)))
         assert mt2.n_partitions() == len(parts)
         assert hl.filter_intervals(mt, parts)._same(mt2)
 
@@ -1696,6 +1731,33 @@ https://hail.zulipchat.com/#narrow/stream/123011-Hail-Dev/topic/test_drop/near/2
         with pytest.raises(hl.expr.ExpressionException, match='source mismatch'):
             mt.annotate_entries(x = mt2.af)
 
+    def test_filter_locus_position_collect_returns_data(self):
+        t = hl.utils.range_table(1)
+        t = t.key_by(locus=hl.locus('2', t.idx + 1))
+        assert t.filter(t.locus.position >= 1).collect() == [
+            hl.utils.Struct(idx=0, locus=hl.genetics.Locus(contig='2', position=1, reference_genome='GRCh37'))]
+
+    @fails_service_backend()
+    @fails_local_backend()
+    def test_lower_row_agg_init_arg(self):
+        mt = hl.balding_nichols_model(5, 200, 200)
+        mt2 = hl.variant_qc(mt)
+        mt2 = mt2.filter_rows((mt2.variant_qc.AF[0] > 0.05) & (mt2.variant_qc.AF[0] < 0.95))
+        mt2 = mt2.sample_rows(.99)
+        rows = mt2.rows()
+        mt = mt.semi_join_rows(rows)
+        hl.hwe_normalized_pca(mt.GT)
+
+def test_keys_before_scans():
+    mt = hl.utils.range_matrix_table(6, 6)
+    mt = mt.annotate_rows(rev_idx = -mt.row_idx)
+    mt = mt.key_rows_by(mt.rev_idx)
+
+    mt = mt.annotate_rows(idx_scan = hl.scan.collect(mt.row_idx))
+
+    mt = mt.key_rows_by(mt.row_idx)
+    assert mt.rows().idx_scan.collect() == [[5, 4, 3, 2, 1], [5, 4, 3, 2], [5, 4, 3], [5, 4], [5], []]
+
 
 def test_read_write_all_types():
     mt = create_all_values_matrix_table()
@@ -1703,18 +1765,22 @@ def test_read_write_all_types():
     mt.write(tmp_file)
     assert hl.read_matrix_table(tmp_file)._same(mt)
 
-@fails_service_backend()
-@fails_local_backend()
+
 def test_read_write_balding_nichols_model():
     mt = hl.balding_nichols_model(3, 10, 10)
     tmp_file = new_temp_file()
     mt.write(tmp_file)
     assert hl.read_matrix_table(tmp_file)._same(mt)
 
-@fails_service_backend()
-@fails_local_backend()
+
 def test_read_partitions():
     ht = hl.utils.range_matrix_table(n_rows=100, n_cols=10, n_partitions=3)
     path = new_temp_file()
     ht.write(path)
     assert hl.read_matrix_table(path, _n_partitions=10).n_partitions() == 10
+
+
+def test_filter_against_invalid_contig():
+    mt = hl.balding_nichols_model(3, 5, 20)
+    fmt = mt.filter_rows(mt.locus.contig == "chr1")
+    assert fmt.rows()._force_count() == 0

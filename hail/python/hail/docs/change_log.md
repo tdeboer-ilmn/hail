@@ -24,6 +24,456 @@ an earlier version of Hail to read files written in a later version.
 
 ---
 
+## Version 0.2.105
+
+Released 2022-10-31 🎃
+
+### New Features
+
+- (hail#12293)  Added support for `hail.MatrixTable`s to `hail.ggplot`.
+
+### Bug Fixes
+
+- (hail#12384) Fixed a critical bug that disabled tree aggregation and scan executions in 0.2.104, leading to out-of-memory errors.
+- (hail#12265) Fix long-standing bug wherein `hl.agg.collect_as_set` and `hl.agg.counter` error when applied to types which, in Python, are unhashable. For example, `hl.agg.counter(t.list_of_genes)` will not error when `t.list_of_genes` is a list. Instead, the counter dictionary will use `FrozenList` keys from the `frozenlist` package.
+
+---
+
+## Version 0.2.104
+
+Release 2022-10-19
+
+### New Features
+
+- (hail#12346): Introduced new progress bars which include total time elapsed and look cool.
+
+---
+
+## Version 0.2.103
+
+Release 2022-10-18
+
+### Bug Fixes
+
+- (hail#12305): Fixed a rare crash reading tables/matrixtables with _intervals
+
+---
+
+## Version 0.2.102
+
+Released 2022-10-06
+
+### New Features
+
+- (hail#12218) Missing values are now supported in primitive columns in `Table.to_pandas`.
+- (hail#12254) Cross-product-style legends for data groups have been replaced with factored ones (consistent with `ggplot2`'s implementation) for `hail.ggplot.geom_point`, and support has been added for custom legend group labels.
+- (hail#12268) `VariantDataset` now implements `union_rows` for combining datasets with the same samples but disjoint variants.
+
+### Bug Fixes
+
+- (hail#12278) Fixed bug made more likely by 0.2.101 in which Hail errors when interacting with a NumPy integer or floating point type.
+- (hail#12277) Fixed bug in reading tables/matrixtables with partition intervals that led to error or segfault.
+
+---
+
+## Version 0.2.101
+
+Released 2022-10-04
+
+### New Features
+
+- (hail#12218) Support missing values in primitive columns in `Table.to_pandas`.
+- (hail#12195) Add a `impute_sex_chr_ploidy_from_interval_coverage` to impute sex ploidy directly from a coverage MT.
+- (hail#12222) Query-on-Batch pipelines now add worker jobs to the same batch as the driver
+job instead of producing a new batch per stage.
+- (hail#12244) Added support for custom labels for per-group legends to `hail.ggplot.geom_point` via the
+`legend_format` keyword argument
+
+### Deprecations
+
+- (hail#12230) The python-dill Batch images in `gcr.io/hail-vdc` are no longer supported.
+Use `hailgenetics/python-dill` instead.
+
+### Bug fixes
+
+- (hail#12215) Fix search bar in the Hail Batch documentation.
+
+---
+
+## Version 0.2.100
+
+Released 2022-09-23
+
+### New Features
+
+- (hail#12207) Add support for the `shape` aesthetic to `hail.ggplot.geom_point`.
+
+### Deprecations
+
+- (hail#12213) The `batch_size` parameter of `vds.new_combiner` is deprecated in favor of `gvcf_batch_size`.
+
+### Bug fixes
+
+- (hail#12216) Fix bug that caused `make install-on-cluster` to fail with a message about `sys_platform`.
+- (hail#12164) Fix bug that caused Query on Batch pipelines to fail on datasets with indexes greater than 2GiB.
+
+---
+
+## Version 0.2.99
+
+Released 2022-09-13
+
+### New Features
+
+- (hail#12091) Teach `Table` to `write_many`, which writes one table per provided field.
+- (hail#12067) Add `rand_int32` and `rand_int64` for generating random 32-bit and 64-bit integers, respectively.
+
+### Performance Improvements
+
+- (hail#12159) Improve performance of MatrixTable reads when using `_intervals` argument
+
+### Bug fixes
+
+- (hail#12179) Fix incorrect composition of interval filters with unordered interval lists that could lead to over- or under-filtering.
+- (hail#12162) Fixed crash in `collect_cols_by_key` with preceding random functions.
+
+---
+
+## Version 0.2.98
+
+Released 2022-08-22
+
+### New Features
+
+- (hail#12062) `hl.balding_nichols_model` now supports an optional boolean parameter, `phased`, to control the phasedness of the generated genotypes.
+
+### Performance improvements
+
+- (hail#12099) Make repeated VCF/PLINK queries much faster by caching compiler data structures.
+- (hail#12038) Speed up `hl.import_matrix_table` by caching header line computation.
+
+### Bug fixes
+
+- (hail#12115) When using `use_new_shuffle=True`, fix a bug when there are more than 2^31 rows
+- (hail#12074) Fix bug where `hl.init` could silently overwrite the global random seed.
+- (hail#12079) Fix bug in handling of missing (aka NA) fields in grouped aggregation and distinct by key.
+- (hail#12056) Fix `hl.export_vcf` to actually create tabix files when requested.
+- (hail#12020) Fix bug in `hl.experimental.densify` which manifested as an `AssertionError` about dtypes.
+
+---
+
+## Version 0.2.97
+
+Released 2022-06-30
+
+### New Features
+
+- (hail#11756) `hb.BatchPoolExecutor` and Python jobs both now also support async functions.
+
+### Bug fixes
+
+- (hail#11962) Fix error (logged as (hail#11891)) in VCF combiner when exactly 10 or 100 files are combined.
+- (hail#11969) Fix `import_table` and `import_lines` to use multiple partitions when `force_bgz` is used.
+- (hail#11964) Fix erroneous "Bucket is a requester pays bucket but no user project provided." errors in Google Dataproc by updating to the latest Dataproc image version.
+
+---
+
+## Version 0.2.96
+
+Released 2022-06-21
+
+### New Features
+
+- (hail#11833) `hl.rand_unif` now has default arguments of 0.0 and 1.0
+
+### Bug fixes
+
+- (hail#11905) Fix erroneous FileNotFoundError in glob patterns
+- (hail#11921) and (hail#11910) Fix file clobbering during text export with speculative execution.
+- (hail#11920) Fix array out of bounds error when tree aggregating a multiple of 50 partitions.
+- (hail#11937) Fixed correctness bug in scan order for `Table.annotate` and `MatrixTable.annotate_rows` in certain circumstances.
+- (hail#11887) Escape VCF description strings when exporting.
+- (hail#11886) Fix an error in an example in the docs for `hl.split_multi`.
+
+---
+
+## Version 0.2.95
+
+Released 2022-05-13
+
+### New features
+
+- (hail#11809) Export `dtypes_from_pandas` in `expr.types`
+- (hail#11807) Teach smoothed_pdf to add a plot to an existing figure.
+- (hail#11746) The ServiceBackend, in interactive mode, will print a link to the currently executing driver batch.
+- (hail#11759) `hl.logistic_regression_rows`, `hl.poisson_regression_rows`, and `hl.skat` all now support configuration of the maximum number of iterations and the tolerance.
+- (hail#11835) Add `hl.ggplot.geom_density` which renders a plot of an approximation of the probability density function of its argument.
+
+### Bug fixes
+
+- (hail#11815) Fix incorrectly missing entries in to_dense_mt at the position of ref block END.
+- (hail#11828) Fix `hl.init` to not ignore its `sc` argument. This bug was introduced in 0.2.94.
+- (hail#11830) Fix an error and relax a timeout which caused `hailtop.aiotools.copy` to hang.
+- (hail#11778) Fix a (different) error which could cause hangs in `hailtop.aiotools.copy`.
+
+---
+
+## Version 0.2.94
+
+Released 2022-04-26
+
+### Deprecation
+
+- (hail#11765) Deprecated and removed linear mixed model functionality.
+
+### Beta features
+
+- (hail#11782) `hl.import_table` is up to twice as fast for small tables.
+
+### New features
+
+- (hail#11428) `hailtop.batch.build_python_image` now accepts a `show_docker_output` argument to toggle printing docker's output to the terminal while building container images
+- (hail#11725) `hl.ggplot` now supports `facet_wrap`
+- (hail#11776) `hailtop.aiotools.copy` will always show a progress bar when `--verbose` is passed.
+
+### `hailctl dataproc`
+- (hail#11710) support pass-through arguments to `connect`
+
+### Bug fixes
+
+ - (hail#11792) Resolved issue where corrupted tables could be created with whole-stage code generation enabled.
+
+---
+
+## Version 0.2.93
+
+Release 2022-03-27
+
+### Beta features
+
+- Several issues with the beta version of Hail Query on Hail Batch are addressed in this release.
+
+---
+
+## Version 0.2.92
+
+Release 2022-03-25
+
+### New features
+
+- (hail#11613) Add `hl.ggplot` support for `scale_fill_hue`, `scale_color_hue`, and `scale_fill_manual`,
+  `scale_color_manual`. This allows for an infinite number of discrete colors.
+- (hail#11608) Add all remaining and all versions of extant public gnomAD datasets to the Hail
+  Annotation Database and Datasets API. Current as of March 23rd 2022.
+- (hail#11662) Add the `weight` aesthetic `geom_bar`.
+
+### Beta features
+
+- This version of Hail includes all the necessary client-side infrastructure to execute Hail Query
+  pipelines on a Hail Batch cluster. This effectively enables a "serverless" version of Hail Query
+  which is independent of Apache Spark. Broad affiliated users should contact the Hail team for help
+  using Hail Query on Hail Batch. Unaffiliated users should also contact the Hail team to discuss
+  the feasibility of running your own Hail Batch cluster. The Hail team is accessible at both
+  https://hail.zulipchat.com and https://discuss.hail.is .
+
+---
+
+## Version 0.2.91
+
+Release 2022-03-18
+
+### Bug fixes
+
+- (hail#11614) Update `hail.utils.tutorial.get_movie_lens` to use `https` instead of `http`. Movie
+  Lens has stopped serving data over insecure HTTP.
+- (hail#11563) Fix issue [hail-is/hail#11562](https://github.com/hail-is/hail/issues/11562).
+- (hail#11611) Fix a bug that prevents the display of `hl.ggplot.geom_hline` and
+  `hl.ggplot.geom_vline`.
+
+---
+
+## Version 0.2.90
+
+Release 2022-03-11
+
+### Critical BlockMatrix from_numpy correctness bug
+
+- (hail#11555) `BlockMatrix.from_numpy` did not work correctly. Version 1.0 of org.scalanlp.breeze, a dependency of Apache Spark
+that hail also depends on, has a correctness bug that results in BlockMatrices that repeat the top left block of the block
+matrix for every block. This affected anyone running Spark 3.0.x or 3.1.x.
+
+### Bug fixes
+
+- (hail#11556) Fixed assertion error ocassionally being thrown by valid joins where the join key was a prefix of the left key.
+
+### Versioning
+
+- (hail#11551) Support Python 3.10.
+
+---
+
+## Version 0.2.89
+
+Release 2022-03-04
+
+- (hail#11452) Fix `impute_sex_chromosome_ploidy` docs.
+
+---
+
+## Version 0.2.88
+
+Release 2022-03-01
+
+This release addresses the deploy issues in the 0.2.87 release of Hail.
+
+---
+
+## Version 0.2.87
+
+Release 2022-02-28
+
+An error in the deploy process required us to yank this release from PyPI. Please do not use this
+release.
+
+### Bug fixes
+
+- (hail#11401) Fixed bug where `from_pandas` didn't support missing strings.
+
+---
+
+## Version 0.2.86
+
+Release 2022-02-25
+
+### Bug fixes
+
+- (hail#11374) Fixed bug where certain pipelines that read in PLINK files would give assertion error.
+- (hail#11401) Fixed bug where `from_pandas` didn't support missing ints.
+
+### Performance improvements
+
+- (hail#11306) Newly written tables that have no duplicate keys will be faster to join against.
+
+---
+
+## Version 0.2.85
+
+Release 2022-02-14
+
+### Bug fixes
+
+- (hail#11355) Fixed assertion errors being hit relating to RVDPartitioner.
+- (hail#11344) Fix error where hail ggplot would mislabel points after more than 10 distinct colors were used.
+
+### New features
+
+- (hail#11332) Added `geom_ribbon` and `geom_area` to hail ggplot.
+
+---
+
+## Version 0.2.84
+
+Release 2022-02-10
+
+### Bug fixes
+
+- (hail#11328) Fix bug where occasionally files written to disk would be unreadable.
+- (hail#11331) Fix bug that potentially caused files written to disk to be unreadable.
+- (hail#11312) Fix aggregator memory leak.
+- (hail#11340) Fix bug where repeatedly annotating same field name could cause failure to compile.
+- (hail#11342) Fix to possible issues about having too many open file handles.
+
+### New features
+
+- (hail#11300) `geom_histogram` infers min and max values automatically.
+- (hail#11317) Add support for `alpha` aesthetic and `identity` position to `geom_histogram`.
+
+---
+
+## Version 0.2.83
+
+Release 2022-02-01
+
+### Bug fixes
+
+- (hail#11268) Fixed `log` argument in `hail.plot.histogram`.
+- (hail#11276) Fixed `log` argument in `hail.plot.pdf`.
+- (hail#11256) Fixed memory leak in LD Prune.
+
+### New features
+
+- (hail#11274) Added `geom_col` to `hail.ggplot`.
+
+### hailctl dataproc
+
+- (hail#11280) Updated dataproc image version to one not affected by log4j vulnerabilities.
+
+---
+
+## Version 0.2.82
+
+Release 2022-01-24
+
+### Bug fixes
+
+- (hail#11209) Significantly improved usefulness and speed of `Table.to_pandas`, resolved several bugs with output.
+
+### New features
+
+- (hail#11247) Introduces a new experimental plotting interface `hail.ggplot`, based on R's ggplot library.
+- (hail#11173) Many math functions like `hail.sqrt` now automatically broadcast over ndarrays.
+
+### Performance Improvements
+
+- (hail#11216) Significantly improve performance of `parse_locus_interval`
+
+### Python and Java Support
+
+- (hail#11219) We no longer officially support Python 3.6, though it may continue to work in the short term.
+- (hail#11220) We support building hail with Java 11.
+
+---
+
+## Version 0.2.81
+
+Release 2021-12-20
+
+### hailctl dataproc
+
+- (hail#11182) Updated Dataproc image version to mitigate yet more Log4j vulnerabilities.
+
+---
+
+## Version 0.2.80
+
+Release 2021-12-15
+
+### New features
+
+- (hail#11077) `hl.experimental.write_matrix_tables` now returns the paths of the written matrix tables.
+
+### hailctl dataproc
+
+- (hail#11157) Updated Dataproc image version to mitigate the Log4j vulnerability.
+- (hail#10900) Added `--region` parameter to `hailctl dataproc submit`.
+- (hail#11090) Teach `hailctl dataproc describe` how to read URLs with the protocols `s3` (Amazon S3), `hail-az` (Azure Blob Storage), and `file` (local file system) in addition to `gs` (Google Cloud Storage).
+
+---
+
+## Version 0.2.79
+
+Release 2021-11-17
+
+### Bug fixes
+
+- (hail#11023) Fixed bug in call decoding that was introduced in version 0.2.78.
+
+### New features
+
+- (hail#10993) New function `p_value_excess_het`.
+
+---
+
 ## Version 0.2.78
 
 Release 2021-10-19

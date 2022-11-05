@@ -31,7 +31,7 @@ class GroupedBTreeKey(kt: PType, kb: EmitClassBuilder[_], region: Value[Region],
       mb.emitWithBuilder { cb =>
         val off = mb.getCodeParam[Long](1)
         val ev1 = cb.memoize(loadCompKey(cb, off))
-        val ev2 = mb.getEmitParam(cb, 2, null) // don't need region
+        val ev2 = mb.getEmitParam(cb, 2) // don't need region
         comp(cb, ev1, ev2)
       }
     }
@@ -46,9 +46,8 @@ class GroupedBTreeKey(kt: PType, kb: EmitClassBuilder[_], region: Value[Region],
   def isKeyMissing(cb: EmitCodeBuilder, off: Code[Long]): Value[Boolean] =
     storageType.isFieldMissing(cb, off, 0)
 
-  def loadKey(cb: EmitCodeBuilder, off: Code[Long]): SValue = {
-    kt.loadCheapSCodeField(cb, storageType.loadField(off, 0))
-  }
+  def loadKey(cb: EmitCodeBuilder, off: Code[Long]): SValue =
+    cb.memoizeField(kt.loadCheapSCode(cb, storageType.loadField(off, 0)), "loadKey")
 
   def initValue(cb: EmitCodeBuilder, destc: Code[Long], k: EmitCode, rIdx: Code[Int]): Unit = {
     val dest = cb.newLocal("ga_init_value_dest", destc)
@@ -132,6 +131,11 @@ class DictState(val kb: EmitClassBuilder[_], val keyVType: VirtualTypeWithReq, v
     keyed.initValue(cb, _elt, k, size * nStates)
   }
 
+  def loadNode(cb: EmitCodeBuilder, node: Code[Long]): Unit = {
+    cb.assign(_elt, node)
+    keyed.loadStates(cb)
+  }
+  
   def loadContainer(cb: EmitCodeBuilder, kec: EmitCode): Unit = {
     val kev = cb.memoize(kec, "ga_load_cont_k")
     cb.assign(_elt, tree.getOrElseInitialize(cb, kev))

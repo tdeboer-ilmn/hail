@@ -1,8 +1,10 @@
-import hailtop.batch as hb
-import random
 import os
+import random
+
+import hailtop.batch as hb
 
 DOCKER_ROOT_IMAGE = os.environ['DOCKER_ROOT_IMAGE']
+
 
 def flip(p):
     return random.random() <= p

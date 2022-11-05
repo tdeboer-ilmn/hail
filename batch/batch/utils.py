@@ -1,18 +1,23 @@
-from typing import Deque, Set, Tuple
-import logging
 import json
+import logging
 import secrets
-from aiohttp import web
-from functools import wraps
 from collections import deque
+from functools import wraps
+from typing import Deque, Set, Tuple
+
+from aiohttp import web
 
 from gear import maybe_parse_bearer_header
 from hailtop.utils import secret_alnum_string
 
-from .cloud.resource_utils import cost_from_msec_mcpu
-
-
 log = logging.getLogger('utils')
+
+
+@web.middleware
+async def unavailable_if_frozen(request: web.Request, handler):
+    if request.method in ("POST", "PATCH") and request.app['frozen']:
+        raise web.HTTPServiceUnavailable()
+    return await handler(request)
 
 
 def authorization_token(request):
@@ -129,9 +134,10 @@ async def query_billing_projects(db, user=None, billing_project=None):
         where_condition = ''
 
     sql = f'''
+WITH base_t AS (
 SELECT billing_projects.name as billing_project,
   billing_projects.`status` as `status`,
-  users, msec_mcpu, `limit`, SUM(`usage` * rate) as cost
+  users, `limit`
 FROM (
   SELECT billing_project, JSON_ARRAYAGG(`user`) as users
   FROM billing_project_users
@@ -140,22 +146,24 @@ FROM (
 ) AS t
 RIGHT JOIN billing_projects
   ON t.billing_project = billing_projects.name
-LEFT JOIN aggregated_billing_project_resources
-  ON aggregated_billing_project_resources.billing_project = billing_projects.name
-LEFT JOIN resources
-  ON resources.resource = aggregated_billing_project_resources.resource
 {where_condition}
-GROUP BY billing_projects.name, billing_projects.status, msec_mcpu, `limit`
-LOCK IN SHARE MODE;
+GROUP BY billing_projects.name, billing_projects.status, `limit`
+LOCK IN SHARE MODE
+)
+SELECT base_t.*, COALESCE(SUM(`usage` * rate), 0) as accrued_cost
+FROM base_t
+LEFT JOIN (
+  SELECT base_t.billing_project, resource_id, CAST(COALESCE(SUM(`usage`), 0) AS SIGNED) AS `usage`
+  FROM base_t
+  LEFT JOIN aggregated_billing_project_user_resources_v2
+    ON base_t.billing_project = aggregated_billing_project_user_resources_v2.billing_project
+  GROUP BY base_t.billing_project, resource_id
+) AS usage_t ON usage_t.billing_project = base_t.billing_project
+LEFT JOIN resources ON resources.resource_id = usage_t.resource_id
+GROUP BY base_t.billing_project;
 '''
 
     def record_to_dict(record):
-        cost_msec_mcpu = cost_from_msec_mcpu(record['msec_mcpu'])
-        cost_resources = record['cost']
-        record['accrued_cost'] = coalesce(cost_msec_mcpu, 0) + coalesce(cost_resources, 0)
-        del record['msec_mcpu']
-        del record['cost']
-
         if record['users'] is None:
             record['users'] = []
         else:
@@ -165,3 +173,29 @@ LOCK IN SHARE MODE;
     billing_projects = [record_to_dict(record) async for record in db.execute_and_fetchall(sql, tuple(args))]
 
     return billing_projects
+
+
+def json_to_value(x):
+    if x is None:
+        return x
+    return json.loads(x)
+
+
+def regions_to_bits_rep(selected_regions, all_regions_mapping):
+    result = 0
+    for region in selected_regions:
+        idx = all_regions_mapping[region]
+        assert idx < 64, str(all_regions_mapping)
+        result |= 1 << (idx - 1)
+    return result
+
+
+def regions_bits_rep_to_regions(regions_bits_rep, all_regions_mapping):
+    if regions_bits_rep is None:
+        return None
+    result = []
+    for region, idx in all_regions_mapping.items():
+        selected_region = bool((regions_bits_rep >> idx - 1) & 1)
+        if selected_region:
+            result.append(region)
+    return result

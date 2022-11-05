@@ -38,6 +38,14 @@ object CodeOrdering {
 
   final case class Neq(missingEqual: Boolean = true) extends BooleanOp
 
+  final case class StructLt(missingEqual: Boolean = true) extends BooleanOp
+
+  final case class StructLteq(missingEqual: Boolean = true) extends BooleanOp
+
+  final case class StructGt(missingEqual: Boolean = true) extends BooleanOp
+
+  final case class StructCompare(missingEqual: Boolean = true) extends BooleanOp
+
   type F[R] = (EmitCodeBuilder, EmitValue, EmitValue) => Value[R]
 
   def makeOrdering(t1: SType, t2: SType, ecb: EmitClassBuilder[_]): CodeOrdering = {
@@ -107,8 +115,8 @@ abstract class CodeOrdering {
       FastIndexedSeq(arg1.emitParamType, arg2.emitParamType), ti) { mb =>
 
       mb.emitWithBuilder[T] { cb =>
-        val arg1 = mb.getEmitParam(cb, 1, null) // can't contain streams
-        val arg2 = mb.getEmitParam(cb, 2, null) // can't contain streams
+        val arg1 = mb.getEmitParam(cb, 1)
+        val arg2 = mb.getEmitParam(cb, 2)
         f(cb, arg1, arg2, missingEqual)
       }
     }

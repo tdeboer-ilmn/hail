@@ -36,6 +36,7 @@ object ExecStrategy extends Enumeration {
 }
 
 object TestUtils {
+  val theHailClassLoader = new HailClassLoader(getClass().getClassLoader())
 
   import org.scalatest.Assertions._
 
@@ -94,62 +95,6 @@ object TestUtils {
     m.map(g => if (g == -1) null: BoxedCall else Call2.fromUnphasedDiploidGtIndex(g): BoxedCall)
   }
 
-  // !useHWE: mean 0, norm exactly sqrt(n), variance 1
-  // useHWE: mean 0, norm approximately sqrt(m), variance approx. m / n
-  // missing gt are mean imputed, constant variants return None, only HWE uses nVariants
-  def normalizedHardCalls(view: HardCallView, nSamples: Int, useHWE: Boolean = false, nVariants: Int = -1): Option[Array[Double]] = {
-    require(!(useHWE && nVariants == -1))
-    val vals = Array.ofDim[Double](nSamples)
-    var nMissing = 0
-    var sum = 0
-    var sumSq = 0
-
-    var row = 0
-    while (row < nSamples) {
-      view.setGenotype(row)
-      if (view.hasGT) {
-        val gt = Call.unphasedDiploidGtIndex(view.getGT)
-        vals(row) = gt
-        (gt: @unchecked) match {
-          case 0 =>
-          case 1 =>
-            sum += 1
-            sumSq += 1
-          case 2 =>
-            sum += 2
-            sumSq += 4
-        }
-      } else {
-        vals(row) = -1
-        nMissing += 1
-      }
-      row += 1
-    }
-
-    val nPresent = nSamples - nMissing
-    val nonConstant = !(sum == 0 || sum == 2 * nPresent || sum == nPresent && sumSq == nPresent)
-
-    if (nonConstant) {
-      val mean = sum.toDouble / nPresent
-      val stdDev = math.sqrt(
-        if (useHWE)
-          mean * (2 - mean) * nVariants / 2
-        else {
-          val meanSq = (sumSq + nMissing * mean * mean) / nSamples
-          meanSq - mean * mean
-        })
-
-      val gtDict = Array(0, -mean / stdDev, (1 - mean) / stdDev, (2 - mean) / stdDev)
-      var i = 0
-      while (i < nSamples) {
-        vals(i) = gtDict(vals(i).toInt + 1)
-        i += 1
-      }
-
-      Some(vals)
-    } else
-      None
-  }
 
   def loweredExecute(ctx: ExecuteContext, x: IR, env: Env[(Any, Type)],
     args: IndexedSeq[(Any, Type)],
@@ -251,7 +196,7 @@ object TestUtils {
             rvb.endArray()
             val aggOff = rvb.end()
 
-            val resultOff = f(ctx.fs, 0, region)(region, argsOff, aggOff)
+            val resultOff = f(theHailClassLoader, ctx.fs, 0, region)(region, argsOff, aggOff)
             SafeRow(resultType2.asInstanceOf[PBaseStruct], resultOff).get(0)
           }
 
@@ -276,7 +221,7 @@ object TestUtils {
             rvb.endTuple()
             val argsOff = rvb.end()
 
-            val resultOff = f(ctx.fs, 0, region)(region, argsOff)
+            val resultOff = f(theHailClassLoader, ctx.fs, 0, region)(region, argsOff)
             SafeRow(resultType2.asInstanceOf[PBaseStruct], resultOff).get(0)
           }
       }
@@ -306,90 +251,6 @@ object TestUtils {
 
     assert(t.valuesSimilar(i, c), s"interpret $i vs compile $c")
     assert(t.valuesSimilar(i2, c), s"interpret (optimize = false) $i vs compile $c")
-  }
-
-  def assertAllEvalTo(xs: (IR, Any)*)(implicit execStrats: Set[ExecStrategy]): Unit = {
-    assertEvalsTo(MakeTuple.ordered(xs.map(_._1)), Row.fromSeq(xs.map(_._2)))
-  }
-
-  def assertEvalsTo(x: IR, expected: Any)
-    (implicit execStrats: Set[ExecStrategy]) {
-    assertEvalsTo(x, Env.empty, FastIndexedSeq(), None, expected)
-  }
-
-  def assertEvalsTo(x: IR, args: IndexedSeq[(Any, Type)], expected: Any)
-    (implicit execStrats: Set[ExecStrategy]) {
-    assertEvalsTo(x, Env.empty, args, None, expected)
-  }
-
-  def assertEvalsTo(x: IR, agg: (IndexedSeq[Row], TStruct), expected: Any)
-    (implicit execStrats: Set[ExecStrategy]) {
-    assertEvalsTo(x, Env.empty, FastIndexedSeq(), Some(agg), expected)
-  }
-
-  def assertEvalsTo(x: IR,
-    env: Env[(Any, Type)],
-    args: IndexedSeq[(Any, Type)],
-    agg: Option[(IndexedSeq[Row], TStruct)],
-    expected: Any)
-    (implicit execStrats: Set[ExecStrategy]) {
-
-    TypeCheck(x, BindingEnv(env.mapValues(_._2), agg = agg.map(_._2.toEnv)))
-
-    val t = x.typ
-    assert(t == TVoid || t.typeCheck(expected), s"$t, $expected")
-
-    ExecuteContext.scoped() { ctx =>
-      val filteredExecStrats: Set[ExecStrategy] =
-        if (HailContext.backend.isInstanceOf[SparkBackend])
-          execStrats
-        else {
-          info("skipping interpret and non-lowering compile steps on non-spark backend")
-          execStrats.intersect(ExecStrategy.backendOnly)
-        }
-
-      filteredExecStrats.foreach { strat =>
-        try {
-          val res = strat match {
-            case ExecStrategy.Interpret =>
-              assert(agg.isEmpty)
-              Interpret[Any](ctx, x, env, args)
-            case ExecStrategy.InterpretUnoptimized =>
-              assert(agg.isEmpty)
-              Interpret[Any](ctx, x, env, args, optimize = false)
-            case ExecStrategy.JvmCompile =>
-              assert(Forall(x, node => Compilable(node)))
-              eval(x, env, args, agg, bytecodePrinter =
-                Option(HailContext.getFlag("jvm_bytecode_dump"))
-                  .map { path =>
-                    val pw = new PrintWriter(new File(path))
-                    pw.print(s"/* JVM bytecode dump for IR:\n${Pretty(x)}\n */\n\n")
-                    pw
-                  }, true, ctx)
-            case ExecStrategy.JvmCompileUnoptimized =>
-              assert(Forall(x, node => Compilable(node)))
-              eval(x, env, args, agg, bytecodePrinter =
-                Option(HailContext.getFlag("jvm_bytecode_dump"))
-                  .map { path =>
-                    val pw = new PrintWriter(new File(path))
-                    pw.print(s"/* JVM bytecode dump for IR:\n${Pretty(x)}\n */\n\n")
-                    pw
-                  },
-                optimize = false, ctx)
-            case ExecStrategy.LoweredJVMCompile =>
-              loweredExecute(ctx, x, env, args, agg)
-          }
-          if (t != TVoid) {
-            assert(t.typeCheck(res), s"\n  t=$t\n  result=$res\n  strategy=$strat")
-            assert(t.valuesSimilar(res, expected), s"\n  result=$res\n  expect=$expected\n  strategy=$strat)")
-          }
-        } catch {
-          case e: Exception =>
-            error(s"error from strategy $strat")
-            if (execStrats.contains(strat)) throw e
-        }
-      }
-    }
   }
 
   def assertThrows[E <: Throwable : Manifest](x: IR, regex: String) {
@@ -430,85 +291,6 @@ object TestUtils {
     assertCompiledThrows[HailException](x, regex)
   }
 
-  def assertNDEvals(nd: IR, expected: Any)
-    (implicit execStrats: Set[ExecStrategy]) {
-    assertNDEvals(nd, Env.empty, FastIndexedSeq(), None, expected)
-  }
-
-  def assertNDEvals(nd: IR, expected: (Any, IndexedSeq[Long]))
-    (implicit execStrats: Set[ExecStrategy]) {
-    if (expected == null)
-      assertNDEvals(nd, Env.empty, FastIndexedSeq(), None, null, null)
-    else
-      assertNDEvals(nd, Env.empty, FastIndexedSeq(), None, expected._2, expected._1)
-  }
-
-  def assertNDEvals(nd: IR, args: IndexedSeq[(Any, Type)], expected: Any)
-    (implicit execStrats: Set[ExecStrategy]) {
-    assertNDEvals(nd, Env.empty, args, None, expected)
-  }
-
-  def assertNDEvals(nd: IR, agg: (IndexedSeq[Row], TStruct), expected: Any)
-    (implicit execStrats: Set[ExecStrategy]) {
-    assertNDEvals(nd, Env.empty, FastIndexedSeq(), Some(agg), expected)
-  }
-
-  def assertNDEvals(nd: IR, env: Env[(Any, Type)], args: IndexedSeq[(Any, Type)],
-    agg: Option[(IndexedSeq[Row], TStruct)], expected: Any)
-    (implicit execStrats: Set[ExecStrategy]): Unit = {
-    var e: IndexedSeq[Any] = expected.asInstanceOf[IndexedSeq[Any]]
-    val dims = Array.fill(nd.typ.asInstanceOf[TNDArray].nDims) {
-      val n = e.length
-      if (n != 0 && e.head.isInstanceOf[IndexedSeq[_]])
-        e = e.head.asInstanceOf[IndexedSeq[Any]]
-      n.toLong
-    }
-    assertNDEvals(nd, Env.empty, FastIndexedSeq(), agg, dims, expected)
-  }
-
-  def assertNDEvals(nd: IR, env: Env[(Any, Type)], args: IndexedSeq[(Any, Type)],
-    agg: Option[(IndexedSeq[Row], TStruct)], dims: IndexedSeq[Long], expected: Any)
-    (implicit execStrats: Set[ExecStrategy]): Unit = {
-    val arrayIR = if (expected == null) nd else {
-      val refs = Array.fill(nd.typ.asInstanceOf[TNDArray].nDims) { Ref(genUID(), TInt32) }
-      Let("nd", nd,
-        dims.zip(refs).foldRight[IR](NDArrayRef(Ref("nd", nd.typ), refs.map(Cast(_, TInt64)), -1)) {
-          case ((n, ref), accum) =>
-            ToArray(StreamMap(rangeIR(n.toInt), ref.name, accum))
-        })
-    }
-    assertEvalsTo(arrayIR, env, args, agg, expected)
-  }
-
-  def assertBMEvalsTo(bm: BlockMatrixIR, expected: DenseMatrix[Double])
-    (implicit execStrats: Set[ExecStrategy]): Unit = {
-    ExecuteContext.scoped() { ctx =>
-      val filteredExecStrats: Set[ExecStrategy] =
-        if (HailContext.backend.isInstanceOf[SparkBackend]) execStrats
-        else {
-          info("skipping interpret and non-lowering compile steps on non-spark backend")
-          execStrats.intersect(ExecStrategy.backendOnly)
-        }
-      filteredExecStrats.filter(ExecStrategy.interpretOnly).foreach { strat =>
-        try {
-          val res = strat match {
-            case ExecStrategy.Interpret =>
-              Interpret(bm, ctx, optimize = true)
-            case ExecStrategy.InterpretUnoptimized =>
-              Interpret(bm, ctx, optimize = false)
-          }
-          assert(res.toBreezeMatrix() == expected)
-        } catch {
-          case e: Exception =>
-            error(s"error from strategy $strat")
-            if (execStrats.contains(strat)) throw e
-        }
-      }
-      val expectedArray = Array.tabulate(expected.rows)(i => Array.tabulate(expected.cols)(j => expected(i, j)).toFastIndexedSeq).toFastIndexedSeq
-      assertNDEvals(BlockMatrixCollect(bm), expectedArray)(filteredExecStrats.filterNot(ExecStrategy.interpretOnly))
-    }
-  }
-
   def importVCF(ctx: ExecuteContext, file: String, force: Boolean = false,
     forceBGZ: Boolean = false,
     headerFile: Option[String] = None,
@@ -521,7 +303,8 @@ object TestUtils {
     contigRecoding: Option[Map[String, String]] = None,
     arrayElementsRequired: Boolean = true,
     skipInvalidLoci: Boolean = false,
-    partitionsJSON: String = null): MatrixIR = {
+    partitionsJSON: Option[String] = None,
+    partitionsTypeStr: Option[String] = None): MatrixIR = {
     rg.foreach { referenceGenome =>
       ReferenceGenome.addReference(referenceGenome)
     }
@@ -532,6 +315,7 @@ object TestUtils {
       callFields,
       entryFloatType,
       headerFile,
+      /*sampleIDs=*/None,
       nPartitions,
       blockSizeInMB,
       minPartitions,
@@ -542,7 +326,8 @@ object TestUtils {
       forceBGZ,
       force,
       TextInputFilterAndReplace(),
-      partitionsJSON)
-    MatrixRead(reader.fullMatrixType, dropSamples, false, reader)
+      partitionsJSON,
+      partitionsTypeStr)
+    MatrixRead(reader.fullMatrixTypeWithoutUIDs, dropSamples, false, reader)
   }
 }

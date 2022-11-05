@@ -127,7 +127,7 @@ class AggFunc(object):
         comb_op_expr = to_expr(comb_op(accum_ref, other_accum_ref))
 
         return construct_expr(ir.AggFold(initial_value_casted._ir, seq_op_expr._ir, comb_op_expr._ir, accum_name, other_accum_name, self._as_scan),
-                              initial_value.dtype,
+                              unified_type,
                               indices,
                               aggregations)
 
@@ -142,7 +142,7 @@ class AggFunc(object):
             array_agg_expr = hl.array(array_agg_expr)
         elt = array_agg_expr.dtype.element_type
         var = Env.get_uid()
-        ref = construct_expr(ir.Ref(var), elt, array_agg_expr._indices)
+        ref = construct_expr(ir.Ref(var, elt), elt, array_agg_expr._indices)
         self._agg_bindings.add(var)
         aggregated = f(ref)
         _check_agg_bindings(aggregated, self._agg_bindings)
@@ -155,7 +155,7 @@ class AggFunc(object):
         aggregations = hl.utils.LinkedList(Aggregation)
         if not self._as_scan:
             aggregations = aggregations.push(Aggregation(array_agg_expr, aggregated))
-        return construct_expr(ir.AggExplode(ir.ToStream(array_agg_expr._ir), var, aggregated._ir, self._as_scan),
+        return construct_expr(ir.AggExplode(ir.toStream(array_agg_expr._ir), var, aggregated._ir, self._as_scan),
                               aggregated.dtype,
                               Indices(indices.source, aggregated._indices.axes),
                               aggregations)
@@ -211,7 +211,7 @@ class AggFunc(object):
 
         elt = array.dtype.element_type
         var = Env.get_uid()
-        ref = construct_expr(ir.Ref(var), elt, array._indices)
+        ref = construct_expr(ir.Ref(var, elt), elt, array._indices)
         self._agg_bindings.add(var)
         aggregated = f(ref)
         _check_agg_bindings(aggregated, self._agg_bindings)
@@ -243,10 +243,11 @@ _agg_func = AggFunc()
 
 def _check_agg_bindings(expr, bindings):
     bound_references = {ref.name for ref in expr._ir.search(
-        lambda x: isinstance(x, ir.Ref)
-        and not isinstance(x, ir.TopLevelReference)
-        and not x.name.startswith('__uid_scan')
-        and not x.name.startswith('__uid_agg'))}
+        lambda x: (isinstance(x, ir.Ref)
+                   and not isinstance(x, ir.TopLevelReference)
+                   and not x.name.startswith('__uid_scan')
+                   and not x.name.startswith('__uid_agg')
+                   and not x.name == '__rng_state'))}
     free_variables = bound_references - expr._ir.bound_variables - bindings
     if free_variables:
         raise ExpressionException("dynamic variables created by 'hl.bind' or lambda methods like 'hl.map' may not be aggregated")
@@ -432,7 +433,13 @@ def collect_as_set(expr) -> SetExpression:
     Collect the unique `ID` field where `HT` is greater than 68:
 
     >>> table1.aggregate(hl.agg.filter(table1.HT > 68, hl.agg.collect_as_set(table1.ID)))
-    frozenset({2, 3})
+    {2, 3}
+
+    Note that when collecting a set-typed field with :func:`.collect_as_set`, the values become
+    :class:`.frozenset` s because Python does not permit the keys of a dictionary to be mutable:
+
+    >>> table1.aggregate(hl.agg.filter(table1.HT > 68, hl.agg.collect_as_set(hl.set({table1.ID}))))
+    {frozenset({3}), frozenset({2})}
 
     Warning
     -------
@@ -447,6 +454,7 @@ def collect_as_set(expr) -> SetExpression:
     -------
     :class:`.SetExpression`
         Set of unique `expr` records.
+
     """
     return _agg_func('CollectAsSet', [expr], tset(expr.dtype))
 
@@ -590,13 +598,20 @@ def counter(expr, *, weight=None) -> DictExpression:
     Count the number of individuals for each unique `SEX` value:
 
     >>> table1.aggregate(hl.agg.counter(table1.SEX))
-    frozendict({'F': 2, 'M': 2})
+    {'F': 2, 'M': 2}
     <BLANKLINE>
 
     Compute the total height for each unique `SEX` value:
 
     >>> table1.aggregate(hl.agg.counter(table1.SEX, weight=table1.HT))
-    frozendict({'F': 130, 'M': 137})
+    {'F': 130, 'M': 137}
+    <BLANKLINE>
+
+    Note that when counting a set-typed field, the values become :class:`.frozenset` s because
+    Python does not permit the keys of a dictionary to be mutable:
+
+    >>> table1.aggregate(hl.agg.counter(hl.set({table1.SEX}), weight=table1.HT))
+    {frozenset({'F'}): 130, frozenset({'M'}): 137}
     <BLANKLINE>
 
     Notes
@@ -628,6 +643,7 @@ def counter(expr, *, weight=None) -> DictExpression:
     -------
     :class:`.DictExpression`
         Dictionary with the number of occurrences of each unique record.
+
     """
     if weight is None:
         return _agg_func.group_by(expr, count())
@@ -1069,7 +1085,7 @@ def explode(f, array_agg_expr) -> Expression:
     Compute the set of all observed elements in the `filters` field (``Set[String]``):
 
     >>> dataset.aggregate_rows(hl.agg.explode(lambda elt: hl.agg.collect_as_set(elt), dataset.filters))
-    frozenset({'VQSRTrancheINDEL97.00to99.00'})
+    {'VQSRTrancheINDEL97.00to99.00'}
 
     Notes
     -----

@@ -1,18 +1,21 @@
-import os
 import atexit
 import datetime
-import string
 import difflib
-import shutil
-import tempfile
-import secrets
-from collections import defaultdict, Counter
-from random import Random
 import json
+import os
 import re
-from urllib.parse import urlparse
-from io import StringIO
+import secrets
+import shutil
+import string
+import tempfile
+from collections import defaultdict, Counter
 from contextlib import contextmanager
+from io import StringIO
+from random import Random
+from typing import Optional
+from urllib.parse import urlparse
+
+from typing_extensions import Literal
 
 import hail
 import hail as hl
@@ -64,7 +67,17 @@ def range_matrix_table(n_rows, n_cols, n_partitions=None) -> 'hail.MatrixTable':
     check_nonnegative_and_in_range('range_matrix_table', 'n_cols', n_cols)
     if n_partitions is not None:
         check_positive_and_in_range('range_matrix_table', 'n_partitions', n_partitions)
-    return hail.MatrixTable(hail.ir.MatrixRead(hail.ir.MatrixRangeReader(n_rows, n_cols, n_partitions)))
+    return hail.MatrixTable(hail.ir.MatrixRead(
+        hail.ir.MatrixRangeReader(n_rows, n_cols, n_partitions),
+        _assert_type=hl.tmatrix(
+            hl.tstruct(),
+            hl.tstruct(col_idx=hl.tint32),
+            ['col_idx'],
+            hl.tstruct(row_idx=hl.tint32),
+            ['row_idx'],
+            hl.tstruct()
+        )
+    ))
 
 
 @typecheck(n=int, n_partitions=nullable(int))
@@ -211,6 +224,14 @@ def run_command(args):
     except sp.CalledProcessError as e:
         print(e.output)
         raise e
+
+
+def hl_plural(orig, n, alternate=None):
+    if alternate is None:
+        plural = orig + 's'
+    else:
+        plural = alternate
+    return hl.if_else(n == 1, orig, plural)
 
 
 def plural(orig, n, alternate=None):
@@ -577,10 +598,6 @@ def escape_id(s):
         return "`{}`".format(escape_str(s, backticked=True))
 
 
-def dump_json(obj):
-    return f'"{escape_str(json.dumps(obj))}"'
-
-
 def parsable_strings(strs):
     strs = ' '.join(f'"{escape_str(s)}"' for s in strs)
     return f"({strs})"
@@ -618,3 +635,20 @@ def default_handler():
         return display
     except ImportError:
         return print
+
+
+def guess_cloud_spark_provider() -> Optional[Literal['dataproc', 'hdinsight']]:
+    if 'HAIL_DATAPROC' in os.environ:
+        return 'dataproc'
+    if 'AZURE_SPARK' in os.environ or 'hdinsight' in os.getenv('CLASSPATH', ''):
+        return 'hdinsight'
+    return None
+
+
+def no_service_backend(unsupported_feature):
+    from hail import current_backend
+    from hail.backend.service_backend import ServiceBackend
+    if isinstance(current_backend(), ServiceBackend):
+        raise NotImplementedError(f'{unsupported_feature!r} is not yet supported on the service backend.'
+                                  f'\n  If this is a pressing need, please alert the team on the discussion'
+                                  f'\n  forum to aid in prioritization: https://discuss.hail.is')

@@ -26,7 +26,6 @@ def assert_ndarrays_almost_eq(*expr_and_expected):
     assert_ndarrays(np.allclose, expr_and_expected)
 
 
-@fails_service_backend()
 def test_ndarray_ref():
 
     scalar = 5.0
@@ -62,7 +61,6 @@ def test_ndarray_ref():
     assert "Index 4 is out of bounds for axis 0 with size 3" in str(exc.value)
 
 
-@fails_service_backend()
 def test_ndarray_slice():
     np_rect_prism = np.arange(24).reshape((2, 3, 4))
     rect_prism = hl.nd.array(np_rect_prism)
@@ -204,7 +202,6 @@ def test_ndarray_transposed_slice():
     )
 
 
-@fails_service_backend()
 def test_ndarray_eval():
     data_list = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
     mishapen_data_list1 = [[4], [1, 2, 3]]
@@ -554,7 +551,6 @@ def test_ndarray_transpose():
         cube.transpose((1, 1, 1))
     assert "Axes cannot contain duplicates" in str(exc.value)
 
-
 def test_ndarray_matmul():
     np_v = np.array([1, 2])
     np_y = np.array([1, 1, 1])
@@ -738,7 +734,6 @@ def test_ndarray_solve_triangular():
     with pytest.raises(HailUserError) as exc:
         hl.eval(hl.nd.solve_triangular(a_sing, b_sing))
     assert "singular" in str(exc.value), str(exc.value)
-
 
 def test_ndarray_solve():
     a = hl.nd.array([[1, 2], [3, 5]])
@@ -1108,26 +1103,36 @@ def test_identity():
     assert_ndarrays_eq(*[(hl.nd.identity(i), np.identity(i)) for i in range(13)])
 
 
-def test_agg_ndarray_sum():
+def test_agg_ndarray_sum_empty():
     no_values = hl.utils.range_table(0).annotate(x=hl.nd.arange(5))
     assert no_values.aggregate(hl.agg.ndarray_sum(no_values.x)) is None
 
+
+def test_agg_ndarray_sum_0_to_10():
     increasing_0d = hl.utils.range_table(10)
     increasing_0d = increasing_0d.annotate(x=hl.nd.array(increasing_0d.idx))
     assert np.array_equal(increasing_0d.aggregate(hl.agg.ndarray_sum(increasing_0d.x)), np.array(45))
 
+
+def test_agg_ndarray_sum_ones_1d():
     just_ones_1d = hl.utils.range_table(20).annotate(x=hl.nd.ones((7,)))
     assert np.array_equal(just_ones_1d.aggregate(hl.agg.ndarray_sum(just_ones_1d.x)), np.full((7,), 20))
 
+
+def test_agg_ndarray_sum_ones_2d():
     just_ones_2d = hl.utils.range_table(100).annotate(x=hl.nd.ones((2, 3)))
     assert np.array_equal(just_ones_2d.aggregate(hl.agg.ndarray_sum(just_ones_2d.x)), np.full((2, 3), 100))
 
+
+def test_agg_ndarray_sum_with_transposes():
     transposes = hl.utils.range_table(4).annotate(x=hl.nd.arange(16).reshape((4, 4)))
     transposes = transposes.annotate(x = hl.if_else((transposes.idx % 2) == 0, transposes.x, transposes.x.T))
     np_arange_4_by_4 = np.arange(16).reshape((4, 4))
     transposes_result = (np_arange_4_by_4 * 2) + (np_arange_4_by_4.T * 2)
     assert np.array_equal(transposes.aggregate(hl.agg.ndarray_sum(transposes.x)), transposes_result)
 
+
+def test_agg_ndarray_mismatched_dims_raises_fatal_error():
     with pytest.raises(FatalError) as exc:
         mismatched = hl.utils.range_table(5)
         mismatched = mismatched.annotate(x=hl.nd.ones((mismatched.idx,)))
@@ -1173,5 +1178,18 @@ def test_maximum_minimuim():
     assert(nan_max.size == max_matches)
     assert(nan_min.size == min_matches)
 
+def test_ndarray_broadcasting_with_decorator():
+    nd = hl.nd.array([[1, 4, 9], [16, 25, 36]])
+    nd_sqrt = hl.eval(hl.nd.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+    nd = hl.eval(hl.sqrt(nd))
+    assert(np.array_equal(nd, nd_sqrt))
 
+    nd = hl.nd.array([[10, 100, 1000], [10000, 100000, 1000000]])
+    nd_log10 = hl.eval(hl.nd.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+    nd = hl.eval(hl.log10(nd))
+    assert(np.array_equal(nd, nd_log10))
 
+    nd = hl.nd.array([[1.2, 2.3, 3.3], [4.3, 5.3, 6.3]])
+    nd_floor = hl.eval(hl.nd.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+    nd = hl.eval(hl.floor(nd))
+    assert(np.array_equal(nd, nd_floor))

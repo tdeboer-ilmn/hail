@@ -141,7 +141,7 @@ class NullableValidator:
 
 
 class TruthyValidator:
-    def validate(self, name: str, obj):  # pylint: disable=no-self-use
+    def validate(self, name: str, obj):
         if not obj:
             raise ValidationError(f'{name} cannot be {obj}')
 
@@ -154,7 +154,8 @@ class MultipleValidator:
         excs = []
         for checker in self.checkers:
             try:
-                return checker.validate(name, obj)
+                checker.validate(name, obj)
+                return
             except ValidationError as e:
                 excs.append(e)
         if excs:

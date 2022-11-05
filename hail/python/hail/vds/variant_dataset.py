@@ -4,9 +4,10 @@ import hail as hl
 from hail.matrixtable import MatrixTable
 from hail.typecheck import typecheck_method
 from hail.utils.java import info
+from hail.genetics import ReferenceGenome
 
 
-def read_vds(path, *, intervals=None) -> 'VariantDataset':
+def read_vds(path, *, intervals=None, n_partitions=None) -> 'VariantDataset':
     """Read in a :class:`.VariantDataset` written with :meth:`.VariantDataset.write`.
 
     Parameters
@@ -17,9 +18,16 @@ def read_vds(path, *, intervals=None) -> 'VariantDataset':
     -------
     :class:`.VariantDataset`
     """
-    reference_data = hl.read_matrix_table(VariantDataset._reference_path(path), _intervals=intervals)
-    variant_data = hl.read_matrix_table(VariantDataset._variants_path(path), _intervals=intervals)
-
+    if intervals or not n_partitions:
+        reference_data = hl.read_matrix_table(VariantDataset._reference_path(path), _intervals=intervals)
+        variant_data = hl.read_matrix_table(VariantDataset._variants_path(path), _intervals=intervals)
+    else:
+        assert n_partitions is not None
+        reference_data = hl.read_matrix_table(VariantDataset._reference_path(path))
+        intervals = reference_data._calculate_new_partitions(n_partitions)
+        assert len(intervals) > 0
+        reference_data = hl.read_matrix_table(VariantDataset._reference_path(path), _intervals=intervals)
+        variant_data = hl.read_matrix_table(VariantDataset._variants_path(path), _intervals=intervals)
     return VariantDataset(reference_data, variant_data)
 
 
@@ -126,6 +134,16 @@ class VariantDataset:
         """The number of samples present."""
         return self.reference_data.count_cols()
 
+    @property
+    def reference_genome(self) -> ReferenceGenome:
+        """Dataset reference genome.
+
+        Returns
+        -------
+        :class:`.ReferenceGenome`
+        """
+        return self.reference_data.locus.dtype.reference_genome
+
     @typecheck_method(check_data=bool)
     def validate(self, *, check_data: bool = True):
         """Eagerly checks necessary representational properties of the VDS."""
@@ -222,3 +240,20 @@ class VariantDataset:
 
     def _same(self, other: 'VariantDataset'):
         return self.reference_data._same(other.reference_data) and self.variant_data._same(other.variant_data)
+
+    def union_rows(*vdses):
+        '''Combine many VDSes with the sample samples but disjoint variants.
+
+        **Examples**
+
+        If a dataset is imported as VDS in chromosome-chunks, the following will combine them into
+        one VDS:
+
+        >>> vds_paths = ['chr1.vds', 'chr2.vds']  # doctest: +SKIP
+        ... vds_per_chrom = [hl.vds.read_vds(path) for path in vds_paths)  # doctest: +SKIP
+        ... hl.vds.VariantDataset.union_rows(*vds_per_chrom)  # doctest: +SKIP
+
+        '''
+        new_ref_mt = hl.MatrixTable.union_rows(*(vds.reference_data for vds in vdses))
+        new_var_mt = hl.MatrixTable.union_rows(*(vds.variant_data for vds in vdses))
+        return hl.vds.VariantDataset(new_ref_mt, new_var_mt)

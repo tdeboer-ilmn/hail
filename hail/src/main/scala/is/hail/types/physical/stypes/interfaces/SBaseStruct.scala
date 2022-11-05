@@ -6,10 +6,31 @@ import is.hail.expr.ir.{EmitCode, EmitCodeBuilder, EmitValue, IEmitCode}
 import is.hail.types.physical.PCanonicalStruct
 import is.hail.types.physical.stypes._
 import is.hail.types.physical.stypes.concrete._
-import is.hail.types.physical.stypes.primitives.SInt32Value
+import is.hail.types.physical.stypes.primitives.{SInt32Value, SInt64Value}
 import is.hail.types.virtual.{TBaseStruct, TStruct, TTuple}
 import is.hail.types.{RField, RStruct, RTuple, TypeWithRequiredness}
 import is.hail.utils._
+
+object SBaseStruct {
+  def merge(cb: EmitCodeBuilder, s1: SBaseStructValue, s2: SBaseStructValue): SBaseStructValue = {
+    val lt = s1.st.virtualType.asInstanceOf[TStruct]
+    val rt = s2.st.virtualType.asInstanceOf[TStruct]
+    val resultVType = TStruct.concat(lt, rt)
+
+    val st1 = s1.st
+    val st2 = s2.st
+
+    (s1, s2) match {
+      case (s1, s2: SStackStructValue) =>
+        s1._insert(resultVType, rt.fieldNames.zip(s2.values): _*)
+      case (s1: SStackStructValue, s2) =>
+        s2._insert(resultVType, lt.fieldNames.zip(s1.values): _*)
+      case _ =>
+        val newVals = (0 until st2.size).map(i => cb.memoize(s2.loadField(cb, i), "InsertFieldsStruct_merge"))
+        s1._insert(resultVType, rt.fieldNames.zip(newVals): _*)
+    }
+  }
+}
 
 trait SBaseStruct extends SType {
   def virtualType: TBaseStruct
@@ -34,8 +55,6 @@ trait SBaseStructSettable extends SBaseStructValue with SSettable
 trait SBaseStructValue extends SValue {
   def st: SBaseStruct
 
-  override def get: SBaseStructCode
-
   def isFieldMissing(cb: EmitCodeBuilder, fieldIdx: Int): Value[Boolean]
 
   def isFieldMissing(cb: EmitCodeBuilder, fieldName: String): Value[Boolean] =
@@ -54,12 +73,29 @@ trait SBaseStructValue extends SValue {
     val hash_result = cb.newLocal[Int]("hash_result_struct", 1)
     (0 until st.size).foreach(i => {
       loadField(cb, i).consume(cb, { cb.assign(hash_result, hash_result * 31) },
-        {field => cb.assign(hash_result, (hash_result * 31) + field.hash(cb).intCode(cb))})
+        {field => cb.assign(hash_result, (hash_result * 31) + field.hash(cb).value)})
     })
     new SInt32Value(hash_result)
   }
 
-  protected[stypes] def _insert(newType: TStruct, fields: (String, EmitValue)*): SBaseStructValue = {
+  override def sizeToStoreInBytes(cb: EmitCodeBuilder): SInt64Value = {
+    // Size in bytes of the struct that must represent this thing, plus recursive call on any non-missing children.
+    val pStructSize = this.st.storageType().byteSize
+    val sizeSoFar = cb.newLocal[Long]("sstackstruct_size_in_bytes", pStructSize)
+    (0 until st.size).foreach { idx =>
+      if (this.st.fieldTypes(idx).containsPointers) {
+        val sizeAtThisIdx: Value[Long] = this.loadField(cb, idx).consumeCode(cb, {
+          const(0L)
+        }, { sv =>
+          sv.sizeToStoreInBytes(cb).value
+        })
+        cb.assign(sizeSoFar, sizeSoFar + sizeAtThisIdx)
+      }
+    }
+    new SInt64Value(sizeSoFar)
+  }
+
+  def _insert(newType: TStruct, fields: (String, EmitValue)*): SBaseStructValue = {
     new SInsertFieldsStructValue(
       SInsertFieldsStruct(newType, st, fields.map { case (name, ec) => (name, ec.emitType) }.toFastIndexedSeq),
       this,
@@ -77,29 +113,5 @@ trait SBaseStructValue extends SValue {
 
     val pcs = PCanonicalStruct(false, allFields.map { case (f, ec) => (f, ec.emitType.storageType) }: _*)
     pcs.constructFromFields(cb, region, allFields.map(_._2.load), false)
-  }
-}
-
-trait SBaseStructCode extends SCode {
-  self =>
-  def st: SBaseStruct
-
-  def memoize(cb: EmitCodeBuilder, name: String): SBaseStructValue
-
-  def memoizeField(cb: EmitCodeBuilder, name: String): SBaseStructValue
-
-  final def loadSingleField(cb: EmitCodeBuilder, fieldName: String): IEmitCode = loadSingleField(cb, st.fieldIdx(fieldName))
-
-  def loadSingleField(cb: EmitCodeBuilder, fieldIdx: Int): IEmitCode = {
-    memoize(cb, "structcode_loadsinglefield")
-      .loadField(cb, fieldIdx)
-  }
-
-  protected[stypes] def _insert(newType: TStruct, fields: (String, EmitCode)*): SBaseStructCode = {
-    new SInsertFieldsStructCode(
-      SInsertFieldsStruct(newType, st, fields.map { case (name, ec) => (name, ec.emitType) }.toFastIndexedSeq),
-      this,
-      fields.map(_._2).toFastIndexedSeq
-    )
   }
 }

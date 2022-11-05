@@ -1,12 +1,13 @@
 import os
 import warnings
 import re
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, Union, List, Any, Set
+from typing import Callable, Optional, Dict, Union, List, Any, Set
+from io import BytesIO
+import dill
 
-from hailtop.utils import secret_alnum_string
-from hailtop.aiotools import AsyncFS, RouterAsyncFS, LocalAsyncFS
-from hailtop.aiocloud.aiogoogle import GoogleStorageAsyncFS
+from hailtop.utils import secret_alnum_string, url_scheme, async_to_blocking
+from hailtop.aiotools import AsyncFS
+from hailtop.aiotools.router_fs import RouterAsyncFS
 
 from . import backend as _backend, job, resource as _resource  # pylint: disable=cyclic-import
 from .exceptions import BatchException
@@ -87,16 +88,15 @@ class Batch:
         Automatically cancel the batch after N failures have occurred. The default
         behavior is there is no limit on the number of failures. Only
         applicable for the :class:`.ServiceBackend`. Must be greater than 0.
-
     """
 
     _counter = 0
     _uid_prefix = "__BATCH__"
-    _regex_pattern = r"(?P<BATCH>{}\d+)".format(_uid_prefix)
+    _regex_pattern = r"(?P<BATCH>{}\d+)".format(_uid_prefix)  # pylint: disable=consider-using-f-string
 
     @classmethod
     def _get_uid(cls):
-        uid = "{}{}".format(cls._uid_prefix, cls._counter)
+        uid = cls._uid_prefix + str(cls._counter)
         cls._counter += 1
         return uid
 
@@ -150,6 +150,40 @@ class Batch:
 
         self._cancel_after_n_failures = cancel_after_n_failures
 
+        self._python_function_defs: Dict[int, Callable] = {}
+        self._python_function_files: Dict[int, _resource.InputResourceFile] = {}
+
+    def _register_python_function(self, function: Callable) -> int:
+        function_id = id(function)
+        self._python_function_defs[function_id] = function
+        return function_id
+
+    async def _serialize_python_to_input_file(
+        self, path: str, subdir: str, file_id: int, code: Any, dry_run: bool = False
+    ) -> _resource.InputResourceFile:
+        pipe = BytesIO()
+        dill.dump(code, pipe, recurse=True)
+        pipe.seek(0)
+
+        code_path = f"{path}/{subdir}/code{file_id}.p"
+
+        if not dry_run:
+            await self._fs.makedirs(os.path.dirname(code_path), exist_ok=True)
+            await self._fs.write(code_path, pipe.getvalue())
+
+        code_input_file = self.read_input(code_path)
+
+        return code_input_file
+
+    async def _serialize_python_functions_to_input_files(
+        self, path: str, dry_run: bool = False
+    ) -> None:
+        for function_id, function in self._python_function_defs.items():
+            file = await self._serialize_python_to_input_file(
+                path, "functions", function_id, function, dry_run
+            )
+            self._python_function_files[function_id] = file
+
     def _unique_job_token(self, n=5):
         token = secret_alnum_string(n)
         while token in self._job_tokens:
@@ -160,8 +194,8 @@ class Batch:
     def _fs(self) -> AsyncFS:
         if self._DEPRECATED_project is not None:
             if self._DEPRECATED_fs is None:
-                self._DEPRECATED_fs = RouterAsyncFS('file', [LocalAsyncFS(ThreadPoolExecutor()),
-                                                             GoogleStorageAsyncFS(project=self._DEPRECATED_project)])
+                gcs_kwargs = {'project': self._DEPRECATED_project}
+                self._DEPRECATED_fs = RouterAsyncFS('file', gcs_kwargs=gcs_kwargs)
             return self._DEPRECATED_fs
         return self._backend._fs
 
@@ -221,6 +255,9 @@ class Batch:
         if self._default_timeout is not None:
             j.timeout(self._default_timeout)
 
+        if isinstance(self._backend, _backend.ServiceBackend):
+            j.regions(self._backend.regions)
+
         self._jobs.append(j)
         return j
 
@@ -238,7 +275,7 @@ class Batch:
 
         .. code-block:: python
 
-            b = Batch(default_python_image='gcr.io/hail-vdc/python-dill:3.7-slim')
+            b = Batch(default_python_image='hailgenetics/python-dill:3.7-slim')
 
             def hello(name):
                 return f'hello {name}'
@@ -301,6 +338,7 @@ class Batch:
         return jrf
 
     def _new_input_resource_file(self, input_path, value=None):
+        self._backend.validate_file_scheme(input_path)
         if value is None:
             value = f'{secret_alnum_string(5)}/{os.path.basename(input_path.rstrip("/"))}'
         irf = _resource.InputResourceFile(value)
@@ -432,20 +470,36 @@ class Batch:
         self._resource_map.update({rg._uid: rg})
         return rg
 
-    def write_output(self, resource: _resource.Resource, dest: str):  # pylint: disable=R0201
+    def write_output(self, resource: _resource.Resource, dest: str):
         """
         Write resource file or resource file group to an output destination.
 
         Examples
         --------
 
-        Write a single job intermediate to a permanent location:
+        Write a single job intermediate to a local file:
 
         >>> b = Batch()
         >>> j = b.new_job()
         >>> j.command(f'echo "hello" > {j.ofile}')
         >>> b.write_output(j.ofile, 'output/hello.txt')
         >>> b.run()
+
+        Write a single job intermediate to a permanent location in GCS:
+
+        >>> b = Batch()
+        >>> j = b.new_job()
+        >>> j.command(f'echo "hello" > {j.ofile}')
+        >>> b.write_output(j.ofile, 'gs://mybucket/output/hello.txt')
+        >>> b.run()  # doctest: +SKIP
+
+        Write a single job intermediate to a permanent location in Azure:
+
+        >>> b = Batch()
+        >>> j = b.new_job()
+        >>> j.command(f'echo "hello" > {j.ofile}')
+        >>> b.write_output(j.ofile, 'hail-az://my-account/my-container/output/hello.txt')
+        >>> b.run()  # doctest: +SKIP
 
         .. warning::
 
@@ -489,7 +543,8 @@ class Batch:
                                  f"using the PythonJob 'call' method")
 
         if isinstance(self._backend, _backend.LocalBackend):
-            if not dest.startswith('gs://'):
+            dest_scheme = url_scheme(dest)
+            if dest_scheme == '':
                 dest = os.path.abspath(os.path.expanduser(dest))
 
         resource._add_output_path(dest)
@@ -575,7 +630,7 @@ class Batch:
         run_result = self._backend._run(self, dry_run, verbose, delete_scratch_on_exit, **backend_kwargs)  # pylint: disable=assignment-from-no-return
         if self._DEPRECATED_fs is not None:
             # best effort only because this is deprecated
-            self._DEPRECATED_fs.close()
+            async_to_blocking(self._DEPRECATED_fs.close())
             self._DEPRECATED_fs = None
         return run_result
 

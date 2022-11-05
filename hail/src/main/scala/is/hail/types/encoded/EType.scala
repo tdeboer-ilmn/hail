@@ -28,17 +28,19 @@ abstract class EType extends BaseType with Serializable with Requiredness {
   type StagedDecoder = (EmitCodeBuilder, Value[Region], Value[InputBuffer]) => SValue
   type StagedInplaceDecoder = (EmitCodeBuilder, Value[Region], Value[Long], Value[InputBuffer]) => Unit
 
-  final def buildEncoder(ctx: ExecuteContext, t: PType): (OutputBuffer) => Encoder = {
+  final def buildEncoder(ctx: ExecuteContext, t: PType): (OutputBuffer, HailClassLoader) => Encoder = {
     val f = EType.buildEncoder(ctx, this, t)
-    out: OutputBuffer => new CompiledEncoder(out, f)
+    (out: OutputBuffer, theHailClassLoader: HailClassLoader) => new CompiledEncoder(out, theHailClassLoader, f)
   }
 
-  final def buildDecoder(ctx: ExecuteContext, requestedType: Type): (PType, (InputBuffer) => Decoder) = {
+  final def buildDecoder(ctx: ExecuteContext, requestedType: Type): (PType, (InputBuffer, HailClassLoader) => Decoder) = {
     val (rt, f) = EType.buildDecoderToRegionValue(ctx, this, requestedType)
-    (rt, (in: InputBuffer) => new CompiledDecoder(in, f))
+    val makeDec = (in: InputBuffer, theHailClassLoader: HailClassLoader) =>
+      new CompiledDecoder(in, rt, theHailClassLoader, f)
+    (rt, makeDec)
   }
 
-  final def buildStructDecoder(ctx: ExecuteContext, requestedType: TStruct): (PStruct, (InputBuffer) => Decoder) = {
+  final def buildStructDecoder(ctx: ExecuteContext, requestedType: TStruct): (PStruct, (InputBuffer, HailClassLoader) => Decoder) = {
     val (pType: PStruct, makeDec) = buildDecoder(ctx, requestedType)
     pType -> makeDec
   }
@@ -181,14 +183,14 @@ object EType {
   protected[encoded] def lowBitMask(n: Code[Int]): Code[Byte] = (const(0xFF) >>> ((-n) & 0x7)).toB
 
   val cacheCapacity = 256
-  protected val encoderCache = new util.LinkedHashMap[(EType, PType), () => EncoderAsmFunction](cacheCapacity, 0.75f, true) {
-    override def removeEldestEntry(eldest: Entry[(EType, PType), () => EncoderAsmFunction]): Boolean = size() > cacheCapacity
+  protected val encoderCache = new util.LinkedHashMap[(EType, PType), (HailClassLoader) => EncoderAsmFunction](cacheCapacity, 0.75f, true) {
+    override def removeEldestEntry(eldest: Entry[(EType, PType), (HailClassLoader) => EncoderAsmFunction]): Boolean = size() > cacheCapacity
   }
   protected var encoderCacheHits: Long = 0L
   protected var encoderCacheMisses: Long = 0L
 
   // The 'entry point' for building an encoder from an EType and a PType
-  def buildEncoder(ctx: ExecuteContext, et: EType, pt: PType): () => EncoderAsmFunction = {
+  def buildEncoder(ctx: ExecuteContext, et: EType, pt: PType): (HailClassLoader) => EncoderAsmFunction = {
     val k = (et, pt)
     if (encoderCache.containsKey(k)) {
       encoderCacheHits += 1
@@ -210,19 +212,19 @@ object EType {
         val f = et.buildEncoder(pc.st, mb.ecb)
         f(cb, pc, out)
       }
-      val func = fb.result()
+      val func = fb.result(ctx)
       encoderCache.put(k, func)
       func
     }
   }
 
-  protected val decoderCache = new util.LinkedHashMap[(EType, Type), (PType, () => DecoderAsmFunction)](cacheCapacity, 0.75f, true) {
-    override def removeEldestEntry(eldest: Entry[(EType, Type), (PType, () => DecoderAsmFunction)]): Boolean = size() > cacheCapacity
+  protected val decoderCache = new util.LinkedHashMap[(EType, Type), (PType, (HailClassLoader) => DecoderAsmFunction)](cacheCapacity, 0.75f, true) {
+    override def removeEldestEntry(eldest: Entry[(EType, Type), (PType, (HailClassLoader) => DecoderAsmFunction)]): Boolean = size() > cacheCapacity
   }
   protected var decoderCacheHits: Long = 0L
   protected var decoderCacheMisses: Long = 0L
 
-  def buildDecoderToRegionValue(ctx: ExecuteContext, et: EType, t: Type): (PType, () => DecoderAsmFunction) = {
+  def buildDecoderToRegionValue(ctx: ExecuteContext, et: EType, t: Type): (PType, (HailClassLoader) => DecoderAsmFunction) = {
     val k = (et, t)
     if (decoderCache.containsKey(k)) {
       decoderCacheHits += 1
@@ -247,7 +249,7 @@ object EType {
         pt.store(cb, region, pc, false)
       }
 
-      val r = (pt, fb.result())
+      val r = (pt, fb.result(ctx))
       decoderCache.put(k, r)
       r
     }
@@ -272,6 +274,7 @@ object EType {
         EField("position", EInt32(true), 1)),
         required = r.required)
     case TCall => EInt32(r.required)
+    case TRNGState => ERNGState(r.required, None)
     case t: TInterval =>
       val rinterval = r.asInstanceOf[RInterval]
       EBaseStruct(
@@ -281,9 +284,9 @@ object EType {
           EField("includesStart", EBoolean(true), 2),
           EField("includesEnd", EBoolean(true), 3)),
         required = rinterval.required)
-    case t: TIterable => EArray(fromTypeAndAnalysis(t.elementType, coerce[RIterable](r).elementType), r.required)
+    case t: TIterable => EArray(fromTypeAndAnalysis(t.elementType, tcoerce[RIterable](r).elementType), r.required)
     case t: TBaseStruct =>
-      val rstruct = coerce[RBaseStruct](r)
+      val rstruct = tcoerce[RBaseStruct](r)
       assert(t.size == rstruct.size, s"different number of fields: ${t} ${r}")
       EBaseStruct(Array.tabulate(t.size) { i =>
         val f = rstruct.fields(i)

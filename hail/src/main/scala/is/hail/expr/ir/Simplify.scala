@@ -1,26 +1,29 @@
 package is.hail.expr.ir
 
+import is.hail.HailContext
+import is.hail.backend.ExecuteContext
 import is.hail.types.virtual._
 import is.hail.io.bgen.MatrixBGENReader
 import is.hail.rvd.{PartitionBoundOrdering, RVDPartitionInfo}
+import is.hail.types.tcoerce
 import is.hail.utils._
 
 object Simplify {
 
   /** Transform 'ir' using simplification rules until none apply.
     */
-  def apply(ir: BaseIR): BaseIR = Simplify(ir, allowRepartitioning = true)
+  def apply(ctx: ExecuteContext, ir: BaseIR): BaseIR = Simplify(ctx, ir, allowRepartitioning = true)
 
   /** Use 'allowRepartitioning'=false when in a context where simplification
     * should not change the partitioning of the result of 'ast', such as when
     * some parent (downstream) node of 'ast' uses seeded randomness.
     */
-  private[ir] def apply(ast: BaseIR, allowRepartitioning: Boolean): BaseIR =
+  private[ir] def apply(ctx: ExecuteContext, ast: BaseIR, allowRepartitioning: Boolean): BaseIR =
     ast match {
-      case ir: IR => simplifyValue(ir)
-      case tir: TableIR => simplifyTable(allowRepartitioning)(tir)
-      case mir: MatrixIR => simplifyMatrix(allowRepartitioning)(mir)
-      case bmir: BlockMatrixIR => simplifyBlockMatrix(bmir)
+      case ir: IR => simplifyValue(ctx)(ir)
+      case tir: TableIR => simplifyTable(ctx, allowRepartitioning)(tir)
+      case mir: MatrixIR => simplifyMatrix(ctx, allowRepartitioning)(mir)
+      case bmir: BlockMatrixIR => simplifyBlockMatrix(ctx)(bmir)
     }
 
   private[this] def visitNode[T <: BaseIR](
@@ -32,38 +35,38 @@ object Simplify {
     transform(t1).map(post).getOrElse(t1)
   }
 
-  private[this] def simplifyValue: IR => IR =
+  private[this] def simplifyValue(ctx: ExecuteContext): IR => IR =
     visitNode(
-      Simplify(_),
+      Simplify(ctx, _),
       rewriteValueNode,
-      simplifyValue)
+      simplifyValue(ctx))
 
-  private[this] def simplifyTable(allowRepartitioning: Boolean)(tir: TableIR): TableIR =
+  private[this] def simplifyTable(ctx: ExecuteContext, allowRepartitioning: Boolean)(tir: TableIR): TableIR =
     visitNode(
-      Simplify(_, allowRepartitioning && isDeterministicallyRepartitionable(tir)),
-      rewriteTableNode(allowRepartitioning),
-      simplifyTable(allowRepartitioning)
+      Simplify(ctx, _, allowRepartitioning && isDeterministicallyRepartitionable(tir)),
+      rewriteTableNode(ctx, allowRepartitioning),
+      simplifyTable(ctx, allowRepartitioning)
     )(tir)
 
-  private[this] def simplifyMatrix(allowRepartitioning: Boolean)(mir: MatrixIR): MatrixIR =
+  private[this] def simplifyMatrix(ctx: ExecuteContext, allowRepartitioning: Boolean)(mir: MatrixIR): MatrixIR =
     visitNode(
-      Simplify(_, allowRepartitioning && isDeterministicallyRepartitionable(mir)),
+      Simplify(ctx, _, allowRepartitioning && isDeterministicallyRepartitionable(mir)),
       rewriteMatrixNode(allowRepartitioning),
-      simplifyMatrix(allowRepartitioning)
+      simplifyMatrix(ctx, allowRepartitioning)
     )(mir)
 
-  private[this] def simplifyBlockMatrix(bmir: BlockMatrixIR): BlockMatrixIR = {
+  private[this] def simplifyBlockMatrix(ctx: ExecuteContext)(bmir: BlockMatrixIR): BlockMatrixIR = {
     visitNode(
-      Simplify(_),
+      Simplify(ctx, _),
       rewriteBlockMatrixNode,
-      simplifyBlockMatrix
+      simplifyBlockMatrix(ctx)
     )(bmir)
   }
 
   private[this] def rewriteValueNode: IR => Option[IR] = valueRules.lift
 
-  private[this] def rewriteTableNode(allowRepartitioning: Boolean)(tir: TableIR): Option[TableIR] =
-    tableRules(allowRepartitioning && isDeterministicallyRepartitionable(tir)).lift(tir)
+  private[this] def rewriteTableNode(ctx: ExecuteContext, allowRepartitioning: Boolean)(tir: TableIR): Option[TableIR] =
+    tableRules(ctx, allowRepartitioning && isDeterministicallyRepartitionable(tir)).lift(tir)
 
   private[this] def rewriteMatrixNode(allowRepartitioning: Boolean)(mir: MatrixIR): Option[MatrixIR] =
     matrixRules(allowRepartitioning && isDeterministicallyRepartitionable(mir)).lift(mir)
@@ -84,6 +87,25 @@ object Simplify {
            _: GetTupleElement => true
       case ApplyComparisonOp(op, _, _) => op.strict
       case f: ApplySeeded => f.implementation.isStrict
+      case _ => false
+    }
+  }
+
+  /**
+    * Returns true if any strict child of 'x' is NA.
+    * A child is strict if 'x' evaluates to missing whenever the child does.
+    */
+  private[this] def hasMissingStrictChild(x: IR): Boolean = {
+    x match {
+      case _: Apply |
+           _: ApplyUnaryPrimOp |
+           _: ApplyBinaryPrimOp |
+           _: ArrayRef |
+           _: ArrayLen |
+           _: GetField |
+           _: GetTupleElement => Children(x).exists(_.isInstanceOf[NA])
+      case ApplyComparisonOp(op, _, _) if op.strict => Children(x).exists(_.isInstanceOf[NA])
+      case f: ApplySeeded if f.implementation.isStrict => f.args.exists(_.isInstanceOf[NA])
       case _ => false
     }
   }
@@ -126,7 +148,7 @@ object Simplify {
 
   private[this] def valueRules: PartialFunction[IR, IR] = {
     // propagate NA
-    case x: IR if isStrict(x) && Children(x).exists(_.isInstanceOf[NA]) =>
+    case x: IR if hasMissingStrictChild(x) =>
       NA(x.typ)
 
     case x@If(NA(_), _, _) => NA(x.typ)
@@ -201,7 +223,7 @@ object Simplify {
     case StreamLen(StreamMap(s, _, _)) => StreamLen(s)
     case StreamLen(StreamFlatMap(a, name, body)) => streamSumIR(StreamMap(a, name, StreamLen(body)))
     case StreamLen(StreamGrouped(a, groupSize)) => bindIR(groupSize)(groupSizeRef => (StreamLen(a) + groupSizeRef - 1) floorDiv groupSizeRef)
-      
+
     case ArrayLen(ToArray(s)) if s.typ.isInstanceOf[TStream] => StreamLen(s)
     case ArrayLen(StreamFlatMap(a, _, MakeArray(args, _))) => ApplyBinaryPrimOp(Multiply(), I32(args.length), ArrayLen(a))
 
@@ -276,18 +298,21 @@ object Simplify {
 
     case GetField(SelectFields(old, fields), name) => GetField(old, name)
 
-    case InsertFields(InsertFields(base, fields1, fieldOrder1), fields2, fieldOrder2) =>
-        val fields2Set = fields2.map(_._1).toSet
-        val newFields = fields1.filter { case (name, _) => !fields2Set.contains(name) } ++ fields2
+    case outer@InsertFields(InsertFields(base, fields1, fieldOrder1), fields2, fieldOrder2) =>
+      val fields2Set = fields2.map(_._1).toSet
+      val newFields = fields1.filter { case (name, _) => !fields2Set.contains(name) } ++ fields2
       (fieldOrder1, fieldOrder2) match {
         case (Some(fo1), None) =>
           val fields1Set = fo1.toSet
           val fieldOrder = fo1 ++ fields2.map(_._1).filter(!fields1Set.contains(_))
           InsertFields(base, newFields, Some(fieldOrder))
-        case _ =>
+        case (_, Some(_)) =>
           InsertFields(base, newFields, fieldOrder2)
+        case _ =>
+          // In this case, it's important to make a field order that reflects the original insertion order
+          val resultFieldOrder = outer.typ.fieldNames
+          InsertFields(base, newFields, Some(resultFieldOrder))
       }
-
     case InsertFields(MakeStruct(fields1), fields2, fieldOrder) =>
       val fields1Map = fields1.toMap
       val fields2Map = fields2.toMap
@@ -301,7 +326,8 @@ object Simplify {
           MakeStruct(finalFields)
       }
 
-    case InsertFields(struct, Seq(), _) => struct
+    case InsertFields(struct, Seq(), None) => struct
+    case InsertFields(SelectFields(old, _), Seq(), Some(insertFieldOrder)) => SelectFields(old, insertFieldOrder)
 
     case top@Let(x, Let(y, yVal, yBody), xBody) if (x != y) => Let(y, yVal, Let(x, yBody, xBody))
 
@@ -364,7 +390,7 @@ object Simplify {
       }
       ForwardLets[IR](rw)
 
-    case SelectFields(old, fields) if coerce[TStruct](old.typ).fieldNames sameElements fields =>
+    case SelectFields(old, fields) if tcoerce[TStruct](old.typ).fieldNames sameElements fields =>
       old
 
     case SelectFields(SelectFields(old, _), fields) =>
@@ -589,7 +615,7 @@ object Simplify {
     case LiftMeOut(child) if IsConstant(child) => child
   }
 
-  private[this] def tableRules(canRepartition: Boolean): PartialFunction[TableIR, TableIR] = {
+  private[this] def tableRules(ctx: ExecuteContext, canRepartition: Boolean): PartialFunction[TableIR, TableIR] = {
 
     case TableRename(child, m1, m2) if m1.isTrivial && m2.isTrivial => child
 
@@ -777,9 +803,15 @@ object Simplify {
       TableAggregateByKey(child, expr)
 
     case TableAggregateByKey(x@TableKeyBy(child, keys, false), expr) if canRepartition && !x.definitelyDoesNotShuffle =>
-      TableKeyByAndAggregate(child, expr, MakeStruct(keys.map(k => k -> GetField(Ref("row", child.typ.rowType), k))))
+      TableKeyByAndAggregate(child, expr, MakeStruct(keys.map(k => k -> GetField(Ref("row", child.typ.rowType), k))), bufferSize = ctx.getFlag("grouped_aggregate_buffer_size").toInt)
 
     case TableParallelize(TableCollect(child), _) if isDeterministicallyRepartitionable(child) => child
+
+    case TableFilterIntervals(child, intervals, keep) if intervals.isEmpty =>
+      if (keep)
+        TableFilter(child, False())
+      else
+        child
 
     // push down filter intervals nodes
     case TableFilterIntervals(TableFilter(child, pred), intervals, keep) =>
@@ -802,14 +834,16 @@ object Simplify {
       TableExplode(TableFilterIntervals(child, intervals, keep), path)
     case TableFilterIntervals(TableAggregateByKey(child, expr), intervals, keep) =>
       TableAggregateByKey(TableFilterIntervals(child, intervals, keep), expr)
-    case TableFilterIntervals(TableFilterIntervals(child, i1, keep1), i2, keep2) if keep1 == keep2 =>
+    case TableFilterIntervals(TableFilterIntervals(child, _i1, keep1), _i2, keep2) if keep1 == keep2 =>
       val ord = PartitionBoundOrdering(child.typ.keyType).intervalEndpointOrdering
+      val i1 = Interval.union(_i1.toArray[Interval], ord)
+      val i2 = Interval.union(_i2.toArray[Interval], ord)
       val intervals = if (keep1)
       // keep means intersect intervals
-        Interval.intersection(i1.toArray[Interval], i2.toArray[Interval], ord)
+        Interval.intersection(i1, i2, ord)
       else
       // remove means union intervals
-        Interval.union(i1.toArray[Interval] ++ i2.toArray[Interval], ord)
+        Interval.union(i1 ++ i2, ord)
       TableFilterIntervals(child, intervals.toFastIndexedSeq, keep1)
 
       // FIXME: Can try to serialize intervals shorter than the key

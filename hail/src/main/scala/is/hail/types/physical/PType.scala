@@ -1,15 +1,14 @@
 package is.hail.types.physical
 
 import is.hail.annotations._
-import is.hail.asm4s
 import is.hail.asm4s._
 import is.hail.backend.ExecuteContext
 import is.hail.check.{Arbitrary, Gen}
-import is.hail.expr.ir
 import is.hail.expr.ir._
-import is.hail.types.physical.stypes.{SCode, SType, SValue}
+import is.hail.types.physical.stypes.concrete.SRNGState
+import is.hail.types.physical.stypes.{SType, SValue}
 import is.hail.types.virtual._
-import is.hail.types.{Requiredness, coerce}
+import is.hail.types.{Requiredness, tcoerce}
 import is.hail.utils._
 import is.hail.variant.ReferenceGenome
 import org.apache.spark.sql.Row
@@ -21,7 +20,7 @@ class PTypeSerializer extends CustomSerializer[PType](format => (
   { case t: PType => JString(t.toString) }))
 
 class PStructSerializer extends CustomSerializer[PStruct](format => (
-  { case JString(s) => coerce[PStruct](IRParser.parsePType(s)) },
+  { case JString(s) => tcoerce[PStruct](IRParser.parsePType(s)) },
   { case t: PStruct => JString(t.toString) }))
 
 object PType {
@@ -121,6 +120,7 @@ object PType {
       case TBinary => PCanonicalBinary(required)
       case TString => PCanonicalString(required)
       case TCall => PCanonicalCall(required)
+      case TRNGState => StoredSTypePType(SRNGState(None), required)
       case t: TLocus => PCanonicalLocus(t.rg, required)
       case t: TInterval => PCanonicalInterval(canonical(t.pointType, innerRequired, innerRequired), required)
       case t: TArray => PCanonicalArray(canonical(t.elementType, innerRequired, innerRequired), required)
@@ -302,7 +302,7 @@ object PType {
     canonical(t, 0, 0)
   }
 
-  def canonicalize(t: PType, ctx: ExecuteContext, path: List[String]): Option[() => AsmFunction2RegionLongLong] = {
+  def canonicalize(t: PType, ctx: ExecuteContext, path: List[String]): Option[(HailClassLoader) => AsmFunction2RegionLongLong] = {
     def canonicalPath(pt: PType, path: List[String]): PType = {
       if (path.isEmpty) {
         PType.canonical(pt)
@@ -334,7 +334,7 @@ object PType {
         val srcAddr = fb.apply_method.getCodeParam[Long](2)
         cpt.store(cb, region, t.loadCheapSCode(cb, srcAddr), deepCopy = false)
       }
-      Some(fb.result())
+      Some(fb.result(ctx))
     }
   }
 }
@@ -416,8 +416,9 @@ abstract class PType extends Serializable with Requiredness {
 
   def subsetTo(t: Type): PType = {
     this match {
-      case PCanonicalStruct(fields, r) =>
+      case x@PCanonicalStruct(fields, r) =>
         val ts = t.asInstanceOf[TStruct]
+        assert(ts.fieldNames.forall(x.fieldNames.contains))
         PCanonicalStruct(r, fields.flatMap { pf => ts.fieldOption(pf.name).map { vf => (pf.name, pf.typ.subsetTo(vf.typ)) } }: _*)
       case PCanonicalTuple(fields, r) =>
         val tt = t.asInstanceOf[TTuple]
@@ -455,8 +456,6 @@ abstract class PType extends Serializable with Requiredness {
 
   // return a SCode that can cheaply operate on the region representation. Generally a pointer type, but not necessarily (e.g. primitives).
   def loadCheapSCode(cb: EmitCodeBuilder, addr: Code[Long]): SValue
-
-  def loadCheapSCodeField(cb: EmitCodeBuilder, addr: Code[Long]): SValue
 
   // stores a stack value as a region value of this type
   def store(cb: EmitCodeBuilder, region: Value[Region], value: SValue, deepCopy: Boolean): Value[Long]

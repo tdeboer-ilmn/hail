@@ -6,6 +6,7 @@ import is.hail.expr.ir._
 import is.hail.types._
 import is.hail.utils._
 import is.hail.asm4s.coerce
+import is.hail.backend.ExecuteContext
 import is.hail.experimental.ExperimentalFunctions
 import is.hail.types.physical._
 import is.hail.types.physical.stypes.{EmitType, SCode, SType, SValue}
@@ -82,6 +83,39 @@ object IRFunctionRegistry {
       })
   }
 
+  def pyRegisterIRForServiceBackend(
+    ctx: ExecuteContext,
+    name: String,
+    typeParamStrs: Array[String],
+    argNames: Array[String],
+    argTypeStrs: Array[String],
+    returnType: String,
+    bodyStr: String
+  ): Unit = {
+    requireJavaIdentifier(name)
+
+    val typeParameters = typeParamStrs.map(IRParser.parseType).toFastIndexedSeq
+    val valueParameterTypes = argTypeStrs.map(IRParser.parseType).toFastIndexedSeq
+    val refMap = BindingEnv.eval(argNames.zip(valueParameterTypes): _*)
+    val body = IRParser.parse_value_ir(
+      bodyStr,
+      IRParserEnvironment(ctx, refMap, Map())
+    )
+
+    userAddedFunctions += ((name, (body.typ, typeParameters, valueParameterTypes)))
+    addIR(
+      name,
+      typeParameters,
+      valueParameterTypes,
+      IRParser.parseType(returnType),
+      false,
+      { (_, args, _) =>
+        Subst(body,
+          BindingEnv(Env[IR](argNames.zip(args): _*)))
+      }
+    )
+  }
+
   def removeIRFunction(
     name: String,
     returnType: Type,
@@ -149,11 +183,11 @@ object IRFunctionRegistry {
     }
   }
 
-  def lookupSeeded(name: String, seed: Long, returnType: Type, arguments: Seq[Type]): Option[(Seq[IR]) => IR] = {
+  def lookupSeeded(name: String, seed: Long, returnType: Type, arguments: Seq[Type]): Option[(Seq[IR], IR) => IR] = {
     lookupFunction(name, returnType, Array.empty[Type], arguments)
       .filter(_.isInstanceOf[SeededJVMFunction])
       .map { case f: SeededJVMFunction =>
-        (irArguments: Seq[IR]) => ApplySeeded(name, irArguments, seed, f.returnType.subst())
+        (irArguments: Seq[IR], rngState: IR) => ApplySeeded(name, irArguments, rngState, seed, f.returnType.subst())
       }
   }
 
@@ -262,13 +296,13 @@ abstract class RegistryFunctions {
     case _ => classInfo[AnyRef]
   }
 
-  def scodeToJavaValue(cb: EmitCodeBuilder, r: Value[Region], sc: SValue): Value[AnyRef] = {
+  def svalueToJavaValue(cb: EmitCodeBuilder, r: Value[Region], sc: SValue): Value[AnyRef] = {
     sc.st match {
-      case SInt32 => cb.memoize(Code.boxInt(sc.asInt32.intCode(cb)))
-      case SInt64 => cb.memoize(Code.boxLong(sc.asInt64.longCode(cb)))
-      case SFloat32 => cb.memoize(Code.boxFloat(sc.asFloat32.floatCode(cb)))
-      case SFloat64 => cb.memoize(Code.boxDouble(sc.asFloat64.doubleCode(cb)))
-      case SBoolean => cb.memoize(Code.boxBoolean(sc.asBoolean.boolCode(cb)))
+      case SInt32 => cb.memoize(Code.boxInt(sc.asInt32.value))
+      case SInt64 => cb.memoize(Code.boxLong(sc.asInt64.value))
+      case SFloat32 => cb.memoize(Code.boxFloat(sc.asFloat32.value))
+      case SFloat64 => cb.memoize(Code.boxDouble(sc.asFloat64.value))
+      case SBoolean => cb.memoize(Code.boxBoolean(sc.asBoolean.value))
       case _: SCall => cb.memoize(Code.boxInt(sc.asCall.canonicalCall(cb)))
       case _: SString => sc.asString.loadString(cb)
       case _: SLocus => sc.asLocus.getLocusObj(cb)
@@ -455,7 +489,7 @@ abstract class RegistryFunctions {
       case t if t.isPrimitive => SType.extractPrimValue(cb, code)
       case TCall => code.asCall.canonicalCall(cb)
       case TArray(TString) => code.st match {
-        case _: SJavaArrayString => cb.memoize(code.asInstanceOf[SJavaArrayStringCode].array)
+        case _: SJavaArrayString => cb.memoize(code.asInstanceOf[SJavaArrayStringValue].array)
         case _ =>
           val sv = code.asIndexable
           val arr = cb.newLocal[Array[String]]("scode_array_string", Code.newArray[String](sv.loadLength()))
@@ -464,7 +498,7 @@ abstract class RegistryFunctions {
           }
           arr
       }
-      case _ => scodeToJavaValue(cb, r, code)
+      case _ => svalueToJavaValue(cb, r, code)
     }
 
     registerSCode(name, valueParameterTypes, returnType, calculateReturnType) { case (r, cb, _, rt, args, _) =>
@@ -487,6 +521,10 @@ abstract class RegistryFunctions {
   def registerWrappedScalaFunction3(name: String, a1: Type, a2: Type, a3: Type, returnType: Type,
     pt: (Type, SType, SType, SType) => SType)(cls: Class[_], method: String): Unit =
     registerWrappedScalaFunction(name, Array(a1, a2, a3), returnType, unwrappedApply(pt))(cls, method)
+
+  def registerWrappedScalaFunction4(name: String, a1: Type, a2: Type, a3: Type, a4: Type, returnType: Type,
+                                    pt: (Type, SType, SType, SType, SType) => SType)(cls: Class[_], method: String): Unit =
+    registerWrappedScalaFunction(name, Array(a1, a2, a3, a4), returnType, unwrappedApply(pt))(cls, method)
 
   def registerJavaStaticFunction(name: String, valueParameterTypes: Array[Type], returnType: Type, pt: (Type, Seq[SType]) => SType)(cls: Class[_], method: String) {
     registerCode(name, valueParameterTypes, returnType, pt) { case (r, cb, rt, _, args) =>
@@ -578,6 +616,13 @@ abstract class RegistryFunctions {
       impl(cb, r, rt, errorID, a1, a2, a3, a4)
     }
 
+
+  def registerIEmitCode5(name: String, mt1: Type, mt2: Type, mt3: Type, mt4: Type, mt5: Type, rt: Type, pt: (Type, EmitType, EmitType, EmitType, EmitType, EmitType) => EmitType)
+    (impl: (EmitCodeBuilder, Value[Region], SType, Value[Int], EmitCode, EmitCode, EmitCode, EmitCode, EmitCode) => IEmitCode): Unit =
+    registerIEmitCode(name, Array(mt1, mt2, mt3, mt4, mt5), rt, unwrappedApply(pt)) { case (cb, r, rt, errorID, Array(a1, a2, a3, a4, a5)) =>
+      impl(cb, r, rt, errorID, a1, a2, a3, a4, a5)
+    }
+
   def registerIEmitCode6(name: String, mt1: Type, mt2: Type, mt3: Type, mt4: Type, mt5: Type, mt6: Type, rt: Type, pt: (Type, EmitType, EmitType, EmitType, EmitType, EmitType, EmitType) => EmitType)
     (impl: (EmitCodeBuilder, Value[Region], SType, Value[Int], EmitCode, EmitCode, EmitCode, EmitCode, EmitCode, EmitCode) => IEmitCode): Unit =
     registerIEmitCode(name, Array(mt1, mt2, mt3, mt4, mt5, mt6), rt, unwrappedApply(pt)) { case (cb, r, rt, errorID, Array(a1, a2, a3, a4, a5, a6)) =>
@@ -642,6 +687,12 @@ abstract class RegistryFunctions {
       impl(cb, r, rt, seed, a1, a2)
     }
 
+  def registerSeeded3(name: String, arg1: Type, arg2: Type, arg3: Type, returnType: Type, pt: (Type, SType, SType, SType) => SType)
+    (impl: (EmitCodeBuilder, Value[Region], SType, Long, SValue, SValue, SValue) => SValue): Unit =
+    registerSeeded(name, Array(arg1, arg2, arg3), returnType, unwrappedApply(pt)) {
+      case (cb, r, rt, seed, Array(a1, a2, a3)) => impl(cb, r, rt, seed, a1, a2, a3)
+    }
+
   def registerSeeded4(name: String, arg1: Type, arg2: Type, arg3: Type, arg4: Type, returnType: Type, pt: (Type, SType, SType, SType, SType) => SType)
     (impl: (EmitCodeBuilder, Value[Region], SType, Long, SValue, SValue, SValue, SValue) => SValue): Unit =
     registerSeeded(name, Array(arg1, arg2, arg3, arg4), returnType, unwrappedApply(pt)) {
@@ -702,6 +753,12 @@ abstract class UnseededMissingnessObliviousJVMFunction (
     EmitCode.fromI(r.mb)(cb => IEmitCode.multiMapEmitCodes(cb, args.toFastIndexedSeq) { args =>
       apply(r, cb, returnType, typeParameters, errorID, args: _*)
     })
+  }
+
+  def applyI(r: EmitRegion, cb: EmitCodeBuilder, returnType: SType, typeParameters: Seq[Type], errorID: Value[Int], args: EmitCode*): IEmitCode = {
+    IEmitCode.multiMapEmitCodes(cb, args.toFastIndexedSeq) { args =>
+      apply(r, cb, returnType, typeParameters, errorID, args: _*)
+    }
   }
 
   def getAsMethod[C](cb: EmitClassBuilder[C], rpt: SType, typeParameters: Seq[Type], args: SType*): EmitMethodBuilder[C] = {

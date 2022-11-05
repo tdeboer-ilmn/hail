@@ -1,6 +1,7 @@
-from typing import Optional, Dict, Any, TypeVar, Generic
+from typing import Optional, Dict, Any, TypeVar, Generic, List, Union
 import sys
 import abc
+import orjson
 import os
 import subprocess as sp
 import uuid
@@ -10,20 +11,26 @@ import copy
 from shlex import quote as shq
 import webbrowser
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from rich.progress import track
 
+from hailtop import pip_version
 from hailtop.config import get_deploy_config, get_user_config
-from hailtop.utils import is_google_registry_domain, parse_docker_image_reference, async_to_blocking, bounded_gather, tqdm
+from hailtop.utils.rich_progress_bar import SimpleRichProgressBar
+from hailtop.utils import parse_docker_image_reference, async_to_blocking, bounded_gather, url_scheme
 from hailtop.batch.hail_genetics_images import HAIL_GENETICS_IMAGES
 from hailtop.batch_client.parse import parse_cpu_in_mcpu
 import hailtop.batch_client.client as bc
 from hailtop.batch_client.client import BatchClient
-from hailtop.aiotools import RouterAsyncFS, LocalAsyncFS, AsyncFS
-from hailtop.aiocloud.aiogoogle import GoogleStorageAsyncFS
+from hailtop.aiotools import AsyncFS
+from hailtop.aiotools.router_fs import RouterAsyncFS
 
 from . import resource, batch, job as _job  # pylint: disable=unused-import
 from .exceptions import BatchException
 from .globals import DEFAULT_SHELL
+
+
+HAIL_GENETICS_HAIL_IMAGE = os.environ.get('HAIL_GENETICS_HAIL_IMAGE',
+                                          f'hailgenetics/hail:{pip_version()}')
 
 
 RunningBatchType = TypeVar('RunningBatchType')
@@ -58,10 +65,10 @@ class Backend(abc.ABC, Generic[RunningBatchType]):
     def _fs(self) -> AsyncFS:
         raise NotImplementedError()
 
-    def _close(self):  # pylint: disable=R0201
+    def _close(self):
         return
 
-    def close(self):  # pylint: disable=R0201
+    def close(self):
         """
         Close a Hail Batch Backend.
 
@@ -73,6 +80,9 @@ class Backend(abc.ABC, Generic[RunningBatchType]):
         if not self._closed:
             self._close()
             self._closed = True
+
+    def validate_file_scheme(self, uri: str) -> None:
+        pass
 
     def __del__(self):
         self.close()
@@ -127,7 +137,7 @@ class LocalBackend(Backend[None]):
             flags += f' -v {gsa_key_file}:/gsa-key/key.json'
 
         self._extra_docker_run_flags = flags
-        self.__fs: AsyncFS = LocalAsyncFS(ThreadPoolExecutor())
+        self.__fs: AsyncFS = RouterAsyncFS(default_scheme='file')
 
     @property
     def _fs(self):
@@ -185,18 +195,18 @@ class LocalBackend(Backend[None]):
         copied_input_resource_files = set()
         os.makedirs(tmpdir + '/inputs/', exist_ok=True)
 
-        if batch.requester_pays_project:
-            requester_pays_project = f'-u {batch.requester_pays_project}'
-        else:
-            requester_pays_project = ''
+        requester_pays_project_json = orjson.dumps(batch.requester_pays_project).decode('utf-8')
 
         def copy_input(job, r):
             if isinstance(r, resource.InputResourceFile):
                 if r not in copied_input_resource_files:
                     copied_input_resource_files.add(r)
 
-                    if r._input_path.startswith('gs://'):
-                        return [f'gsutil {requester_pays_project} cp -r {shq(r._input_path)} {shq(r._get_path(tmpdir))}']
+                    input_scheme = url_scheme(r._input_path)
+                    if input_scheme != '':
+                        transfers_bytes = orjson.dumps([{"from": r._input_path, "to": r._get_path(tmpdir)}])
+                        transfers = transfers_bytes.decode('utf-8')
+                        return [f'python3 -m hailtop.aiotools.copy {shq(requester_pays_project_json)} {shq(transfers)}']
 
                     absolute_input_path = os.path.realpath(os.path.expanduser(r._input_path))
 
@@ -214,24 +224,6 @@ class LocalBackend(Backend[None]):
             assert isinstance(r, (resource.JobResourceFile, resource.PythonResult))
             return []
 
-        def copy_external_output(r):
-            def _cp(dest):
-                if not dest.startswith('gs://'):
-                    dest = os.path.expanduser(dest)
-                    dest = os.path.abspath(dest)
-                    directory = os.path.dirname(dest)
-                    os.makedirs(directory, exist_ok=True)
-                    return 'cp'
-                return f'gsutil {requester_pays_project} cp -r'
-
-            if isinstance(r, resource.InputResourceFile):
-                return [f'{_cp(dest)} {shq(r._input_path)} {shq(dest)}'
-                        for dest in r._output_paths]
-
-            assert isinstance(r, (resource.JobResourceFile, resource.PythonResult))
-            return [f'{_cp(dest)} {r._get_path(tmpdir)} {shq(dest)}'
-                    for dest in r._output_paths]
-
         def symlink_input_resource_group(r):
             symlinks = []
             if isinstance(r, resource.ResourceGroup) and r._source is None:
@@ -241,17 +233,35 @@ class LocalBackend(Backend[None]):
                     symlinks.append(f'ln -sf {shq(src)} {shq(dest)}')
             return symlinks
 
+        def transfer_dicts_for_resource_file(res_file: Union[resource.ResourceFile, resource.PythonResult]) -> List[dict]:
+            if isinstance(res_file, resource.InputResourceFile):
+                source = res_file._input_path
+            else:
+                assert isinstance(res_file, (resource.JobResourceFile, resource.PythonResult))
+                source = res_file._get_path(tmpdir)
+
+            return [{"from": source, "to": dest} for dest in res_file._output_paths]
+
         try:
-            write_inputs = [x for r in batch._input_resources for x in copy_external_output(r)]
-            if write_inputs:
+            input_transfer_dicts = [
+                transfer_dict
+                for input_resource in batch._input_resources
+                for transfer_dict in transfer_dicts_for_resource_file(input_resource)]
+
+            if input_transfer_dicts:
+                input_transfers = orjson.dumps(input_transfer_dicts).decode('utf-8')
                 code = new_code_block()
                 code += ["# Write input resources to output destinations"]
-                code += write_inputs
+                code += [f'python3 -m hailtop.aiotools.copy {shq(requester_pays_project_json)} {shq(input_transfers)}']
                 code += ['\n']
                 run_code(code)
 
+            async_to_blocking(
+                batch._serialize_python_functions_to_input_files(tmpdir, dry_run=dry_run)
+            )
+
             for job in batch._jobs:
-                async_to_blocking(job._compile(tmpdir, tmpdir))
+                async_to_blocking(job._compile(tmpdir, tmpdir, dry_run=dry_run))
 
                 os.makedirs(f'{tmpdir}/{job._dirname}/', exist_ok=True)
 
@@ -308,7 +318,14 @@ class LocalBackend(Backend[None]):
                 else:
                     code.append(f"{job_shell} -c {quoted_job_script}")
 
-                code += [x for r in job._external_outputs for x in copy_external_output(r)]
+                output_transfer_dicts = [
+                    transfer_dict
+                    for output_resource in job._external_outputs
+                    for transfer_dict in transfer_dicts_for_resource_file(output_resource)]
+
+                if output_transfer_dicts:
+                    output_transfers = orjson.dumps(output_transfer_dicts).decode('utf-8')
+                    code += [f'python3 -m hailtop.aiotools.copy {shq(requester_pays_project_json)} {shq(output_transfers)}']
                 code += ['\n']
 
                 run_code(code)
@@ -333,6 +350,8 @@ class LocalBackend(Backend[None]):
 
 
 class ServiceBackend(Backend[bc.Batch]):
+    ANY_REGION = ['any_region']
+
     """Backend that executes batches on Hail's Batch Service on Google Cloud.
 
     Examples
@@ -368,15 +387,40 @@ class ServiceBackend(Backend[bc.Batch]):
         If specified, the project to use when authenticating with Google
         Storage. Google Storage is used to transfer serialized values between
         this computer and the cloud machines that execute Python jobs.
-
+    token:
+        The authorization token to pass to the batch client.
+        Should only be set for user delegation purposes.
+    regions:
+        Cloud region(s) to run jobs in. Use py:staticmethod:`.ServiceBackend.supported_regions` to list the
+        available regions to choose from. Use py:attribute:`.ServiceBackend.ANY_REGION` to signify the default is jobs
+        can run in any available region. The default is jobs can run in any region unless a default value has
+        been set with hailctl. An example invocation is `hailctl config set batch/regions "us-central1,us-east1"`.
     """
+
+    @staticmethod
+    def supported_regions():
+        """
+        Get the supported cloud regions
+
+        Examples
+        --------
+        >>> regions = ServiceBackend.supported_regions()
+
+        Returns
+        -------
+        A list of the supported cloud regions
+        """
+        with BatchClient('dummy') as dummy_client:
+            return dummy_client.supported_regions()
 
     def __init__(self,
                  *args,
                  billing_project: Optional[str] = None,
                  bucket: Optional[str] = None,
                  remote_tmpdir: Optional[str] = None,
-                 google_project: Optional[str] = None
+                 google_project: Optional[str] = None,
+                 token: Optional[str] = None,
+                 regions: Optional[List[str]] = None
                  ):
         if len(args) > 2:
             raise TypeError(f'ServiceBackend() takes 2 positional arguments but {len(args)} were given')
@@ -398,7 +442,7 @@ class ServiceBackend(Backend[bc.Batch]):
                 'the billing_project parameter of ServiceBackend must be set '
                 'or run `hailctl config set batch/billing_project '
                 'MY_BILLING_PROJECT`')
-        self._batch_client = BatchClient(billing_project)
+        self._batch_client = BatchClient(billing_project, _token=token)
 
         user_config = get_user_config()
 
@@ -414,7 +458,7 @@ class ServiceBackend(Backend[bc.Batch]):
         if remote_tmpdir is None:
             if bucket is None:
                 bucket = user_config.get('batch', 'bucket', fallback=None)
-                warnings.warn('Using deprecated configuration setting \'batch\\bucket\'. Run `hailctl config set batch/remote_tmpdir` '
+                warnings.warn('Using deprecated configuration setting \'batch/bucket\'. Run `hailctl config set batch/remote_tmpdir` '
                               'to set the default for \'remote_tmpdir\' instead.')
             if bucket is None:
                 raise ValueError(
@@ -426,8 +470,8 @@ class ServiceBackend(Backend[bc.Batch]):
                     'Use the remote_tmpdir parameter to specify a path.')
             remote_tmpdir = f'gs://{bucket}/batch'
         else:
-            schemes = {'gs'}
-            found_scheme = any([remote_tmpdir.startswith(f'{scheme}://') for scheme in schemes])
+            schemes = {'gs', 'hail-az'}
+            found_scheme = any(remote_tmpdir.startswith(f'{scheme}://') for scheme in schemes)
             if not found_scheme:
                 raise ValueError(
                     f'remote_tmpdir must be a storage uri path like gs://bucket/folder. Possible schemes include {schemes}')
@@ -435,15 +479,25 @@ class ServiceBackend(Backend[bc.Batch]):
             remote_tmpdir += '/'
         self.remote_tmpdir = remote_tmpdir
 
-        self.__fs: AsyncFS = RouterAsyncFS('file', [LocalAsyncFS(ThreadPoolExecutor()),
-                                                    GoogleStorageAsyncFS(project=google_project)])
+        gcs_kwargs = {'project': google_project}
+        self.__fs: RouterAsyncFS = RouterAsyncFS(default_scheme='file', gcs_kwargs=gcs_kwargs)
+
+        if regions is None:
+            regions_from_conf = user_config.get('batch', 'regions', fallback=None)
+            if regions_from_conf is not None:
+                assert isinstance(regions_from_conf, str)
+                regions = regions_from_conf.split(',')
+        elif regions == ServiceBackend.ANY_REGION:
+            regions = None
+        self.regions = regions
 
     @property
     def _fs(self):
         return self.__fs
 
     def _close(self):
-        self._batch_client.close()
+        if hasattr(self, '_batch_client'):
+            self._batch_client.close()
         async_to_blocking(self._fs.close())
 
     def _run(self,
@@ -527,9 +581,6 @@ class ServiceBackend(Backend[bc.Batch]):
 
         bash_flags = 'set -e' + ('x' if verbose else '')
 
-        activate_service_account = 'gcloud -q auth activate-service-account ' \
-                                   '--key-file=/gsa-key/key.json'
-
         def copy_input(r):
             if isinstance(r, resource.InputResourceFile):
                 return [(r._input_path, r._get_path(local_tmpdir))]
@@ -557,34 +608,36 @@ class ServiceBackend(Backend[bc.Batch]):
 
         write_external_inputs = [x for r in batch._input_resources for x in copy_external_output(r)]
         if write_external_inputs:
-            def _cp(src, dst):
-                return f'gsutil -m cp -R {shq(src)} {shq(dst)}'
-
-            write_cmd = f'''
-{bash_flags}
-{activate_service_account}
-{' && '.join([_cp(*files) for files in write_external_inputs])}
-'''
-
+            transfers_bytes = orjson.dumps([
+                {"from": src, "to": dest}
+                for src, dest in write_external_inputs])
+            transfers = transfers_bytes.decode('utf-8')
+            write_cmd = ['python3', '-m', 'hailtop.aiotools.copy', 'null', transfers]
             if dry_run:
-                commands.append(write_cmd)
+                commands.append(' '.join(shq(x) for x in write_cmd))
             else:
-                j = bc_batch.create_job(image='gcr.io/google.com/cloudsdktool/cloud-sdk:310.0.0-alpine',
-                                        command=['/bin/bash', '-c', write_cmd],
+                j = bc_batch.create_job(image=HAIL_GENETICS_HAIL_IMAGE,
+                                        command=write_cmd,
                                         attributes={'name': 'write_external_inputs'})
-                jobs_to_command[j] = write_cmd
+                jobs_to_command[j] = ' '.join(shq(x) for x in write_cmd)
                 n_jobs_submitted += 1
 
         pyjobs = [j for j in batch._jobs if isinstance(j, _job.PythonJob)]
-        for job in pyjobs:
-            if job._image is None:
+        for pyjob in pyjobs:
+            if pyjob._image is None:
                 version = sys.version_info
-                if version.major != 3 or version.minor not in (6, 7, 8):
+                if version.major != 3 or version.minor not in (7, 8, 9, 10):
                     raise BatchException(
-                        f"You must specify 'image' for Python jobs if you are using a Python version other than 3.6, 3.7, or 3.8 (you are using {version})")
-                job._image = f'hailgenetics/python-dill:{version.major}.{version.minor}-slim'
+                        f"You must specify 'image' for Python jobs if you are using a Python version other than 3.7, 3.8, 3.9 or 3.10 (you are using {version})")
+                pyjob._image = f'hailgenetics/python-dill:{version.major}.{version.minor}-slim'
 
-        with tqdm(total=len(batch._jobs), desc='upload code', disable=disable_progress_bar) as pbar:
+        await batch._serialize_python_functions_to_input_files(
+            batch_remote_tmpdir, dry_run=dry_run
+        )
+
+        with SimpleRichProgressBar(total=len(batch._jobs),
+                                   description='upload code',
+                                   disable=disable_progress_bar) as pbar:
             async def compile_job(job):
                 used_remote_tmpdir = await job._compile(local_tmpdir, batch_remote_tmpdir, dry_run=dry_run)
                 pbar.update(1)
@@ -592,7 +645,7 @@ class ServiceBackend(Backend[bc.Batch]):
             used_remote_tmpdir_results = await bounded_gather(*[functools.partial(compile_job, j) for j in batch._jobs], parallelism=150)
             used_remote_tmpdir |= any(used_remote_tmpdir_results)
 
-        for job in tqdm(batch._jobs, desc='create job objects', disable=disable_progress_bar):
+        for job in track(batch._jobs, description='create job objects', disable=disable_progress_bar):
             inputs = [x for r in job._inputs for x in copy_input(r)]
 
             outputs = [x for r in job._internal_outputs for x in copy_internal_output(r)]
@@ -640,7 +693,7 @@ class ServiceBackend(Backend[bc.Batch]):
 
             parents = [job_to_client_job_mapping[j] for j in job._dependencies]
 
-            attributes = copy.deepcopy(job.attributes) if job.attributes else dict()
+            attributes = copy.deepcopy(job.attributes) if job.attributes else {}
             if job.name:
                 attributes['name'] = job.name
 
@@ -658,8 +711,8 @@ class ServiceBackend(Backend[bc.Batch]):
 
             image = job._image if job._image else default_image
             image_ref = parse_docker_image_reference(image)
-            if not is_google_registry_domain(image_ref.domain) and image_ref.name() not in HAIL_GENETICS_IMAGES:
-                warnings.warn(f'Using an image {image} not in GCR. '
+            if image_ref.hosted_in('dockerhub') and image_ref.name() not in HAIL_GENETICS_IMAGES:
+                warnings.warn(f'Using an image {image} from Docker Hub. '
                               f'Jobs may fail due to Docker Hub rate limits.')
 
             env = {**job._env, 'BATCH_TMPDIR': local_tmpdir}
@@ -673,11 +726,12 @@ class ServiceBackend(Backend[bc.Batch]):
                                     output_files=outputs if len(outputs) > 0 else None,
                                     always_run=job._always_run,
                                     timeout=job._timeout,
-                                    gcsfuse=job._gcsfuse if len(job._gcsfuse) > 0 else None,
+                                    cloudfuse=job._cloudfuse if len(job._cloudfuse) > 0 else None,
                                     env=env,
                                     requester_pays_project=batch.requester_pays_project,
                                     mount_tokens=True,
-                                    user_code=user_code)
+                                    user_code=user_code,
+                                    regions=job._regions)
 
             n_jobs_submitted += 1
 
@@ -690,15 +744,9 @@ class ServiceBackend(Backend[bc.Batch]):
 
         if delete_scratch_on_exit and used_remote_tmpdir:
             parents = list(jobs_to_command.keys())
-            rm_cmd = f'gsutil -m rm -r {batch_remote_tmpdir}'
-            cmd = f'''
-{bash_flags}
-{activate_service_account}
-{rm_cmd}
-'''
             j = bc_batch.create_job(
-                image='gcr.io/google.com/cloudsdktool/cloud-sdk:310.0.0-alpine',
-                command=['/bin/bash', '-c', cmd],
+                image=HAIL_GENETICS_HAIL_IMAGE,
+                command=['python3', '-m', 'hailtop.aiotools.delete', batch_remote_tmpdir],
                 parents=parents,
                 attributes={'name': 'remove_tmpdir'},
                 always_run=True)
@@ -720,13 +768,22 @@ class ServiceBackend(Backend[bc.Batch]):
             print('')
 
         deploy_config = get_deploy_config()
-        url = deploy_config.url('batch', f'/batches/{batch_handle.id}')
-        print(f'Submitted batch {batch_handle.id}, see {url}')
+        url = deploy_config.external_url('batch', f'/batches/{batch_handle.id}')
 
         if open:
             webbrowser.open(url)
         if wait:
-            print(f'Waiting for batch {batch_handle.id}...')
-            status = batch_handle.wait()
+            if verbose:
+                print(f'Waiting for batch {batch_handle.id}...')
+            status = batch_handle.wait(disable_progress_bar=disable_progress_bar)
             print(f'batch {batch_handle.id} complete: {status["state"]}')
         return batch_handle
+
+    def validate_file_scheme(self, uri: str) -> None:
+        scheme = self.__fs.get_scheme(uri)
+        if scheme == "file":
+            raise ValueError(
+                f"Local filepath detected: '{uri}'. "
+                "ServiceBackend does not support the use of local filepaths. "
+                "Please specify a remote URI instead (e.g. gs://bucket/folder)."
+            )

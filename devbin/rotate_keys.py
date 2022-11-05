@@ -1,15 +1,18 @@
 import asyncio
 import base64
 import itertools
-from dateutil.parser import isoparse
-from datetime import datetime, timedelta
-import pytz
 import json
-from typing import List, Tuple, Generator, Optional, TextIO
-from enum import Enum
-import warnings
 import sys
-import kubernetes_asyncio as kube
+import warnings
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Generator, List, Optional, TextIO, Tuple
+
+import kubernetes_asyncio.client
+import kubernetes_asyncio.config
+import pytz
+from dateutil.parser import isoparse
+
 from hailtop.aiocloud.aiogoogle import GoogleIAmClient
 from hailtop.utils import retry_transient_errors
 
@@ -274,8 +277,9 @@ async def main():
     iam_client = GoogleIAmClient(project)
     iam_manager = IAMManager(iam_client)
 
-    await kube.config.load_kube_config()  # type: ignore
-    k8s_manager = KubeSecretManager(kube.client.CoreV1Api())  # type: ignore
+    await kubernetes_asyncio.config.load_kube_config()
+    k8s_client = kubernetes_asyncio.client.CoreV1Api()
+    k8s_manager = KubeSecretManager(k8s_client)
 
     try:
         service_accounts = await iam_manager.get_all_service_accounts()
@@ -323,7 +327,10 @@ async def main():
         else:
             print('Doing nothing')
     finally:
-        await iam_client.close()
+        try:
+            await iam_client.close()
+        finally:
+            await k8s_client.api_client.rest_client.pool_manager.close()
 
 
 asyncio.get_event_loop().run_until_complete(main())

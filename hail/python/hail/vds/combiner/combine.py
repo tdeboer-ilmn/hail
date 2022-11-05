@@ -2,7 +2,7 @@ from typing import Collection, List, Optional, Set
 
 import hail as hl
 from hail import MatrixTable, Table
-from hail.ir import Apply, TableMapRows, TopLevelReference
+from hail.ir import Apply, TableMapRows
 from hail.experimental.vcf_combiner.vcf_combiner import combine_gvcfs, localize, parse_as_fields, unlocalize
 from ..variant_dataset import VariantDataset
 
@@ -89,7 +89,7 @@ def make_variants_matrix_table(mt: MatrixTable,
             mt.row.dtype)
         _transform_variant_function_map[mt.row.dtype, info_key] = f
     transform_row = _transform_variant_function_map[mt.row.dtype, info_key]
-    return unlocalize(Table(TableMapRows(mt._tir, Apply(transform_row._name, transform_row._ret_type, TopLevelReference('row')))))
+    return unlocalize(Table(TableMapRows(mt._tir, Apply(transform_row._name, transform_row._ret_type, mt.row._ir))))
 
 
 def defined_entry_fields(mt: MatrixTable, sample=None) -> Set[str]:
@@ -137,13 +137,13 @@ def make_reference_matrix_table(mt: MatrixTable,
         _transform_reference_fuction_map[mt.row.dtype, entry_key] = f
 
     transform_row = _transform_reference_fuction_map[mt.row.dtype, entry_key]
-    return unlocalize(Table(TableMapRows(mt._tir, Apply(transform_row._name, transform_row._ret_type, TopLevelReference('row')))))
+    return unlocalize(Table(TableMapRows(mt._tir, Apply(transform_row._name, transform_row._ret_type, mt.row._ir))))
 
 
 def transform_gvcf(mt: MatrixTable,
                    reference_entry_fields_to_keep: Collection[str],
                    info_to_keep: Optional[Collection[str]] = None) -> VariantDataset:
-    """Transforms a gvcf into a sparse matrix table
+    """Transforms a GVCF into a sparse matrix table
 
     The input to this should be some result of either :func:`.import_vcf` or
     :func:`.import_gvcfs` with ``array_elements_required=False``.
@@ -154,14 +154,14 @@ def transform_gvcf(mt: MatrixTable,
     Parameters
     ----------
     mt : :class:`.MatrixTable`
-        The gvcf being transformed.
+        The GVCF being transformed.
     reference_entry_fields_to_keep : :class:`list` of :class:`str`
         Genotype fields to keep in the reference table. If empty, the first
         10,000 reference block rows of ``mt`` will be sampled and all fields
         found to be defined other than ``GT``, ``AD``, and ``PL`` will be entry
         fields in the resulting reference matrix in the dataset.
     info_to_keep : :class:`list` of :class:`str`
-        Any ``INFO`` fields in the gvcf that are to be kept and put in the ``gvcf_info`` entry
+        Any ``INFO`` fields in the GVCF that are to be kept and put in the ``gvcf_info`` entry
         field. By default, all ``INFO`` fields except ``END`` and ``DP`` are kept.
 
     Returns
@@ -208,8 +208,8 @@ def combine_r(ts):
     merge_function = _merge_function_map[(ts.row.dtype, ts.globals.dtype)]
     ts = Table(TableMapRows(ts._tir, Apply(merge_function._name,
                                            merge_function._ret_type,
-                                           TopLevelReference('row'),
-                                           TopLevelReference('global'))))
+                                           ts.row._ir,
+                                           ts.globals._ir)))
     return ts.transmute_globals(__cols=hl.flatten(ts.g.map(lambda g: g.__cols)))
 
 

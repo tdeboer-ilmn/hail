@@ -1,6 +1,5 @@
 import re
 
-import pkg_resources
 import yaml
 
 from . import gcloud
@@ -134,9 +133,9 @@ REGION_TO_REPLICATE_MAPPING = {
     'australia-southeast1': 'aus-sydney'
 }
 
-ANNOTATION_DB_BUCKETS = ["hail-datasets-us", "hail-datasets-eu", "gnomad-public-requester-pays"]
+ANNOTATION_DB_BUCKETS = ["hail-datasets-us", "hail-datasets-eu"]
 
-IMAGE_VERSION = '2.0.22-debian10'
+IMAGE_VERSION = '2.0.44-debian10'
 
 
 def init_parser(parser):
@@ -184,6 +183,8 @@ def init_parser(parser):
     max_age_group.add_argument('--max-age', type=str, help='If specified, maximum age before shutdown (e.g. 60m).')
     parser.add_argument('--bucket', type=str,
                         help='The Google Cloud Storage bucket to use for cluster staging (just the bucket name, no gs:// prefix).')
+    parser.add_argument('--temp-bucket', type=str,
+                        help='The Google Cloud Storage bucket to use for cluster temporary storage (just the bucket name, no gs:// prefix).')
     parser.add_argument('--network', type=str, help='the network for all nodes in this cluster')
     parser.add_argument('--service-account', type=str, help='The Google Service Account to use for cluster creation (default to the Compute Engine service account).')
     parser.add_argument('--master-tags', type=str, help='comma-separated list of instance tags to apply to the mastern node')
@@ -201,11 +202,13 @@ def init_parser(parser):
                         choices=['GRCh37', 'GRCh38'])
     parser.add_argument('--dry-run', action='store_true', help="Print gcloud dataproc command, but don't run it.")
     parser.add_argument('--no-off-heap-memory', action='store_true',
-                        help="If true, allocate all executor memory to the JVM heap.")
+                        help="If true, don't partition JVM memory between hail heap and JVM heap")
     parser.add_argument('--big-executors', action='store_true',
                         help="If true, double memory allocated per executor, using half the cores of the cluster with an extra large memory allotment per core.")
     parser.add_argument('--off-heap-memory-fraction', type=float, default=0.6,
-                        help="Fraction of worker memory dedicated to off-heap Hail values.")
+                        help="Minimum fraction of worker memory dedicated to off-heap Hail values.")
+    parser.add_argument('--off-heap-memory-hard-limit', action='store_true',
+                        help="If true, limit off-heap allocations to the dedicated fraction")
     parser.add_argument('--yarn-memory-fraction', type=float,
                         help="Fraction of machine memory to allocate to the yarn container scheduler.",
                         default=0.95)
@@ -225,7 +228,9 @@ def init_parser(parser):
                         help="Enable debug features on created cluster (heap dump on out-of-memory error)")
 
 
-def main(args, pass_through_args):
+async def main(args, pass_through_args):
+    import pkg_resources  # pylint: disable=import-outside-toplevel
+
     conf = ClusterConfig()
     conf.extend_flag('image-version', IMAGE_VERSION)
 
@@ -354,11 +359,14 @@ def main(args, pass_through_args):
         off_heap_mb = int(memory_per_executor_mb * args.off_heap_memory_fraction)
         on_heap_mb = memory_per_executor_mb - off_heap_mb
 
-        off_heap_memory_per_core = off_heap_mb // executor_cores
+        if args.off_heap_memory_hard_limit:
+            off_heap_memory_per_core = off_heap_mb // executor_cores
+        else:
+            off_heap_memory_per_core = available_memory_per_core_mb
 
         print(f"hailctl dataproc: Creating a cluster with workers of machine type {args.worker_machine_type}.\n"
               f"  Allocating {memory_per_executor_mb} MB of memory per executor ({executor_cores} cores),\n"
-              f"  with {off_heap_mb} MB for Hail off-heap values and {on_heap_mb} MB for the JVM.\n"
+              f"  with at least {off_heap_mb} MB for Hail off-heap values and {on_heap_mb} MB for the JVM."
               f"  Using a maximum Hail memory reservation of {off_heap_memory_per_core} MB per core.")
 
         conf.extend_flag('properties',
@@ -387,6 +395,8 @@ def main(args, pass_through_args):
         conf.flags['project'] = args.project
     if args.bucket:
         conf.flags['bucket'] = args.bucket
+    if args.temp_bucket:
+        conf.flags['temp-bucket'] = args.bucket
     if args.scopes:
         conf.flags['scopes'] = args.scopes
 

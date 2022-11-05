@@ -1,66 +1,144 @@
-import os
-import logging
 import asyncio
+import json
+import logging
+import os
+import re
+from typing import List, Optional
+
 import aiohttp
-from aiohttp import web
 import aiohttp_session
 import uvloop
-import google.auth.transport.requests
-import google.oauth2.id_token
-import google_auth_oauthlib.flow
+from aiohttp import web
 from prometheus_async.aio.web import server_stats  # type: ignore
-from hailtop.config import get_deploy_config
-from hailtop.tls import internal_server_ssl_context
-from hailtop.hail_logging import AccessLogger
-from hailtop.utils import secret_alnum_string
-from hailtop import httpx
+
 from gear import (
-    setup_aiohttp_session,
-    rest_authenticated_users_only,
-    web_authenticated_developers_only,
-    web_maybe_authenticated_user,
-    web_authenticated_users_only,
-    create_session,
-    check_csrf_token,
-    transaction,
+    AuthClient,
     Database,
+    Transaction,
+    check_csrf_token,
+    create_session,
     maybe_parse_bearer_header,
     monitor_endpoints_middleware,
+    setup_aiohttp_session,
+    transaction,
 )
 from gear.cloud_config import get_global_config
-from web_common import setup_aiohttp_jinja2, setup_common_static_routes, set_message, render_template
+from hailtop import httpx
+from hailtop.config import get_deploy_config
+from hailtop.hail_logging import AccessLogger
+from hailtop.tls import internal_server_ssl_context
+from hailtop.utils import secret_alnum_string
+from web_common import render_template, set_message, setup_aiohttp_jinja2, setup_common_static_routes
+
+from .exceptions import (
+    AuthUserError,
+    DuplicateLoginID,
+    DuplicateUsername,
+    EmptyLoginID,
+    InvalidType,
+    InvalidUsername,
+    MultipleExistingUsers,
+    MultipleUserTypes,
+    PreviouslyDeletedUser,
+    UnknownUser,
+)
+from .flow import get_flow_client
 
 log = logging.getLogger('auth')
 
 uvloop.install()
 
 CLOUD = get_global_config()['cloud']
-GSUITE_ORGANIZATION = os.environ['HAIL_GSUITE_ORGANIZATION']
+ORGANIZATION_DOMAIN = os.environ['HAIL_ORGANIZATION_DOMAIN']
 
 deploy_config = get_deploy_config()
 
 routes = web.RouteTableDef()
 
-
-def get_flow(redirect_uri, state=None):
-    scopes = [
-        'https://www.googleapis.com/auth/userinfo.profile',
-        'https://www.googleapis.com/auth/userinfo.email',
-        'openid',
-    ]
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        '/auth-oauth2-client-secret/client_secret.json', scopes=scopes, state=state
-    )
-    flow.redirect_uri = redirect_uri
-    return flow
+auth = AuthClient()
 
 
-async def user_from_email(db, email):
-    users = [x async for x in db.select_and_fetchall("SELECT * FROM users WHERE email = %s;", email)]
+async def user_from_login_id(db, login_id):
+    users = [x async for x in db.select_and_fetchall("SELECT * FROM users WHERE login_id = %s;", login_id)]
     if len(users) == 1:
         return users[0]
     assert len(users) == 0, users
     return None
+
+
+async def users_with_username_or_login_id(tx: Transaction, username: str, login_id: Optional[str]) -> List[dict]:
+    where_conditions = ['username = %s']
+    where_args = [username]
+
+    if login_id is not None:
+        where_conditions.append('login_id = %s')
+        where_args.append(login_id)
+
+    existing_users = [
+        x
+        async for x in tx.execute_and_fetchall(
+            f"SELECT * FROM users WHERE {' OR '.join(where_conditions)} LOCK IN SHARE MODE;", where_args
+        )
+    ]
+
+    return existing_users
+
+
+async def check_valid_new_user(tx: Transaction, username, login_id, is_developer, is_service_account) -> Optional[dict]:
+    if not isinstance(username, str):
+        raise InvalidType('username', username, 'str')
+    if login_id is not None and not isinstance(login_id, str):
+        raise InvalidType('login_id', login_id, 'str')
+    if not isinstance(is_developer, bool):
+        raise InvalidType('is_developer', is_developer, 'bool')
+    if not isinstance(is_service_account, bool):
+        raise InvalidType('is_service_account', is_service_account, 'bool')
+    if is_developer and is_service_account:
+        raise MultipleUserTypes(username)
+    if not is_service_account and not login_id:
+        raise EmptyLoginID(username)
+    if not username or not all(c for c in username if c.isalnum()):
+        raise InvalidUsername(username)
+
+    existing_users = await users_with_username_or_login_id(tx, username, login_id)
+
+    if len(existing_users) > 1:
+        raise MultipleExistingUsers(username, login_id)
+
+    if len(existing_users) == 1:
+        existing_user = existing_users[0]
+        expected_username = existing_user['username']
+        expected_login_id = existing_user['login_id']
+        if username != expected_username:
+            raise DuplicateLoginID(expected_username, login_id)
+        if login_id != expected_login_id:
+            raise DuplicateUsername(username, expected_login_id)
+        if existing_user['state'] in ('deleting', 'deleted'):
+            raise PreviouslyDeletedUser(username)
+        return existing_user
+
+    return None
+
+
+async def insert_new_user(
+    db: Database, username: str, login_id: Optional[str], is_developer: bool, is_service_account: bool
+) -> bool:
+    @transaction(db)
+    async def _insert(tx):
+        existing_user = await check_valid_new_user(tx, username, login_id, is_developer, is_service_account)
+        if existing_user is not None:
+            return False
+
+        await tx.execute_insertone(
+            '''
+INSERT INTO users (state, username, login_id, is_developer, is_service_account)
+VALUES (%s, %s, %s, %s, %s);
+''',
+            ('creating', username, login_id, is_developer, is_service_account),
+        )
+
+    await _insert()  # pylint: disable=no-value-for-parameter
+    return True
 
 
 def cleanup_session(session):
@@ -69,11 +147,11 @@ def cleanup_session(session):
             del session[key]
 
     _delete('pending')
-    _delete('email')
-    _delete('state')
+    _delete('login_id')
     _delete('next')
     _delete('caller')
     _delete('session_id')
+    _delete('flow')
 
 
 @routes.get('/healthcheck')
@@ -83,29 +161,30 @@ async def get_healthcheck(request):  # pylint: disable=W0613
 
 @routes.get('')
 @routes.get('/')
-async def get_index(request):  # pylint: disable=unused-argument
-    return aiohttp.web.HTTPFound(deploy_config.external_url('auth', '/login'))
+@auth.web_maybe_authenticated_user
+async def get_index(request, userdata):  # pylint: disable=unused-argument
+    return await render_template('auth', request, userdata, 'index.html', {})
 
 
 @routes.get('/creating')
-@web_maybe_authenticated_user
+@auth.web_maybe_authenticated_user
 async def creating_account(request, userdata):
     db = request.app['db']
     session = await aiohttp_session.get_session(request)
     if 'pending' in session:
-        email = session['email']
-        user = await user_from_email(db, email)
+        login_id = session['login_id']
+        user = await user_from_login_id(db, login_id)
 
-        nb_url = deploy_config.external_url('notebook', '')
-        next_page = session.pop('next', nb_url)
+        next_url = deploy_config.external_url('auth', '/user')
+        next_page = session.pop('next', next_url)
 
         cleanup_session(session)
 
         if user is None:
-            set_message(session, f'Account does not exist for email {email}.', 'error')
-            return aiohttp.web.HTTPFound(nb_url)
+            set_message(session, f'Account does not exist for login id {login_id}.', 'error')
+            return aiohttp.web.HTTPFound(deploy_config.external_url('auth', ''))
 
-        page_context = {'username': user['username'], 'state': user['state'], 'email': user['email']}
+        page_context = {'username': user['username'], 'state': user['state'], 'login_id': user['login_id']}
 
         if user['state'] == 'deleting' or user['state'] == 'deleted':
             return await render_template('auth', request, userdata, 'account-error.html', page_context)
@@ -118,7 +197,7 @@ async def creating_account(request, userdata):
 
         assert user['state'] == 'creating'
         session['pending'] = True
-        session['email'] = email
+        session['login_id'] = login_id
         session['next'] = next_page
         return await render_template('auth', request, userdata, 'account-creating.html', page_context)
 
@@ -130,14 +209,14 @@ async def creating_account_wait(request):
     session = await aiohttp_session.get_session(request)
     if 'pending' not in session:
         raise web.HTTPUnauthorized()
-    return await _wait_websocket(request, session['email'])
+    return await _wait_websocket(request, session['login_id'])
 
 
-async def _wait_websocket(request, email):
+async def _wait_websocket(request, login_id):
     app = request.app
     db = app['db']
 
-    user = await user_from_email(db, email)
+    user = await user_from_login_id(db, login_id)
     if not user:
         return web.HTTPNotFound()
 
@@ -148,7 +227,7 @@ async def _wait_websocket(request, email):
         count = 0
         while count < 10:
             try:
-                user = await user_from_email(db, email)
+                user = await user_from_login_id(db, login_id)
                 assert user
                 if user['state'] != 'creating':
                     log.info(f"user {user['username']} is no longer creating")
@@ -173,61 +252,52 @@ async def _wait_websocket(request, email):
 
 @routes.get('/signup')
 async def signup(request):
-    next_page = request.query.get('next', deploy_config.external_url('notebook', ''))
+    next_page = request.query.get('next', deploy_config.external_url('auth', '/user'))
 
-    flow = get_flow(deploy_config.external_url('auth', '/oauth2callback'))
-
-    authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
+    flow_data = request.app['flow_client'].initiate_flow(deploy_config.external_url('auth', '/oauth2callback'))
 
     session = await aiohttp_session.new_session(request)
     cleanup_session(session)
-    session['state'] = state
     session['next'] = next_page
     session['caller'] = 'signup'
+    session['flow'] = flow_data
 
-    return aiohttp.web.HTTPFound(authorization_url)
+    return aiohttp.web.HTTPFound(flow_data['authorization_url'])
 
 
 @routes.get('/login')
 async def login(request):
-    next_page = request.query.get('next', deploy_config.external_url('notebook', ''))
+    next_page = request.query.get('next', deploy_config.external_url('auth', '/user'))
 
-    flow = get_flow(deploy_config.external_url('auth', '/oauth2callback'))
-
-    authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
+    flow_data = request.app['flow_client'].initiate_flow(deploy_config.external_url('auth', '/oauth2callback'))
 
     session = await aiohttp_session.new_session(request)
-
     cleanup_session(session)
-    session['state'] = state
     session['next'] = next_page
     session['caller'] = 'login'
+    session['flow'] = flow_data
 
-    return aiohttp.web.HTTPFound(authorization_url)
+    return aiohttp.web.HTTPFound(flow_data['authorization_url'])
 
 
 @routes.get('/oauth2callback')
 async def callback(request):
     session = await aiohttp_session.get_session(request)
-    if 'state' not in session:
+    if 'flow' not in session:
         raise web.HTTPUnauthorized()
 
-    nb_url = deploy_config.external_url('notebook', '')
+    next_url = deploy_config.external_url('auth', '/user')
     creating_url = deploy_config.external_url('auth', '/creating')
 
-    state = session['state']
     caller = session['caller']
-    next_page = session.pop('next', nb_url)
+    next_page = session.pop('next', next_url)
+    flow_dict = session['flow']
+    flow_dict['callback_uri'] = deploy_config.external_url('auth', '/oauth2callback')
     cleanup_session(session)
 
-    flow = get_flow(deploy_config.external_url('auth', '/oauth2callback'), state=state)
-
     try:
-        flow.fetch_token(code=request.query['code'])
-        token = google.oauth2.id_token.verify_oauth2_token(
-            flow.credentials.id_token, google.auth.transport.requests.Request()
-        )
-        email = token['email']
+        flow_result = request.app['flow_client'].receive_callback(request, flow_dict)
+        login_id = flow_result.login_id
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -236,45 +306,43 @@ async def callback(request):
 
     db = request.app['db']
 
-    user = await user_from_email(db, email)
+    user = await user_from_login_id(db, login_id)
 
     if user is None:
         if caller == 'login':
-            set_message(session, f'Account does not exist for email {email}', 'error')
-            return aiohttp.web.HTTPFound(nb_url)
+            set_message(session, f'Account does not exist for login id {login_id}', 'error')
+            return aiohttp.web.HTTPFound(deploy_config.external_url('auth', ''))
 
         assert caller == 'signup'
 
-        username, domain = email.split('@')
+        username, domain = flow_result.email.split('@')
         username = ''.join(c for c in username if c.isalnum())
 
-        if domain != GSUITE_ORGANIZATION:
+        if domain != ORGANIZATION_DOMAIN:
             raise web.HTTPUnauthorized()
 
-        await db.execute_insertone(
-            '''
-        INSERT INTO users (state, username, email, is_developer)
-        VALUES (%s, %s, %s, %s);
-        ''',
-            ('creating', username, email, False),
-        )
+        try:
+            await insert_new_user(db, username, login_id, is_developer=False, is_service_account=False)
+        except AuthUserError as e:
+            set_message(session, e.message, 'error')
+            return web.HTTPFound(deploy_config.external_url('auth', ''))
 
         session['pending'] = True
-        session['email'] = email
+        session['login_id'] = login_id
 
         return web.HTTPFound(creating_url)
 
     if user['state'] in ('deleting', 'deleted'):
-        page_context = {'username': user['username'], 'state': user['state'], 'email': user['email']}
+        page_context = {'username': user['username'], 'state': user['state'], 'login_id': user['login_id']}
         return await render_template('auth', request, user, 'account-error.html', page_context)
 
     if user['state'] == 'creating':
         if caller == 'signup':
-            set_message(session, f'Account is already creating for email {email}', 'error')
+            set_message(session, f'Account is already creating for login id {login_id}', 'error')
         if caller == 'login':
-            set_message(session, f'Account for email {email} is still being created.', 'error')
+            set_message(session, f'Account for login id {login_id} is still being created.', 'error')
         session['pending'] = True
-        session['email'] = user['email']
+        session['login_id'] = user['login_id']
         return web.HTTPFound(creating_url)
 
     assert user['state'] == 'active'
@@ -285,8 +353,27 @@ async def callback(request):
     return aiohttp.web.HTTPFound(next_page)
 
 
+@routes.post('/api/v1alpha/users/{user}/create')
+@auth.rest_authenticated_developers_only
+async def create_user(request: web.Request, userdata):  # pylint: disable=unused-argument
+    db: Database = request.app['db']
+    username = request.match_info['user']
+
+    body = await request.json()
+    login_id = body['login_id']
+    is_developer = body['is_developer']
+    is_service_account = body['is_service_account']
+
+    try:
+        await insert_new_user(db, username, login_id, is_developer, is_service_account)
+    except AuthUserError as e:
+        raise e.http_response()
+
+    return web.json_response()
+
+
 @routes.get('/user')
-@web_authenticated_users_only()
+@auth.web_authenticated_users_only()
 async def user_page(request, userdata):
     return await render_template('auth', request, userdata, 'user.html', {'cloud': CLOUD})
 
@@ -302,7 +389,7 @@ async def create_copy_paste_token(db, session_id, max_age_secs=300):
 
 @routes.post('/copy-paste-token')
 @check_csrf_token
-@web_authenticated_users_only()
+@auth.web_authenticated_users_only()
 async def get_copy_paste_token(request, userdata):
     session = await aiohttp_session.get_session(request)
     session_id = session['session_id']
@@ -313,7 +400,7 @@ async def get_copy_paste_token(request, userdata):
 
 
 @routes.post('/api/v1alpha/copy-paste-token')
-@rest_authenticated_users_only
+@auth.rest_authenticated_users_only
 async def get_copy_paste_token_api(request, userdata):
     session_id = userdata['session_id']
     db = request.app['db']
@@ -323,10 +410,10 @@ async def get_copy_paste_token_api(request, userdata):
 
 @routes.post('/logout')
 @check_csrf_token
-@web_maybe_authenticated_user
+@auth.web_maybe_authenticated_user
 async def logout(request, userdata):
     if not userdata:
-        return web.HTTPFound(deploy_config.external_url('notebook', ''))
+        return web.HTTPFound(deploy_config.external_url('auth', ''))
 
     db = request.app['db']
     session_id = userdata['session_id']
@@ -335,21 +422,24 @@ async def logout(request, userdata):
     session = await aiohttp_session.get_session(request)
     cleanup_session(session)
 
-    return web.HTTPFound(deploy_config.external_url('notebook', ''))
+    return web.HTTPFound(deploy_config.external_url('auth', ''))
 
 
 @routes.get('/api/v1alpha/login')
 async def rest_login(request):
     callback_port = request.query['callback_port']
+    callback_uri = f'http://127.0.0.1:{callback_port}/oauth2callback'
+    flow_data = request.app['flow_client'].initiate_flow(callback_uri)
+    flow_data['callback_uri'] = callback_uri
 
-    flow = get_flow(f'http://127.0.0.1:{callback_port}/oauth2callback')
-    authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
-
-    return web.json_response({'authorization_url': authorization_url, 'state': state})
+    # keeping authorization_url and state for backwards compatibility
+    return web.json_response(
+        {'flow': flow_data, 'authorization_url': flow_data['authorization_url'], 'state': flow_data['state']}
+    )
 
 
 @routes.get('/roles')
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def get_roles(request, userdata):
     db = request.app['db']
     roles = [x async for x in db.select_and_fetchall('SELECT * FROM roles;')]
@@ -359,7 +449,7 @@ async def get_roles(request, userdata):
 
 @routes.post('/roles')
 @check_csrf_token
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def post_create_role(request, userdata):  # pylint: disable=unused-argument
     session = await aiohttp_session.get_session(request)
     db = request.app['db']
@@ -380,7 +470,7 @@ VALUES (%s);
 
 
 @routes.get('/users')
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def get_users(request, userdata):
     db = request.app['db']
     users = [x async for x in db.select_and_fetchall('SELECT * FROM users;')]
@@ -390,42 +480,86 @@ async def get_users(request, userdata):
 
 @routes.post('/users')
 @check_csrf_token
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def post_create_user(request, userdata):  # pylint: disable=unused-argument
     session = await aiohttp_session.get_session(request)
     db = request.app['db']
     post = await request.post()
     username = post['username']
-    email = post.get('email', '')
+    login_id = post.get('login_id', '')
     is_developer = post.get('is_developer') == '1'
     is_service_account = post.get('is_service_account') == '1'
 
-    if is_developer and is_service_account:
-        set_message(session, 'User cannot be both a developer and a service account.', 'error')
+    try:
+        if login_id == '':
+            login_id = None
+        created_user = await insert_new_user(db, username, login_id, is_developer, is_service_account)
+    except AuthUserError as e:
+        set_message(session, e.message, 'error')
         return web.HTTPFound(deploy_config.external_url('auth', '/users'))
 
-    if email == '':
-        if not is_service_account:
-            set_message(session, 'Email is required for users that are not service accounts.', 'error')
-            return web.HTTPFound(deploy_config.external_url('auth', '/users'))
-        email = None
-
-    user_id = await db.execute_insertone(
-        '''
-INSERT INTO users (state, username, email, is_developer, is_service_account)
-VALUES (%s, %s, %s, %s, %s);
-''',
-        ('creating', username, email, is_developer, is_service_account),
-    )
-
-    set_message(session, f'Created user {user_id} {username} {email}.', 'info')
+    if created_user:
+        set_message(session, f'Created user {username} {login_id}.', 'info')
+    else:
+        set_message(session, f'User {username} {login_id} already exists.', 'info')
 
     return web.HTTPFound(deploy_config.external_url('auth', '/users'))
 
 
+@routes.get('/api/v1alpha/users')
+@auth.rest_authenticated_developers_only
+async def rest_get_users(request, userdata):  # pylint: disable=unused-argument
+    db: Database = request.app['db']
+    users = await db.select_and_fetchall(
+        '''
+SELECT id, username, login_id, state, is_developer, is_service_account FROM users;
+'''
+    )
+    return web.json_response([user async for user in users])
+
+
+@routes.get('/api/v1alpha/users/{user}')
+@auth.rest_authenticated_developers_only
+async def rest_get_user(request, userdata):  # pylint: disable=unused-argument
+    db: Database = request.app['db']
+    username = request.match_info['user']
+
+    user = await db.select_and_fetchone(
+        '''
+SELECT id, username, login_id, state, is_developer, is_service_account FROM users
+WHERE username = %s;
+''',
+        (username,),
+    )
+    if user is None:
+        raise web.HTTPNotFound()
+    return web.json_response(user)
+
+
+async def _delete_user(db: Database, username: str, id: Optional[str]):
+    where_conditions = ['state != "deleted"', 'username = %s']
+    where_args = [username]
+
+    if id is not None:
+        where_conditions.append('id = %s')
+        where_args.append(id)
+
+    n_rows = await db.execute_update(
+        f'''
+UPDATE users
+SET state = 'deleting'
+WHERE {' AND '.join(where_conditions)};
+''',
+        where_args,
+    )
+
+    if n_rows == 0:
+        raise UnknownUser(username)
+
+
 @routes.post('/users/delete')
 @check_csrf_token
-@web_authenticated_developers_only()
+@auth.web_authenticated_developers_only()
 async def delete_user(request, userdata):  # pylint: disable=unused-argument
     session = await aiohttp_session.get_session(request)
     db = request.app['db']
@@ -433,36 +567,44 @@ async def delete_user(request, userdata):  # pylint: disable=unused-argument
     id = post['id']
     username = post['username']
 
-    n_rows = await db.execute_update(
-        '''
-UPDATE users
-SET state = 'deleting'
-WHERE id = %s AND username = %s;
-''',
-        (id, username),
-    )
-    if n_rows != 1:
-        assert n_rows == 0
-        set_message(session, f'Delete failed, no such user {id} {username}.', 'error')
-    else:
+    try:
+        await _delete_user(db, username, id)
         set_message(session, f'Deleted user {id} {username}.', 'info')
+    except UnknownUser:
+        set_message(session, f'Delete failed, no such user {id} {username}.', 'error')
 
     return web.HTTPFound(deploy_config.external_url('auth', '/users'))
 
 
-@routes.get('/api/v1alpha/oauth2callback')
-async def rest_callback(request):
-    state = request.query['state']
-    code = request.query['code']
-    callback_port = request.query['callback_port']
+@routes.delete('/api/v1alpha/users/{user}')
+@auth.rest_authenticated_developers_only
+async def rest_delete_user(request: web.Request, userdata):  # pylint: disable=unused-argument
+    db = request.app['db']
+    username = request.match_info['user']
 
     try:
-        flow = get_flow(f'http://127.0.0.1:{callback_port}/oauth2callback', state=state)
-        flow.fetch_token(code=code)
-        token = google.oauth2.id_token.verify_oauth2_token(
-            flow.credentials.id_token, google.auth.transport.requests.Request()
-        )
-        email = token['email']
+        await _delete_user(db, username, None)
+    except UnknownUser as e:
+        return e.http_response()
+
+    return web.json_response()
+
+
+@routes.get('/api/v1alpha/oauth2callback')
+async def rest_callback(request):
+    flow_json = request.query.get('flow')
+    if flow_json is None:
+        # backwards compatibility with older versions of hailctl
+        callback_port = request.query['callback_port']
+        flow_dict = {
+            'state': request.query['state'],
+            'callback_uri': f'http://127.0.0.1:{callback_port}/oauth2callback',
+        }
+    else:
+        flow_dict = json.loads(request.query['flow'])
+
+    try:
+        flow_result = request.app['flow_client'].receive_callback(request, flow_dict)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -471,7 +613,10 @@ async def rest_callback(request):
 
     db = request.app['db']
     users = [
-        x async for x in db.select_and_fetchall("SELECT * FROM users WHERE email = %s AND state = 'active';", email)
+        x
+        async for x in db.select_and_fetchall(
+            "SELECT * FROM users WHERE login_id = %s AND state = 'active';", flow_result.login_id
+        )
     ]
 
     if len(users) != 1:
@@ -510,7 +655,7 @@ WHERE copy_paste_tokens.id = %s
 
 
 @routes.post('/api/v1alpha/logout')
-@rest_authenticated_users_only
+@auth.rest_authenticated_users_only
 async def rest_logout(request, userdata):
     session_id = userdata['session_id']
     db = request.app['db']
@@ -535,6 +680,7 @@ INNER JOIN sessions ON users.id = sessions.user_id
 WHERE users.state = 'active' AND (sessions.session_id = %s) AND (ISNULL(sessions.max_age_secs) OR (NOW() < TIMESTAMPADD(SECOND, sessions.max_age_secs, sessions.created)));
 ''',
             session_id,
+            'get_userinfo',
         )
     ]
 
@@ -570,7 +716,7 @@ async def get_session_id(request):
     return session.get('session_id')
 
 
-@routes.get('/api/v1alpha/verify_dev_credentials')
+@routes.route('*', '/api/v1alpha/verify_dev_credentials')
 async def verify_dev_credentials(request):
     session_id = await get_session_id(request)
     if not session_id:
@@ -582,7 +728,7 @@ async def verify_dev_credentials(request):
     return web.Response(status=200)
 
 
-@routes.get('/api/v1alpha/verify_dev_or_sa_credentials')
+@routes.route('*', '/api/v1alpha/verify_dev_or_sa_credentials')
 async def verify_dev_or_sa_credentials(request):
     session_id = await get_session_id(request)
     if not session_id:
@@ -599,6 +745,7 @@ async def on_startup(app):
     await db.async_init(maxsize=50)
     app['db'] = db
     app['client_session'] = httpx.client_session()
+    app['flow_client'] = get_flow_client('/auth-oauth2-client-secret/client_secret.json')
 
 
 async def on_cleanup(app):
@@ -606,6 +753,24 @@ async def on_cleanup(app):
         await app['db'].async_close()
     finally:
         await app['client_session'].close()
+
+
+class AuthAccessLogger(AccessLogger):
+    def __init__(self, logger: logging.Logger, log_format: str):
+        super().__init__(logger, log_format)
+        self.exclude = [
+            (endpoint[0], re.compile(deploy_config.base_path('auth') + endpoint[1]))
+            for endpoint in [
+                ('GET', '/api/v1alpha/userinfo'),
+            ]
+        ]
+
+    def log(self, request, response, time):
+        for method, path_expr in self.exclude:
+            if path_expr.fullmatch(request.path) and method == request.method:
+                return
+
+        super().log(request, response, time)
 
 
 def run():
@@ -624,7 +789,7 @@ def run():
     web.run_app(
         deploy_config.prefix_application(app, 'auth'),
         host='0.0.0.0',
-        port=5000,
-        access_log_class=AccessLogger,
+        port=443,
+        access_log_class=AuthAccessLogger,
         ssl_context=internal_server_ssl_context(),
     )

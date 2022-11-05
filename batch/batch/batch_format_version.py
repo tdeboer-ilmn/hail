@@ -1,13 +1,11 @@
 from hailtop.batch_client.aioclient import Job
 
-from .cloud.resource_utils import cost_from_msec_mcpu
-
 
 class BatchFormatVersion:
     def __init__(self, format_version):
         self.format_version = format_version
 
-    def has_full_spec_in_gcs(self):
+    def has_full_spec_in_cloud(self):
         return self.format_version > 1
 
     def has_full_status_in_gcs(self):
@@ -125,9 +123,3 @@ class BatchFormatVersion:
             return (Job.exit_code(job_status), Job.total_duration_msecs(job_status))
         assert len(status) == 2
         return status
-
-    def cost(self, msec_mcpu, resource_cost):
-        if self.format_version < 3:
-            assert msec_mcpu is not None
-            return cost_from_msec_mcpu(msec_mcpu)
-        return resource_cost

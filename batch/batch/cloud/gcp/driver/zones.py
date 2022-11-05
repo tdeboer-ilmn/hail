@@ -1,12 +1,13 @@
 import logging
 import random
-from typing import Dict, Any, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from hailtop.aiocloud import aiogoogle
 from hailtop.utils import url_basename
 
-from ....utils import WindowFractionCounter
+from ....driver.exceptions import RegionsNotSupportedError
 from ....driver.location import CloudLocationMonitor
+from ....utils import WindowFractionCounter
 
 log = logging.getLogger('zones')
 
@@ -50,20 +51,22 @@ class ZoneSuccessRate:
 
 class ZoneMonitor(CloudLocationMonitor):
     @staticmethod
-    async def create(compute_client: aiogoogle.GoogleComputeClient,  # BORROWED
-                     regions: Set[str],
-                     default_zone: str,
-                     ) -> 'ZoneMonitor':
+    async def create(
+        compute_client: aiogoogle.GoogleComputeClient,  # BORROWED
+        regions: Set[str],
+        default_zone: str,
+    ) -> 'ZoneMonitor':
         region_info, zones = await fetch_region_quotas(compute_client, regions)
         return ZoneMonitor(compute_client, region_info, zones, regions, default_zone)
 
-    def __init__(self,
-                 compute_client: aiogoogle.GoogleComputeClient,  # BORROWED
-                 initial_region_info: Dict[str, Dict[str, Any]],
-                 initial_zones: List[str],
-                 regions: Set[str],
-                 default_zone: str,
-                 ):
+    def __init__(
+        self,
+        compute_client: aiogoogle.GoogleComputeClient,  # BORROWED
+        initial_region_info: Dict[str, Dict[str, Any]],
+        initial_zones: List[str],
+        regions: Set[str],
+        default_zone: str,
+    ):
         self._compute_client = compute_client
         self._region_info: Dict[str, Dict[str, Any]] = initial_region_info
         self._regions = regions
@@ -72,18 +75,27 @@ class ZoneMonitor(CloudLocationMonitor):
 
         self.zone_success_rate = ZoneSuccessRate()
 
+    @property
+    def region_quotas(self):
+        return self._region_info
+
     def default_location(self) -> str:
         return self._default_zone
 
-    def choose_location(self,
-                        worker_cores: int,
-                        local_ssd_data_disk: bool,
-                        data_disk_size_gb: int
-                        ) -> str:
-        zone_weights = self.compute_zone_weights(
-            worker_cores, local_ssd_data_disk, data_disk_size_gb)
+    def choose_location(
+        self,
+        cores: int,
+        local_ssd_data_disk: bool,
+        data_disk_size_gb: int,
+        preemptible: bool,
+        regions: List[str],
+    ) -> str:
+        zone_weights = self.compute_zone_weights(cores, local_ssd_data_disk, data_disk_size_gb, preemptible, regions)
 
         zones = [zw.zone for zw in zone_weights]
+
+        if len(zones) == 0:
+            raise RegionsNotSupportedError(regions, self._regions)
 
         zone_prob_weights = [
             min(zw.weight, 10) * self.zone_success_rate.zone_success_rate(zw.zone) for zw in zone_weights
@@ -95,16 +107,24 @@ class ZoneMonitor(CloudLocationMonitor):
         zone = random.choices(zones, zone_prob_weights)[0]
         return zone
 
-    def compute_zone_weights(self,
-                             worker_cores: int,
-                             local_ssd_data_disk: bool,
-                             data_disk_size_gb: int
-                             ) -> List[ZoneWeight]:
+    def compute_zone_weights(
+        self,
+        worker_cores: int,
+        local_ssd_data_disk: bool,
+        data_disk_size_gb: int,
+        preemptible: bool,
+        regions: List[str],
+    ) -> List[ZoneWeight]:
         weights = []
-        for r in self._region_info.values():
+        for region_name, r in self._region_info.items():
+            if region_name not in regions:
+                continue
+
             quota_remaining = {q['metric']: q['limit'] - q['usage'] for q in r['quotas']}
 
-            remaining = quota_remaining['PREEMPTIBLE_CPUS'] / worker_cores
+            cpu_label = 'PREEMPTIBLE_CPUS' if preemptible else 'CPUS'
+            remaining = quota_remaining[cpu_label] / worker_cores
+
             if local_ssd_data_disk:
                 specific_disk_type_quota = quota_remaining['LOCAL_SSD_TOTAL_GB']
             else:
@@ -122,16 +142,13 @@ class ZoneMonitor(CloudLocationMonitor):
         return weights
 
     async def update_region_quotas(self):
-        self._region_info, self.zones = await fetch_region_quotas(
-            self._compute_client, self._regions)
+        self._region_info, self.zones = await fetch_region_quotas(self._compute_client, self._regions)
         log.info('updated region quotas')
 
 
-async def fetch_region_quotas(compute_client: aiogoogle.GoogleComputeClient,
-                              regions: Set[str]
-                              ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
-    region_info = {name: await compute_client.get(f'/regions/{name}')
-                   for name in regions}
-    zones = [url_basename(z)
-             for r in region_info.values() for z in r['zones']]
+async def fetch_region_quotas(
+    compute_client: aiogoogle.GoogleComputeClient, regions: Set[str]
+) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    region_info = {name: await compute_client.get(f'/regions/{name}') for name in regions}
+    zones = [url_basename(z) for r in region_info.values() for z in r['zones']]
     return region_info, zones

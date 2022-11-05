@@ -1,24 +1,28 @@
 import abc
 import json
 import logging
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 from shlex import quote as shq
-import yaml
+from typing import Dict, List, Tuple
+
 import jinja2
-from typing import Dict, List, Optional
-from hailtop.utils import flatten
-from .utils import generate_token
+import yaml
+
+from gear.cloud_config import get_global_config
+from hailtop.utils import RETRY_FUNCTION_SCRIPT, flatten
+
 from .environment import (
+    BUILDKIT_IMAGE,
+    CI_UTILS_IMAGE,
+    CLOUD,
+    DEFAULT_NAMESPACE,
     DOCKER_PREFIX,
     DOMAIN,
-    CI_UTILS_IMAGE,
-    BUILDKIT_IMAGE,
-    DEFAULT_NAMESPACE,
+    REGION,
     STORAGE_URI,
-    CLOUD,
 )
 from .globals import is_test_deployment
-from gear.cloud_config import get_global_config
+from .utils import generate_token
 
 log = logging.getLogger('ci')
 
@@ -92,40 +96,42 @@ class BuildConfiguration:
             raise BuildConfigurationError('Excluding build steps is only permitted in a dev scope')
 
         config = yaml.safe_load(config_str)
-        name_step: Dict[str, Optional[Step]] = {}
-        self.steps: List[Step] = []
-
         if requested_step_names:
             log.info(f"Constructing build configuration with steps: {requested_step_names}")
 
+        runnable_steps: List[Step] = []
+        name_step: Dict[str, Step] = {}
         for step_config in config['steps']:
-            step_params = StepParameters(code, scope, step_config, name_step)
-            step = Step.from_json(step_params)
-            if not step.run_if_requested or step.name in requested_step_names:
-                self.steps.append(step)
+            step = Step.from_json(StepParameters(code, scope, step_config, name_step))
+            if step.name not in excluded_step_names and step.can_run_in_current_cloud():
                 name_step[step.name] = step
-            else:
-                name_step[step.name] = None
+                runnable_steps.append(step)
 
-        # transitively close requested_step_names over dependencies
         if requested_step_names:
+            # transitively close requested_step_names over dependencies
             visited = set()
 
-            def request(step: Step):
+            def visit_dependent(step: Step):
                 if step not in visited and step.name not in excluded_step_names:
+                    if not step.can_run_in_current_cloud():
+                        raise BuildConfigurationError(f'Step {step.name} cannot be run in cloud {CLOUD}')
                     visited.add(step)
                     for s2 in step.deps:
-                        request(s2)
+                        if not s2.run_if_requested:
+                            visit_dependent(s2)
 
             for step_name in requested_step_names:
-                request(name_step[step_name])
-            self.steps = [s for s in self.steps if s in visited]
+                visit_dependent(name_step[step_name])
+            self.steps = [step for step in runnable_steps if step in visited]
+        else:
+            self.steps = [step for step in runnable_steps if not step.run_if_requested]
 
     def build(self, batch, code, scope):
         assert scope in ('deploy', 'test', 'dev')
 
         for step in self.steps:
-            if (step.scopes is None or scope in step.scopes) and (step.clouds is None or CLOUD in step.clouds):
+            if step.can_run_in_scope(scope):
+                assert step.can_run_in_current_cloud()
                 step.build(batch, code, scope)
 
         if scope == 'dev':
@@ -143,8 +149,21 @@ class BuildConfiguration:
                 f"Cleanup {step.name} after running {[parent_step.name for parent_step in step_to_parent_steps[step]]}"
             )
 
-            if (step.scopes is None or scope in step.scopes) and (step.clouds is None or CLOUD in step.clouds):
+            if step.can_run_in_scope(scope):
                 step.cleanup(batch, scope, parent_jobs)
+
+    def deployed_services(self) -> Tuple[str, List[str]]:
+        services = defaultdict(list)
+        for s in self.steps:
+            if isinstance(s, DeployStep):
+                services[s.namespace].extend(s.services())
+        # build.yaml allows for multiple namespaces, but
+        # in actuality we only ever use 1 and make many assumptions
+        # around there being a 1:1 correspondence between builds and namespaces
+        namespaces = list(services.keys())
+        assert len(namespaces) == 1
+        ns = namespaces[0]
+        return ns, services[ns]
 
 
 class Step(abc.ABC):
@@ -156,9 +175,9 @@ class Step(abc.ABC):
             duplicates = [name for name, count in Counter(json['dependsOn']).items() if count > 1]
             if duplicates:
                 raise BuildConfigurationError(f'found duplicate dependencies of {self.name}: {duplicates}')
-            self.deps = [params.name_step[d] for d in json['dependsOn'] if params.name_step[d]]
+            self.deps: List[Step] = [params.name_step[d] for d in json['dependsOn'] if d in params.name_step]
         else:
-            self.deps = []
+            self.deps: List[Step] = []
         self.scopes = json.get('scopes')
         self.clouds = json.get('clouds')
         self.run_if_requested = json.get('runIfRequested', False)
@@ -194,8 +213,14 @@ class Step(abc.ABC):
                     frontier.append(d)
         return visited
 
+    def can_run_in_current_cloud(self):
+        return self.clouds is None or CLOUD in self.clouds
+
+    def can_run_in_scope(self, scope: str):
+        return self.scopes is None or scope in self.scopes
+
     @staticmethod
-    def from_json(params):
+    def from_json(params: StepParameters):
         kind = params.json['kind']
         if kind == 'buildImage':
             return BuildImage2Step.from_json(params)
@@ -218,7 +243,15 @@ class Step(abc.ABC):
         return hash(self.name)
 
     @abc.abstractmethod
+    def wrapped_job(self) -> list:
+        pass
+
+    @abc.abstractmethod
     def build(self, batch, code, scope):
+        pass
+
+    @abc.abstractmethod
+    def config(self, scope) -> dict:
         pass
 
     @abc.abstractmethod
@@ -228,26 +261,37 @@ class Step(abc.ABC):
 
 class BuildImage2Step(Step):
     def __init__(
-        self, params, dockerfile, context_path, publish_as, inputs, resources
+        self, params: StepParameters, dockerfile, context_path, publish_as, inputs, resources
     ):  # pylint: disable=unused-argument
         super().__init__(params)
         self.dockerfile = dockerfile
         self.context_path = context_path
-        self.publish_as = publish_as
         self.inputs = inputs
         self.resources = resources
-        self.extra_cache_repository = None
-        if publish_as:
-            self.extra_cache_repository = f'{DOCKER_PREFIX}/{self.publish_as}'
-        if params.scope == 'deploy' and publish_as and not is_test_deployment:
-            self.base_image = f'{DOCKER_PREFIX}/{self.publish_as}'
+
+        image_name = publish_as
+        self.base_image = f'{DOCKER_PREFIX}/{image_name}'
+        self.main_branch_cache_repository = f'{self.base_image}:cache'
+
+        if params.scope == 'deploy':
+            if is_test_deployment:
+                # CIs that don't live in default doing a deploy
+                # should not clobber the main `cache` tag
+                self.cache_repository = f'{self.base_image}:cache-{DEFAULT_NAMESPACE}-deploy'
+                self.image = f'{self.base_image}:test-deploy-{self.token}'
+            else:
+                self.cache_repository = self.main_branch_cache_repository
+                self.image = f'{self.base_image}:deploy-{self.token}'
+        elif params.scope == 'dev':
+            dev_user = params.code.config()['user']
+            self.cache_repository = f'{self.base_image}:cache-{dev_user}'
+            self.image = f'{self.base_image}:dev-{self.token}'
         else:
-            self.base_image = f'{DOCKER_PREFIX}/ci-intermediate'
-        self.image = f'{self.base_image}:{self.token}'
-        if publish_as:
-            self.cache_repository = f'{DOCKER_PREFIX}/{self.publish_as}:cache'
-        else:
-            self.cache_repository = f'{DOCKER_PREFIX}/ci-intermediate:cache'
+            assert params.scope == 'test'
+            pr_number = params.code.config()['number']
+            self.cache_repository = f'{self.base_image}:cache-pr-{pr_number}'
+            self.image = f'{self.base_image}:test-pr-{pr_number}-{self.token}'
+
         self.job = None
 
     def wrapped_job(self):
@@ -256,13 +300,13 @@ class BuildImage2Step(Step):
         return []
 
     @staticmethod
-    def from_json(params):
+    def from_json(params: StepParameters):
         json = params.json
         return BuildImage2Step(
             params,
             json['dockerFile'],
             json.get('contextPath'),
-            json.get('publishAs'),
+            json['publishAs'],
             json.get('inputs'),
             json.get('resources'),
         )
@@ -308,9 +352,11 @@ set +x
 /bin/sh /home/user/convert-cloud-credentials-to-docker-auth-config
 set -x
 
+{RETRY_FUNCTION_SCRIPT}
+
 export BUILDKITD_FLAGS='--oci-worker-no-process-sandbox --oci-worker-snapshotter=overlayfs'
 export BUILDCTL_CONNECT_RETRIES_MAX=100 # https://github.com/moby/buildkit/issues/1423
-buildctl-daemonless.sh \
+retry buildctl-daemonless.sh \
      build \
      --frontend dockerfile.v0 \
      --local context={shq(context)} \
@@ -318,6 +364,7 @@ buildctl-daemonless.sh \
      --output 'type=image,"name={shq(self.image)},{shq(self.cache_repository)}",push=true' \
      --export-cache type=inline \
      --import-cache type=registry,ref={shq(self.cache_repository)} \
+     --import-cache type=registry,ref={shq(self.main_branch_cache_repository)} \
      --trace=/home/user/trace
 cat /home/user/trace
 '''
@@ -349,18 +396,41 @@ cat /home/user/trace
             parents=self.deps_parents(),
             network='private',
             unconfined=True,
+            regions=[REGION],
         )
 
     def cleanup(self, batch, scope, parents):
+        if scope == 'deploy' and not is_test_deployment:
+            return
+
         if CLOUD == 'azure':
-            log.warning('Image cleanup in ACR is not yet supported')
-            return
-        assert CLOUD == 'gcp'
+            image = 'mcr.microsoft.com/azure-cli'
+            assert self.image.startswith(DOCKER_PREFIX)
+            image_name = self.image[len(f'{DOCKER_PREFIX}/') :]
+            script = f'''
+set -x
+date
 
-        if scope == 'deploy' and self.publish_as and not is_test_deployment:
-            return
+set +x
+USERNAME=$(cat /secrets/registry-push-credentials/credentials.json | jq -j '.appId')
+PASSWORD=$(cat /secrets/registry-push-credentials/credentials.json | jq -j '.password')
+TENANT=$(cat /secrets/registry-push-credentials/credentials.json | jq -j '.tenant')
+az login --service-principal -u $USERNAME -p $PASSWORD --tenant $TENANT
+set -x
 
-        script = f'''
+until az acr repository untag -n {shq(DOCKER_PREFIX)} --image {shq(image_name)} || ! az acr repository show -n {shq(DOCKER_PREFIX)} --image {shq(image_name)}
+do
+    echo 'failed, will sleep 2 and retry'
+    sleep 2
+done
+
+date
+true
+'''
+        else:
+            assert CLOUD == 'gcp'
+            image = CI_UTILS_IMAGE
+            script = f'''
 set -x
 date
 
@@ -378,7 +448,7 @@ true
 '''
 
         self.job = batch.create_job(
-            CI_UTILS_IMAGE,
+            image,
             command=['bash', '-c', script],
             attributes={'name': f'cleanup_{self.name}'},
             secrets=[
@@ -391,12 +461,26 @@ true
             parents=parents,
             always_run=True,
             network='private',
+            timeout=5 * 60,
+            regions=[REGION],
         )
 
 
 class RunImageStep(Step):
     def __init__(
-        self, params, image, script, inputs, outputs, port, resources, service_account, secrets, always_run, timeout
+        self,
+        params,
+        image,
+        script,
+        inputs,
+        outputs,
+        port,
+        resources,
+        service_account,
+        secrets,
+        always_run,
+        timeout,
+        num_splits,
     ):  # pylint: disable=unused-argument
         super().__init__(params)
         self.image = expand_value_from(image, self.input_config(params.code, params.scope))
@@ -415,15 +499,14 @@ class RunImageStep(Step):
         self.secrets = secrets
         self.always_run = always_run
         self.timeout = timeout
-        self.job = None
+        self.jobs = []
+        self.num_splits = num_splits
 
     def wrapped_job(self):
-        if self.job:
-            return [self.job]
-        return []
+        return self.jobs
 
     @staticmethod
-    def from_json(params):
+    def from_json(params: StepParameters):
         json = params.json
         return RunImageStep(
             params,
@@ -437,16 +520,33 @@ class RunImageStep(Step):
             json.get('secrets'),
             json.get('alwaysRun', False),
             json.get('timeout', 3600),
+            json.get('numSplits', 1),
         )
 
     def config(self, scope):  # pylint: disable=unused-argument
         return {'token': self.token}
 
     def build(self, batch, code, scope):
+        if self.num_splits == 1:
+            self.jobs = [self._build_job(batch, code, scope, self.name, None, None)]
+        else:
+            self.jobs = [
+                self._build_job(
+                    batch,
+                    code,
+                    scope,
+                    f'{self.name}_{i}',
+                    {'HAIL_RUN_IMAGE_SPLITS': str(self.num_splits), 'HAIL_RUN_IMAGE_SPLIT_INDEX': str(i)},
+                    f'/{self.name}_{i}',
+                )
+                for i in range(self.num_splits)
+            ]
+
+    def _build_job(self, batch, code, scope, job_name, env, output_prefix):
         template = jinja2.Template(self.script, undefined=jinja2.StrictUndefined, trim_blocks=True, lstrip_blocks=True)
         rendered_script = template.render(**self.input_config(code, scope))
 
-        log.info(f'step {self.name}, rendered script:\n{rendered_script}')
+        log.info(f'step {job_name}, rendered script:\n{rendered_script}')
 
         if self.inputs:
             input_files = []
@@ -458,7 +558,8 @@ class RunImageStep(Step):
         if self.outputs:
             output_files = []
             for o in self.outputs:
-                output_files.append((o["from"], f'{STORAGE_URI}/build/{batch.attributes["token"]}{o["to"]}'))
+                prefixed_path = o["to"] if output_prefix is None else output_prefix + o["to"]
+                output_files.append((o["from"], f'{STORAGE_URI}/build/{batch.attributes["token"]}{prefixed_path}'))
         else:
             output_files = None
 
@@ -470,12 +571,12 @@ class RunImageStep(Step):
                 mount_path = secret['mountPath']
                 secrets.append({'namespace': namespace, 'name': name, 'mount_path': mount_path})
 
-        self.job = batch.create_job(
+        return batch.create_job(
             self.image,
             command=['bash', '-c', rendered_script],
             port=self.port,
             resources=self.resources,
-            attributes={'name': self.name},
+            attributes={'name': job_name},
             input_files=input_files,
             output_files=output_files,
             secrets=secrets,
@@ -484,6 +585,8 @@ class RunImageStep(Step):
             always_run=self.always_run,
             timeout=self.timeout,
             network='private',
+            env=env,
+            regions=[REGION],
         )
 
     def cleanup(self, batch, scope, parents):
@@ -527,7 +630,7 @@ class CreateNamespaceStep(Step):
         return []
 
     @staticmethod
-    def from_json(params):
+    def from_json(params: StepParameters):
         json = params.json
         return CreateNamespaceStep(
             params,
@@ -569,6 +672,9 @@ metadata:
   namespace: {self._name}
 rules:
 - apiGroups: [""]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["apps"]
   resources: ["*"]
   verbs: ["*"]
 ---
@@ -633,15 +739,10 @@ kubectl -n {self.namespace_name} get -o json secret global-config \
 '''
 
             for s in self.secrets:
-                if isinstance(s, str):
+                name = s['name']
+                if s.get('clouds') is None or CLOUD in s['clouds']:
                     script += f'''
-kubectl -n {self.namespace_name} get -o json secret {s} | jq 'del(.metadata) | .metadata.name = "{s}"' | kubectl -n {self._name} apply -f -
-'''
-                else:
-                    clouds = s.get('clouds')
-                    if clouds is None or CLOUD in clouds:
-                        script += f'''
-kubectl -n {self.namespace_name} get -o json secret {s["name"]} | jq 'del(.metadata) | .metadata.name = "{s["name"]}"' | kubectl -n {self._name} apply -f -
+kubectl -n {self.namespace_name} get -o json secret {name} | jq 'del(.metadata) | .metadata.name = "{name}"' | kubectl -n {self._name} apply -f - { '|| true' if s.get('optional') is True else ''}
 '''
 
         script += '''
@@ -656,6 +757,7 @@ date
             service_account={'namespace': DEFAULT_NAMESPACE, 'name': 'ci-agent'},
             parents=self.deps_parents(),
             network='private',
+            regions=[REGION],
         )
 
     def cleanup(self, batch, scope, parents):
@@ -684,6 +786,7 @@ true
             parents=parents,
             always_run=True,
             network='private',
+            regions=[REGION],
         )
 
 
@@ -702,7 +805,7 @@ class DeployStep(Step):
         return []
 
     @staticmethod
-    def from_json(params):
+    def from_json(params: StepParameters):
         json = params.json
         return DeployStep(
             params,
@@ -713,11 +816,16 @@ class DeployStep(Step):
             json.get('wait'),
         )
 
+    def services(self):
+        if self.wait:
+            return [w['name'] for w in self.wait]
+        return []
+
     def config(self, scope):  # pylint: disable=unused-argument
         return {'token': self.token}
 
     def build(self, batch, code, scope):
-        with open(f'{code.repo_dir()}/{self.config_file}', 'r') as f:
+        with open(f'{code.repo_dir()}/{self.config_file}', 'r', encoding='utf-8') as f:
             template = jinja2.Template(f.read(), undefined=jinja2.StrictUndefined, trim_blocks=True, lstrip_blocks=True)
             rendered_config = template.render(**self.input_config(code, scope))
 
@@ -810,6 +918,7 @@ date
             service_account={'namespace': DEFAULT_NAMESPACE, 'name': 'ci-agent'},
             parents=self.deps_parents(),
             network='private',
+            regions=[REGION],
         )
 
     def cleanup(self, batch, scope, parents):  # pylint: disable=unused-argument
@@ -835,6 +944,7 @@ date
                 parents=parents,
                 always_run=True,
                 network='private',
+                regions=[REGION],
             )
 
 
@@ -897,7 +1007,7 @@ class CreateDatabaseStep(Step):
         return []
 
     @staticmethod
-    def from_json(params):
+    def from_json(params: StepParameters):
         json = params.json
         return CreateDatabaseStep(
             params,
@@ -968,7 +1078,10 @@ EOF
                 attributes={'name': self.name + "_create_passwords"},
                 output_files=[(x[1], x[0]) for x in password_files_input],
                 parents=self.deps_parents(),
+                regions=[REGION],
             )
+
+        n_cores = 4 if scope == 'deploy' and not is_test_deployment else 1
 
         self.create_database_job = batch.create_job(
             CI_UTILS_IMAGE,
@@ -985,6 +1098,8 @@ EOF
             input_files=input_files,
             parents=[self.create_passwords_job] if self.create_passwords_job else self.deps_parents(),
             network='private',
+            resources={'preemptible': False, 'cpu': str(n_cores)},
+            regions=[REGION],
         )
 
     def cleanup(self, batch, scope, parents):
@@ -1025,4 +1140,5 @@ done
             parents=parents,
             always_run=True,
             network='private',
+            regions=[REGION],
         )

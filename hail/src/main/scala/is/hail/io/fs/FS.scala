@@ -1,16 +1,21 @@
 package is.hail.io.fs
 
 import java.io._
-import java.util.zip.{GZIPInputStream, GZIPOutputStream}
-
-import is.hail.HailContext
+import java.nio.charset._
+import java.util.zip.GZIPOutputStream
+import is.hail.{HailContext, HailFeatureFlags}
 import is.hail.backend.BroadcastValue
 import is.hail.io.compress.{BGzipInputStream, BGzipOutputStream}
+import is.hail.io.fs.FSUtil.{containsWildcard, dropTrailingSlash}
 import is.hail.utils._
+import is.hail.services._
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import org.apache.commons.io.IOUtils
 import org.apache.hadoop
 
+import java.nio.ByteBuffer
+import java.nio.file.FileSystems
+import scala.collection.mutable
 import scala.io.Source
 
 trait Positioned {
@@ -36,8 +41,19 @@ trait FileStatus {
   def getModificationTime: java.lang.Long
   def getLen: Long
   def isDirectory: Boolean
+  def isSymlink: Boolean
   def isFile: Boolean
   def getOwner: String
+}
+
+class BlobStorageFileStatus(path: String, modificationTime: java.lang.Long, size: Long, isDir: Boolean) extends FileStatus {
+  def getPath: String = path
+  def getModificationTime: java.lang.Long = modificationTime
+  def getLen: Long = size
+  def isDirectory: Boolean = isDir
+  def isFile: Boolean = !isDir
+  def isSymlink: Boolean = false
+  def getOwner: String = null
 }
 
 trait CompressionCodec {
@@ -57,6 +73,158 @@ object BGZipCompressionCodec extends CompressionCodec {
   def makeInputStream(is: InputStream): InputStream = new BGzipInputStream(is)
 
   def makeOutputStream(os: OutputStream): OutputStream = new BGzipOutputStream(os)
+}
+
+object FSUtil {
+  def dropTrailingSlash(path: String): String = {
+    if (path.isEmpty)
+      return path
+
+    if (path.last != '/')
+      return path
+
+    var i = path.length - 1
+    while (i > 0 && path(i - 1) == '/')
+      i -= 1
+    path.substring(0, i)
+  }
+
+  def containsWildcard(path: String): Boolean = {
+    var i = 0
+    while (i < path.length) {
+      val c = path(i)
+      if (c == '\\') {
+        i += 1
+        if (i < path.length)
+          i += 1
+        else
+          return false
+      } else if (c == '*' || c == '{' || c == '?' || c == '[')
+        return true
+
+      i += 1
+    }
+
+    false
+  }
+}
+
+abstract class FSSeekableInputStream extends InputStream with Seekable {
+  protected[this] var closed: Boolean = false
+  private[this] var pos: Long = 0
+  private[this] var eof: Boolean = false
+
+  protected[this] val bb: ByteBuffer = ByteBuffer.allocate(8 * 1024 * 1024)
+  bb.limit(0)
+
+  def fill(): Int
+
+  override def read(): Int = {
+    if (eof)
+      return -1
+
+    if (bb.remaining() == 0) {
+      val nRead = fill()
+      if (nRead == -1) {
+        eof = true
+        return -1
+      }
+    }
+
+    pos += 1
+    bb.get().toInt & 0xff
+  }
+
+  override def read(bytes: Array[Byte], off: Int, len: Int): Int = {
+    if (eof)
+      return -1
+
+    if (bb.remaining() == 0) {
+      val nRead = fill()
+      if (nRead == -1) {
+        eof = true
+        return -1
+      }
+    }
+
+    val toTransfer = math.min(len, bb.remaining())
+    bb.get(bytes, off, toTransfer)
+    pos += toTransfer
+    toTransfer
+  }
+
+  def seek(newPos: Long): Unit = {
+    val distance = newPos - pos
+    val bufferSeekPosition = bb.position() + distance
+    if (bufferSeekPosition >= 0 && bufferSeekPosition < bb.limit()) {
+      assert(bufferSeekPosition <= Int.MaxValue)
+      bb.position(bufferSeekPosition.toInt)
+    } else {
+      bb.clear()
+      bb.limit(0)
+      if (bb.remaining() != 0) {
+        assert(false, bb.remaining().toString())
+      }
+    }
+    pos = newPos
+  }
+
+  def getPosition: Long = pos
+}
+
+abstract class FSPositionedOutputStream extends OutputStream with Positioned {
+  protected[this] var closed: Boolean = false
+  protected[this] val bb: ByteBuffer = ByteBuffer.allocate(64 * 1024)
+  protected[this] var pos: Long = 0
+
+   def flush(): Unit
+
+   def write(i: Int): Unit = {
+    if (bb.remaining() == 0)
+      flush()
+    bb.put(i.toByte)
+    pos += 1
+  }
+
+   override def write(bytes: Array[Byte], off: Int, len: Int): Unit = {
+    var i = off
+    var remaining = len
+    while (remaining > 0) {
+      if (bb.remaining() == 0)
+        flush()
+      val toTransfer = math.min(bb.remaining(), remaining)
+      bb.put(bytes, i, toTransfer)
+      i += toTransfer
+      remaining -= toTransfer
+      pos += toTransfer
+    }
+  }
+
+  def getPosition: Long = pos
+}
+
+object FS {
+  def cloudSpecificCacheableFS(
+    credentialsPath: String,
+    flags: Option[HailFeatureFlags]
+  ): ServiceCacheableFS = retryTransientErrors {
+    using(new FileInputStream(credentialsPath)) { is =>
+      val credentialsStr = Some(IOUtils.toString(is, Charset.defaultCharset()))
+      sys.env.get("HAIL_CLOUD").get match {
+        case "gcp" =>
+          val requesterPaysConfiguration = flags.flatMap { flags =>
+            RequesterPaysConfiguration.fromFlags(
+              flags.get("gcs_requester_pays_project"), flags.get("gcs_requester_pays_buckets")
+            )
+          }
+          new GoogleStorageFS(credentialsStr, requesterPaysConfiguration).asCacheable()
+        case "azure" =>
+          new AzureStorageFS(credentialsStr).asCacheable()
+        case cloud =>
+          throw new IllegalArgumentException(s"Bad cloud: $cloud")
+      }
+    }
+  }
 }
 
 trait FS extends Serializable {
@@ -113,11 +281,11 @@ trait FS extends Serializable {
       ""
   }
 
-  def openNoCompression(filename: String): SeekableDataInputStream
+  def openNoCompression(filename: String, _debug: Boolean = false): SeekableDataInputStream
 
   def createNoCompression(filename: String): PositionedDataOutputStream
 
-  def mkDir(dirname: String): Unit
+  def mkDir(dirname: String): Unit = ()
 
   def delete(filename: String, recursive: Boolean)
 
@@ -125,18 +293,68 @@ trait FS extends Serializable {
 
   def glob(filename: String): Array[FileStatus]
 
-  def globAll(filenames: Iterable[String]): Array[String]
+  def globWithPrefix(prefix: String, path: String) = {
+    val components =
+      if (path == "")
+        Array.empty[String]
+      else
+        path.split("/")
 
-  def globAllStatuses(filenames: Iterable[String]): Array[FileStatus]
+    val javaFS = FileSystems.getDefault
+
+    val ab = new mutable.ArrayBuffer[FileStatus]()
+    def f(prefix: String, fs: FileStatus, i: Int): Unit = {
+      assert(!prefix.endsWith("/"), prefix)
+
+      if (i == components.length) {
+        var t = fs
+        if (t == null) {
+          try {
+            t = fileStatus(prefix)
+          } catch {
+            case _: FileNotFoundException =>
+          }
+        }
+        if (t != null)
+          ab += t
+      }
+
+      if (i < components.length) {
+        val c = components(i)
+        if (containsWildcard(c)) {
+          val m = javaFS.getPathMatcher(s"glob:$c")
+          for (cfs <- listStatus(prefix)) {
+            val p = dropTrailingSlash(cfs.getPath)
+            val d = p.drop(prefix.length + 1)
+            if (m.matches(javaFS.getPath(d))) {
+              f(p, cfs, i + 1)
+            }
+          }
+        } else
+          f(s"$prefix/$c", null, i + 1)
+      }
+    }
+
+    f(s"$prefix", null, 0)
+    ab.toArray
+  }
+
+  def globAll(filenames: Iterable[String]): Array[String] =
+    globAllStatuses(filenames).map(_.getPath)
+
+  def globAllStatuses(filenames: Iterable[String]): Array[FileStatus] = filenames.flatMap(glob).toArray
 
   def fileStatus(filename: String): FileStatus
 
   def makeQualified(path: String): String
 
-  def deleteOnExit(path: String): Unit
+  def deleteOnExit(filename: String): Unit = {
+    Runtime.getRuntime.addShutdownHook(
+      new Thread(() => delete(filename, recursive = false)))
+  }
 
-  def open(path: String, codec: CompressionCodec): InputStream = {
-    val is = openNoCompression(path)
+  def open(path: String, codec: CompressionCodec, _debug: Boolean = false): InputStream = {
+    val is = openNoCompression(path, _debug)
     if (codec != null)
       codec.makeInputStream(is)
     else
@@ -314,9 +532,25 @@ trait FS extends Serializable {
     }
   }
 
+  def concatenateFiles(sourceNames: Array[String], destFilename: String): Unit = {
+    val fileStatuses = sourceNames.map(fileStatus(_))
+
+    info(s"merging ${ fileStatuses.length } files totalling " +
+      s"${ readableBytes(fileStatuses.map(_.getLen).sum) }...")
+
+    val (_, timing) = time(copyMergeList(fileStatuses, destFilename, deleteSource = false))
+
+    info(s"while writing:\n    $destFilename\n  merge time: ${ formatTime(timing) }")
+  }
+
   def touch(filename: String): Unit = {
     using(createNoCompression(filename))(_ => ())
   }
 
   lazy val broadcast: BroadcastValue[FS] = HailContext.backend.broadcast(this)
+
+  def getConfiguration(): Any
+
+  def setConfiguration(config: Any): Unit
 }
+

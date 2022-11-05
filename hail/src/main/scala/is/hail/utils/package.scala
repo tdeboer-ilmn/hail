@@ -82,6 +82,8 @@ package object utils extends Logging
   with Py4jUtils
   with ErrorHandling {
 
+  def utilsPackageClass = getClass
+
   def getStderrAndLogOutputStream[T](implicit tct: ClassTag[T]): OutputStream =
     new TeeOutputStream(new LoggerOutputStream(log, Level.ERROR), System.err)
 
@@ -89,6 +91,12 @@ package object utils extends Logging
     substitutions.zipWithIndex.foldLeft(s) { case (str, (value, i)) =>
       str.replace(s"@${ i + 1 }", value.toString)
     }
+  }
+
+  def coerceToInt(l: Long): Int = {
+    if (l > Int.MaxValue || l < Int.MinValue)
+      fatal(s"int overflow: $l")
+    l.toInt
   }
 
   def checkGzippedFile(fs: FS,
@@ -502,17 +510,6 @@ package object utils extends Logging
     s
   }
 
-  def decompress(input: Array[Byte], size: Int): Array[Byte] = {
-    val expansion = new Array[Byte](size)
-    val inflater = new Inflater
-    inflater.setInput(input)
-    var off = 0
-    while (off < expansion.length) {
-      off += inflater.inflate(expansion, off, expansion.length - off)
-    }
-    expansion
-  }
-
   def loadFromResource[T](file: String)(reader: (InputStream) => T): T = {
     val resourceStream = Thread.currentThread().getContextClassLoader.getResourceAsStream(file)
     assert(resourceStream != null, s"Error while locating file '$file'")
@@ -812,19 +809,9 @@ package object utils extends Logging
     }
   }
 
-  def compress(bb: ByteArrayBuilder, input: Array[Byte]): Int = {
-    val compressor = new Deflater()
-    compressor.setInput(input)
-    compressor.finish()
-    val buffer = new Array[Byte](1024)
-    var compressedLength = 0
-    while (!compressor.finished()) {
-      val nCompressedBytes = compressor.deflate(buffer)
-      bb ++= (buffer, nCompressedBytes)
-      compressedLength += nCompressedBytes
-    }
-    compressedLength
-  }
+  def decompress(input: Array[Byte], size: Int): Array[Byte] = CompressionUtils.decompress(input, size)
+
+  def compress(bb: ByteArrayBuilder, input: Array[Byte]): Int = CompressionUtils.compress(bb, input)
 
   def unwrappedApply[U, T](f: (U, T) => T): (U, Seq[T]) => T = if (f == null) null else { (s, ts) =>
     f(s, ts(0))

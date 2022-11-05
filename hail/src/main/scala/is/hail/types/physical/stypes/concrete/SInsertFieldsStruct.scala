@@ -1,31 +1,13 @@
 package is.hail.types.physical.stypes.concrete
 
 import is.hail.annotations.Region
-import is.hail.asm4s.{Code, Settable, TypeInfo, Value}
-import is.hail.expr.ir.{EmitCode, EmitCodeBuilder, EmitSettable, EmitValue, IEmitCode}
-import is.hail.types.physical.stypes.interfaces.{SBaseStruct, SBaseStructCode, SBaseStructSettable, SBaseStructValue}
-import is.hail.types.physical.stypes.{EmitType, SCode, SType, SValue}
+import is.hail.asm4s.{Settable, TypeInfo, Value}
+import is.hail.expr.ir.{EmitCodeBuilder, EmitSettable, EmitValue, IEmitCode}
+import is.hail.types.physical.stypes.interfaces.{SBaseStruct, SBaseStructSettable, SBaseStructValue}
+import is.hail.types.physical.stypes.{EmitType, SType, SValue}
 import is.hail.types.physical.{PCanonicalStruct, PType}
 import is.hail.types.virtual.{TStruct, Type}
 import is.hail.utils._
-
-object SInsertFieldsStruct {
-  def merge(cb: EmitCodeBuilder, s1: SBaseStructValue, s2: SBaseStructValue): SInsertFieldsStructValue = {
-    val lt = s1.st.virtualType.asInstanceOf[TStruct]
-    val rt = s2.st.virtualType.asInstanceOf[TStruct]
-    val resultVType = TStruct.concat(lt, rt)
-
-    val st1 = s1.st
-    val st2 = s2.st
-    val st = SInsertFieldsStruct(resultVType, st1, rt.fieldNames.zip(st2.fieldEmitTypes))
-
-    if (st2.size == 1) {
-      new SInsertFieldsStructValue(st, s1, FastIndexedSeq(cb.memoize(s2.loadField(cb, 0), "InsertFieldsStruct_merge")))
-    } else {
-      new SInsertFieldsStructValue(st, s1, (0 until st2.size).map(i => cb.memoize(s2.loadField(cb, i), "InsertFieldsStruct_merge")))
-    }
-  }
-}
 
 final case class SInsertFieldsStruct(virtualType: TStruct, parent: SBaseStruct, insertedFields: IndexedSeq[(String, EmitType)]) extends SBaseStruct {
   override def size: Int = virtualType.size
@@ -135,11 +117,9 @@ final case class SInsertFieldsStruct(virtualType: TStruct, parent: SBaseStruct, 
 
 class SInsertFieldsStructValue(
   val st: SInsertFieldsStruct,
-  parent: SBaseStructValue,
-  newFields: IndexedSeq[EmitValue]
+  val parent: SBaseStructValue,
+  val newFields: IndexedSeq[EmitValue]
 ) extends SBaseStructValue {
-  override def get: SInsertFieldsStructCode = new SInsertFieldsStructCode(st, parent.get, newFields.map(_.load))
-
   override lazy val valueTuple: IndexedSeq[Value[_]] = parent.valueTuple ++ newFields.flatMap(_.valueTuple())
 
   override def loadField(cb: EmitCodeBuilder, fieldIdx: Int): IEmitCode = {
@@ -172,45 +152,11 @@ final class SInsertFieldsStructSettable(
 ) extends SInsertFieldsStructValue(st, parent, newFields) with SBaseStructSettable {
   override def settableTuple(): IndexedSeq[Settable[_]] = parent.settableTuple() ++ newFields.flatMap(_.settableTuple())
 
-  override def store(cb: EmitCodeBuilder, pv: SCode): Unit = {
-    val sifc = pv.asInstanceOf[SInsertFieldsStructCode]
-    parent.store(cb, sifc.parent)
-    newFields.zip(sifc.newFields).foreach { case (settable, code) => cb.assign(settable, code) }
-  }
-}
-
-class SInsertFieldsStructCode(val st: SInsertFieldsStruct, val parent: SBaseStructCode, val newFields: IndexedSeq[EmitCode]) extends SBaseStructCode {
-  override def memoize(cb: EmitCodeBuilder, name: String): SInsertFieldsStructSettable = {
-    new SInsertFieldsStructSettable(st, parent.memoize(cb, name + "_parent").asInstanceOf[SBaseStructSettable], newFields.indices.map { i =>
-      val code = newFields(i)
-      val es = cb.emb.newEmitLocal(s"${ name }_nf_$i", code.emitType)
-      es.store(cb, code)
-      es
-    })
-  }
-
-  override def memoizeField(cb: EmitCodeBuilder, name: String): SInsertFieldsStructSettable = {
-    new SInsertFieldsStructSettable(st, parent.memoizeField(cb, name + "_parent").asInstanceOf[SBaseStructSettable], newFields.indices.map { i =>
-      val code = newFields(i)
-      val es = cb.emb.newEmitField(s"${ name }_nf_$i", code.emitType)
-      es.store(cb, code)
-      es
-    })
-  }
-
-  override def _insert(newType: TStruct, fields: (String, EmitCode)*): SBaseStructCode = {
-    val newFieldSet = fields.map(_._1).toSet
-    val filteredNewFields = st.insertedFields.map(_._1)
-      .zipWithIndex
-      .filter { case (name, idx) => !newFieldSet.contains(name) }
-      .map { case (name, idx) => (name, newFields(idx)) }
-    parent._insert(newType, filteredNewFields ++ fields: _*)
-  }
-
-  override def loadSingleField(cb: EmitCodeBuilder, fieldIdx: Int): IEmitCode = {
-    st.getFieldIndexInNewOrParent(fieldIdx) match {
-      case Left(parentIdx) => parent.loadSingleField(cb, parentIdx)
-      case Right(newIdx) => newFields(newIdx).toI(cb)
-    }
+  override def store(cb: EmitCodeBuilder, sv: SValue): Unit = sv match {
+    case sv: SInsertFieldsStructValue =>
+      parent.store(cb, sv.parent)
+      (newFields, sv.newFields).zipped.foreach { (settable, value) =>
+        cb.assign(settable, value)
+      }
   }
 }

@@ -36,10 +36,10 @@ case object LowerMatrixToTablePass extends LoweringPass {
   val context: String = "LowerMatrixToTable"
 
   def transform(ctx: ExecuteContext, ir: BaseIR): BaseIR = ir match {
-    case x: IR => LowerMatrixIR(x)
-    case x: TableIR => LowerMatrixIR(x)
-    case x: MatrixIR => LowerMatrixIR(x)
-    case x: BlockMatrixIR => LowerMatrixIR(x)
+    case x: IR => LowerMatrixIR(ctx, x)
+    case x: TableIR => LowerMatrixIR(ctx, x)
+    case x: MatrixIR => LowerMatrixIR(ctx, x)
+    case x: BlockMatrixIR => LowerMatrixIR(ctx, x)
   }
 }
 
@@ -94,37 +94,44 @@ case object LowerArrayAggsToRunAggsPass extends LoweringPass {
   val context: String = "LowerArrayAggsToRunAggs"
 
   def transform(ctx: ExecuteContext, ir: BaseIR): BaseIR = {
-    val r = Requiredness(ir, ctx)
-    RewriteBottomUp(ir, {
+    val x = ir.noSharing
+    val r = Requiredness(x, ctx)
+    RewriteBottomUp(x, {
       case x@StreamAgg(a, name, query) =>
         val res = genUID()
         val aggs = Extract(query, res, r)
-        val newNode = Let(
-          res,
-          RunAgg(
-            Begin(FastSeq(
-              aggs.init,
-              StreamFor(
-                a,
-                name,
-                aggs.seqPerElt))),
-            aggs.results,
-            aggs.states),
-          aggs.postAggIR)
+
+        val newNode = aggs.rewriteFromInitBindingRoot { root =>
+          Let(
+            res,
+            RunAgg(
+              Begin(FastSeq(
+                aggs.init,
+                StreamFor(
+                  a,
+                  name,
+                  aggs.seqPerElt))),
+              aggs.results,
+              aggs.states),
+            root)
+        }
+
         if (newNode.typ != x.typ)
-          throw new RuntimeException(s"types differ:\n  new: ${ newNode.typ }\n  old: ${ x.typ }")
+          throw new RuntimeException(s"types differ:\n  new: ${newNode.typ}\n  old: ${x.typ}")
         Some(newNode)
       case x@StreamAggScan(a, name, query) =>
         val res = genUID()
         val aggs = Extract(query, res, r, isScan=true)
-        val newNode = RunAggScan(
-          a,
-          name,
-          aggs.init,
-          aggs.seqPerElt,
-          Let(res, aggs.results, aggs.postAggIR),
-          aggs.states
-        )
+        val newNode = aggs.rewriteFromInitBindingRoot { root =>
+          RunAggScan(
+            a,
+            name,
+            aggs.init,
+            aggs.seqPerElt,
+            Let(res, aggs.results, root),
+            aggs.states
+          )
+        }
         if (newNode.typ != x.typ)
           throw new RuntimeException(s"types differ:\n  new: ${ newNode.typ }\n  old: ${ x.typ }")
         Some(newNode)

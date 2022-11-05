@@ -1,5 +1,6 @@
 package is.hail.backend.local
 
+import is.hail.{HailContext, HailFeatureFlags}
 import is.hail.annotations.{Region, SafeRow, UnsafeRow}
 import is.hail.asm4s._
 import is.hail.backend._
@@ -7,7 +8,7 @@ import is.hail.expr.ir.lowering._
 import is.hail.expr.ir.{IRParser, _}
 import is.hail.expr.{JSONAnnotationImpex, Validate}
 import is.hail.io.bgen.IndexBgen
-import is.hail.io.fs.{FS, HadoopFS}
+import is.hail.io.fs._
 import is.hail.io.plink.LoadPlink
 import is.hail.io.{BufferSpec, TypedCodecSpec}
 import is.hail.linalg.BlockMatrix
@@ -35,36 +36,70 @@ class LocalTaskContext(val partitionId: Int, val stageId: Int) extends HailTaskC
 object LocalBackend {
   private var theLocalBackend: LocalBackend = _
 
-  def apply(tmpdir: String): LocalBackend = synchronized {
+  def apply(
+    tmpdir: String,
+    gcsRequesterPaysProject: String,
+    gcsRequesterPaysBuckets: String
+  ): LocalBackend = synchronized {
     require(theLocalBackend == null)
 
-    theLocalBackend = new LocalBackend(tmpdir)
+    theLocalBackend = new LocalBackend(
+      tmpdir,
+      gcsRequesterPaysProject,
+      gcsRequesterPaysBuckets
+    )
     theLocalBackend
   }
 
   def stop(): Unit = synchronized {
     if (theLocalBackend != null) {
       theLocalBackend = null
+      // Hadoop does not honor the hadoop configuration as a component of the cache key for file
+      // systems, so we blow away the cache so that a new configuration can successfully take
+      // effect.
+      // https://github.com/hail-is/hail/pull/12133#issuecomment-1241322443
+      hadoop.fs.FileSystem.closeAll()
     }
   }
 }
 
 class LocalBackend(
-  val tmpdir: String
+  val tmpdir: String,
+  gcsRequesterPaysProject: String,
+  gcsRequesterPaysBuckets: String
 ) extends Backend {
   // FIXME don't rely on hadoop
   val hadoopConf = new hadoop.conf.Configuration()
+  if (gcsRequesterPaysProject != null) {
+    if (gcsRequesterPaysBuckets == null) {
+      hadoopConf.set("fs.gs.requester.pays.mode", "AUTO")
+      hadoopConf.set("fs.gs.requester.pays.project.id", gcsRequesterPaysProject)
+    } else {
+      hadoopConf.set("fs.gs.requester.pays.mode", "CUSTOM")
+      hadoopConf.set("fs.gs.requester.pays.project.id", gcsRequesterPaysProject)
+      hadoopConf.set("fs.gs.requester.pays.buckets", gcsRequesterPaysBuckets)
+    }
+  }
   hadoopConf.set(
     "hadoop.io.compression.codecs",
     "org.apache.hadoop.io.compress.DefaultCodec,"
       + "is.hail.io.compress.BGzipCodec,"
       + "is.hail.io.compress.BGzipCodecTbi,"
       + "org.apache.hadoop.io.compress.GzipCodec")
-  
+
+  private[this] val flags = HailFeatureFlags.fromEnv()
+  private[this] val theHailClassLoader = new HailClassLoader(getClass().getClassLoader())
+
+  def getFlag(name: String): String = flags.get(name)
+
+  def setFlag(name: String, value: String) = flags.set(name, value)
+
+  val availableFlags: java.util.ArrayList[String] = flags.available
+
   val fs: FS = new HadoopFS(new SerializableHadoopConfiguration(hadoopConf))
 
   def withExecuteContext[T](timer: ExecutionTimer)(f: ExecuteContext => T): T = {
-    ExecuteContext.scoped(tmpdir, tmpdir, this, fs, timer, null)(f)
+    ExecuteContext.scoped(tmpdir, tmpdir, this, fs, timer, null, theHailClassLoader, flags)(f)
   }
 
   def broadcast[T: ClassTag](value: T): BroadcastValue[T] = new LocalBroadcastValue[T](value)
@@ -77,11 +112,18 @@ class LocalBackend(
     current
   }
 
-  def parallelizeAndComputeWithIndex(backendContext: BackendContext, fs: FS, collection: Array[Array[Byte]], dependency: Option[TableStageDependency] = None)(f: (Array[Byte], HailTaskContext, FS) => Array[Byte]): Array[Array[Byte]] = {
+  def parallelizeAndComputeWithIndex(
+    backendContext: BackendContext,
+    fs: FS,
+    collection: Array[Array[Byte]],
+    dependency: Option[TableStageDependency] = None
+  )(
+    f: (Array[Byte], HailTaskContext, HailClassLoader, FS) => Array[Byte]
+  ): Array[Array[Byte]] = {
     val stageId = nextStageId()
     collection.zipWithIndex.map { case (c, i) =>
       val htc = new LocalTaskContext(i, stageId)
-      val bytes = f(c, htc, fs)
+      val bytes = f(c, htc, theHailClassLoader, fs)
       htc.finish()
       bytes
     }
@@ -95,7 +137,7 @@ class LocalBackend(
     val ir = LoweringPipeline.darrayLowerer(true)(DArrayLowering.All).apply(ctx, ir0).asInstanceOf[IR]
 
     if (!Compilable(ir))
-      throw new LowererUnsupportedOperation(s"lowered to uncompilable IR: ${ Pretty(ir) }")
+      throw new LowererUnsupportedOperation(s"lowered to uncompilable IR: ${ Pretty(ctx, ir) }")
 
     if (ir.typ == TVoid) {
       val (pt, f) = ctx.timer.time("Compile") {
@@ -107,7 +149,7 @@ class LocalBackend(
       }
 
       ctx.timer.time("Run") {
-        f(fs, 0, ctx.r).apply(ctx.r)
+        f(ctx.theHailClassLoader, fs, 0, ctx.r).apply(ctx.r)
         (pt, 0)
       }
     } else {
@@ -120,13 +162,13 @@ class LocalBackend(
       }
 
       ctx.timer.time("Run") {
-        (pt, f(fs, 0, ctx.r).apply(ctx.r))
+        (pt, f(ctx.theHailClassLoader, fs, 0, ctx.r).apply(ctx.r))
       }
     }
   }
 
   private[this] def _execute(ctx: ExecuteContext, ir: IR): (Option[SingleCodeType], Long) = {
-    TypeCheck(ir)
+    TypeCheck(ctx, ir)
     Validate(ir)
     val queryID = Backend.nextID()
     log.info(s"starting execution of query $queryID of initial size ${ IRSize(ir) }")
@@ -174,14 +216,14 @@ class LocalBackend(
     }
   }
 
-  def executeEncode(ir: IR, bufferSpecString: String): (Array[Byte], String) = {
+  def executeEncode(ir: IR, bufferSpecString: String, timed: Boolean): (Array[Byte], String) = {
     val (bytes, timer) = ExecutionTimer.time("LocalBackend.encodeToBytes") { timer =>
       val bs = BufferSpec.parseOrDefault(bufferSpecString)
       withExecuteContext(timer) { ctx =>
         executeToEncoded(timer, ir, bs)
       }
     }
-    (bytes, Serialization.write(Map("timings" -> timer.toMap))(new DefaultFormats {}))
+    (bytes, if (timed) Serialization.write(Map("timings" -> timer.toMap))(new DefaultFormats {}) else "")
   }
 
   def decodeToJSON(ptypeString: String, b: Array[Byte], bufferSpecString: String): String = {
@@ -242,33 +284,33 @@ class LocalBackend(
   def parse_value_ir(s: String, refMap: java.util.Map[String, String], irMap: java.util.Map[String, BaseIR]): IR = {
     ExecutionTimer.logTime("LocalBackend.parse_value_ir") { timer =>
       withExecuteContext(timer) { ctx =>
-        IRParser.parse_value_ir(s, IRParserEnvironment(ctx, refMap.asScala.toMap.mapValues(IRParser.parseType), irMap.asScala.toMap))
+        IRParser.parse_value_ir(s, IRParserEnvironment(ctx, BindingEnv.eval(refMap.asScala.toMap.mapValues(IRParser.parseType).toSeq: _*), irMap.asScala.toMap))
       }
     }
   }
 
-  def parse_table_ir(s: String, refMap: java.util.Map[String, String], irMap: java.util.Map[String, BaseIR]): TableIR = {
+  def parse_table_ir(s: String, irMap: java.util.Map[String, BaseIR]): TableIR = {
     ExecutionTimer.logTime("LocalBackend.parse_table_ir") { timer =>
       withExecuteContext(timer) { ctx =>
-        IRParser.parse_table_ir(s, IRParserEnvironment(ctx, refMap.asScala.toMap.mapValues(IRParser.parseType), irMap.asScala.toMap))
+        IRParser.parse_table_ir(s, IRParserEnvironment(ctx, irMap = irMap.asScala.toMap))
       }
     }
   }
 
-  def parse_matrix_ir(s: String, refMap: java.util.Map[String, String], irMap: java.util.Map[String, BaseIR]): MatrixIR = {
+  def parse_matrix_ir(s: String, irMap: java.util.Map[String, BaseIR]): MatrixIR = {
     ExecutionTimer.logTime("LocalBackend.parse_matrix_ir") { timer =>
       withExecuteContext(timer) { ctx =>
-        IRParser.parse_matrix_ir(s, IRParserEnvironment(ctx, refMap.asScala.toMap.mapValues(IRParser.parseType), irMap.asScala.toMap))
+        IRParser.parse_matrix_ir(s, IRParserEnvironment(ctx, irMap = irMap.asScala.toMap))
       }
     }
   }
 
   def parse_blockmatrix_ir(
-    s: String, refMap: java.util.Map[String, String], irMap: java.util.Map[String, BaseIR]
+    s: String, irMap: java.util.Map[String, BaseIR]
   ): BlockMatrixIR = {
     ExecutionTimer.logTime("LocalBackend.parse_blockmatrix_ir") { timer =>
       withExecuteContext(timer) { ctx =>
-        IRParser.parse_blockmatrix_ir(s, IRParserEnvironment(ctx, refMap.asScala.toMap.mapValues(IRParser.parseType), irMap.asScala.toMap))
+        IRParser.parse_blockmatrix_ir(s, IRParserEnvironment(ctx, irMap = irMap.asScala.toMap))
       }
     }
   }
@@ -280,8 +322,8 @@ class LocalBackend(
     relationalLetsAbove: Map[String, IR],
     rowTypeRequiredness: RStruct
   ): TableStage = {
-    // Use a local sort for the moment to enable larger pipelines to run
-    LowerDistributedSort.localSort(ctx, stage, sortFields, relationalLetsAbove)
+
+    LowerDistributedSort.distributedSort(ctx, stage, sortFields, relationalLetsAbove, rowTypeRequiredness)
   }
 
   def pyLoadReferencesFromDataset(path: String): String =

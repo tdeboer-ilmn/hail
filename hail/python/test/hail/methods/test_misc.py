@@ -28,8 +28,6 @@ class Tests(unittest.TestCase):
             'foo'
         )['foo'].dtype == hl.tstr
 
-    @fails_service_backend()
-    @fails_local_backend()
     def test_annotate_intervals(self):
         ds = get_dataset()
 
@@ -63,7 +61,8 @@ class Tests(unittest.TestCase):
         self.assertTrue(ds.annotate_rows(target=interval_list2[ds.locus].target).rows()
                         ._same(ds.annotate_rows(target=bed2[ds.locus].target).rows()))
 
-    @skip_unless_spark_backend()
+    @fails_service_backend()
+    @fails_local_backend()
     def test_maximal_independent_set(self):
         # prefer to remove nodes with higher index
         t = hl.utils.range_table(10)
@@ -79,7 +78,8 @@ class Tests(unittest.TestCase):
         self.assertRaises(ValueError, lambda: hl.maximal_independent_set(graph.i, hl.utils.range_table(10).idx, True))
         self.assertRaises(ValueError, lambda: hl.maximal_independent_set(hl.literal(1), hl.literal(2), True))
 
-    @skip_unless_spark_backend()
+    @fails_service_backend()
+    @fails_local_backend()
     def test_maximal_independent_set2(self):
         edges = [(0, 4), (0, 1), (0, 2), (1, 5), (1, 3), (2, 3), (2, 6),
                  (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]
@@ -95,7 +95,8 @@ class Tests(unittest.TestCase):
         non_maximal_indep_sets = [{0, 7}, {6, 1}]
         self.assertTrue(mis in non_maximal_indep_sets or mis in maximal_indep_sets)
 
-    @skip_unless_spark_backend()
+    @fails_service_backend()
+    @fails_local_backend()
     def test_maximal_independent_set3(self):
         is_case = {"A", "C", "E", "G", "H"}
         edges = [("A", "B"), ("C", "D"), ("E", "F"), ("G", "H")]
@@ -117,7 +118,8 @@ class Tests(unittest.TestCase):
         self.assertTrue(mis.all(mis.node.is_case))
         self.assertTrue(set([row.id for row in mis.select(mis.node.id).collect()]) in expected_sets)
 
-    @skip_unless_spark_backend()
+    @fails_service_backend()
+    @fails_local_backend()
     def test_maximal_independent_set_types(self):
         ht = hl.utils.range_table(10)
         ht = ht.annotate(i=hl.struct(a='1', b=hl.rand_norm(0, 1)),
@@ -126,7 +128,8 @@ class Tests(unittest.TestCase):
                          jj=hl.struct(id=ht.j, rank=hl.rand_norm(0, 1)))
         hl.maximal_independent_set(ht.ii, ht.jj).count()
 
-    @skip_unless_spark_backend()
+    @fails_service_backend()
+    @fails_local_backend()
     def test_maximal_independent_set_on_floats(self):
         t = hl.utils.range_table(1).annotate(l = hl.struct(s="a", x=3.0), r = hl.struct(s="b", x=2.82))
         expected = [hl.Struct(node=hl.Struct(s="a", x=3.0))]
@@ -186,7 +189,6 @@ class Tests(unittest.TestCase):
                                  hl.Struct(locus=hl.Locus('20', 10644700), alleles=['A', 'T']))]
         self.assertEqual(hl.filter_intervals(ds, intervals).count_rows(), 3)
 
-    @fails_service_backend()
     def test_summarize_variants(self):
         mt = hl.utils.range_matrix_table(3, 3)
         variants = hl.literal({0: hl.Struct(locus=hl.Locus('1', 1), alleles=['A', 'T', 'C']),
@@ -199,7 +201,6 @@ class Tests(unittest.TestCase):
         self.assertEqual(r.allele_types, {'SNP': 2, 'MNP': 1, 'Unknown': 1, 'Insertion': 1})
         self.assertEqual(r.allele_counts, {2: 1, 3: 2})
 
-    @fails_service_backend()
     def test_verify_biallelic(self):
         mt = hl.import_vcf(resource('sample2.vcf'))  # has multiallelics
         with self.assertRaises(hl.utils.HailUserError):
@@ -218,3 +219,27 @@ class Tests(unittest.TestCase):
         ht = hl.utils.range_table(N).annotate(x = hl.scan.count() / N, is_even=hl.scan.count() % 2 == 0)
         lgc_nan = hl.lambda_gc(hl.case().when(ht.is_even, hl.float('nan')).default(ht.x))
         self.assertAlmostEqual(lgc_nan, 1, places=1)  # approximate, 1 place is safe
+
+    def test_segment_intervals(self):
+        intervals = hl.Table.parallelize(
+            [
+                hl.struct(interval=hl.interval(0, 10)),
+                hl.struct(interval=hl.interval(20, 50)),
+                hl.struct(interval=hl.interval(52, 52))
+            ],
+            schema=hl.tstruct(interval=hl.tinterval(hl.tint32)),
+            key='interval'
+        )
+
+        points1 = [-1, 5, 30, 40, 52, 53]
+
+        segmented1 = hl.segment_intervals(intervals, points1)
+
+        assert segmented1.aggregate(hl.agg.collect(segmented1.interval) == [
+            hl.interval(0, 5),
+            hl.interval(5, 10),
+            hl.interval(20, 30),
+            hl.interval(30, 40),
+            hl.interval(40, 50),
+            hl.interval(52, 52)
+        ])

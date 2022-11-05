@@ -1,37 +1,19 @@
 #!/bin/bash
 
-export HAIL="$HOME/hail"
+set -e
 
-get_global_config_field() {
-    kubectl get secret global-config --template={{.data.$1}} | base64 --decode
-}
+if [[ -z "$HAIL" ]]; then
+    echo 1>&2 "Path to local clone of hail repository must be set."
+    exit 1
+fi
 
-render_config_mk() {
-    DOCKER_PREFIX=$(get_global_config_field docker_prefix)
-    INTERNAL_IP=$(get_global_config_field internal_ip)
-    IP=$(get_global_config_field ip)
-    DOMAIN=$(get_global_config_field domain)
-    cat >$HAIL/config.mk <<EOF
-DOCKER_PREFIX := $DOCKER_PREFIX
-INTERNAL_IP := $INTERNAL_IP
-IP := $IP
-DOMAIN := $DOMAIN
-
-ifeq (\$(NAMESPACE),default)
-SCOPE = deploy
-DEPLOY = true
-else
-SCOPE = dev
-DEPLOY = false
-endif
-EOF
-}
+source $HAIL/devbin/functions.sh
 
 copy_images() {
-    cd $HAIL/docker/third-party
-    DOCKER_PREFIX=$(get_global_config_field docker_prefix)
-    DOCKER_PREFIX=$DOCKER_PREFIX ./copy_images.sh
-    cd -
+    make -C $HAIL/docker/third-party copy
+
+    make -C $HAIL/hail python/hail/hail_pip_version
+    make -C $HAIL/docker/hailgenetics mirror-dockerhub-images
 }
 
 generate_ssl_certs() {
@@ -67,14 +49,14 @@ generate_ssl_certs() {
 deploy_unmanaged() {
     make -C $HAIL/hail python/hailtop/hail_version
 
-    render_config_mk
     copy_images
     generate_ssl_certs
 
+    export NAMESPACE=default
     kubectl -n default apply -f $HAIL/ci/bootstrap.yaml
     make -C $HAIL/ci build-ci-utils build-hail-buildkit
     make -C $HAIL/batch build-worker
-    make -C $HAIL/internal-gateway deploy
+    make -C $HAIL/internal-gateway envoy-xds-config deploy
     make -C $HAIL/bootstrap-gateway deploy
     make -C $HAIL/letsencrypt run
 }
@@ -94,10 +76,11 @@ bootstrap() {
     export HAIL_BUILDKIT_IMAGE=$DOCKER_PREFIX/hail-buildkit:cache
     export HAIL_DEFAULT_NAMESPACE=$(get_global_config_field default_namespace)
     export HAIL_CI_STORAGE_URI=dummy
+    export HAIL_CI_GITHUB_CONTEXT=dummy
     export PYTHONPATH=$HAIL/ci:$HAIL/batch:$HAIL/hail/python:$HAIL/gear
 
     if [ -n "$3" ] && [ -n "$4" ]; then
-        extra_code_config="--extra-code-config {\"username\":\"""$3""\",\"email\":\"""$4""\"}"
+        extra_code_config="--extra-code-config {\"username\":\"""$3""\",\"login_id\":\"""$4""\"}"
     else
         extra_code_config=""
     fi

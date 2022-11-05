@@ -35,12 +35,21 @@ class MatrixIRSuite extends HailSuite {
       val read = MatrixIR.read(fs, path, dropCols = false, dropRows = false, None)
       val droppedRows = MatrixIR.read(fs, path, dropCols = false, dropRows = true, None)
 
-      val expectedCols = Array.tabulate(10)(i => Row(i)).toFastIndexedSeq
-      val expectedRows = Array.tabulate(10)(i => Row(i, expectedCols.map { case Row(j) => Row(i, j) })).toFastIndexedSeq
+      val expectedCols = Array.tabulate(10)(i => Row(i, Row(0L, i.toLong))).toFastIndexedSeq
+      val expectedRows = if (writer eq writer1) {
+        val uids = for {
+          (partSize, partIndex) <- partition(10, 3).zipWithIndex
+          i <- 0 until partSize
+        } yield Row(partIndex.toLong, i.toLong)
+        (0 until 10, uids).zipped.map { (i, uid) => Row(i, uid, expectedCols.map { case Row(j, _) => Row(i, j) }) }
+      } else
+        Array.tabulate(10)(i => Row(i, Row(0L, i.toLong), expectedCols.map { case Row(j, _) => Row(i, j) })).toFastIndexedSeq
       val expectedGlobals = Row(0, expectedCols);
       {
         implicit val execStrats: Set[ExecStrategy] = Set(ExecStrategy.Interpret, ExecStrategy.InterpretUnoptimized)
-        assertEvalsTo(TableCollect(TableKeyBy(CastMatrixToTable(read, "entries", "cols"), FastIndexedSeq())), Row(expectedRows, expectedGlobals))
+        assertEvalsTo(
+          TableCollect(TableKeyBy(CastMatrixToTable(read, "entries", "cols"), FastIndexedSeq())),
+          Row(expectedRows, expectedGlobals))
         assertEvalsTo(TableCollect(TableKeyBy(CastMatrixToTable(droppedRows, "entries", "cols"), FastIndexedSeq())), Row(FastIndexedSeq(), expectedGlobals))
       }
     }
@@ -48,7 +57,8 @@ class MatrixIRSuite extends HailSuite {
 
   def rangeMatrix(nRows: Int = 20, nCols: Int = 20, nPartitions: Option[Int] = Some(4)): MatrixIR = {
     val reader = MatrixRangeReader(nRows, nCols, nPartitions)
-    MatrixRead(reader.fullMatrixType, false, false, reader)
+    val requestedType = reader.fullMatrixTypeWithoutUIDs
+    MatrixRead(requestedType, false, false, reader)
   }
 
   def getRows(mir: MatrixIR): Array[Row] =
@@ -199,7 +209,7 @@ class MatrixIRSuite extends HailSuite {
     val globalType = TStruct(("__cols", TArray(colSig)))
     var tv = TableValue(ctx, rowSig, keyNames, rowRdd)
     tv = tv.copy(typ = tv.typ.copy(globalType = globalType), globals = BroadcastRow(ctx, Row(cdata.toFastIndexedSeq), globalType))
-    TableLiteral(tv)
+    TableLiteral(tv, theHailClassLoader)
   }
 
   @Test def testCastTableToMatrix() {
@@ -268,7 +278,7 @@ class MatrixIRSuite extends HailSuite {
 
   @Test def testMatrixFiltersWorkWithRandomness() {
     val range = rangeMatrix(20, 20, Some(4))
-    val rand = ApplySeeded("rand_bool", FastIndexedSeq(0.5), seed=0, TBoolean)
+    val rand = ApplySeeded("rand_bool", FastIndexedSeq(0.5), RNGStateLiteral(), seed=0, TBoolean)
 
     val cols = Interpret(MatrixFilterCols(range, rand), ctx, optimize = true).toMatrixValue(range.typ.colKey).nCols
     val rows = Interpret(MatrixFilterRows(range, rand), ctx, optimize = true).rvd.count()

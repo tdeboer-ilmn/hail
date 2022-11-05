@@ -33,7 +33,7 @@ object TestRegisterFunctions extends RegistryFunctions {
     registerScalaFunction("foobar1", Array(), TInt32, null)(ScalaTestObject.getClass, "testFunction")
     registerScalaFunction("foobar2", Array(), TInt32, null)(ScalaTestCompanion.getClass, "testFunction")
     registerSCode2("testCodeUnification", tnum("x"), tv("x", "int32"), tv("x"), null) {
-      case (_, cb, rt, a, b, _) => primitive(cb.memoize(a.asInt.intCode(cb) + b.asInt.intCode(cb)))
+      case (_, cb, rt, a, b, _) => primitive(cb.memoize(a.asInt.value + b.asInt.value))
     }
     registerSCode1("testCodeUnification2", tv("x"), tv("x"), null) { case (_, cb, rt, a, _) => a }
   }
@@ -114,7 +114,7 @@ class FunctionSuite extends HailSuite {
     })
     pool.scopedRegion { r =>
 
-      assert(fb.resultWithIndex().apply(ctx.fs, 0, r)() == 2)
+      assert(fb.resultWithIndex().apply(theHailClassLoader, ctx.fs, 0, r)() == 2)
     }
   }
 }

@@ -5,11 +5,11 @@ import is.hail.asm4s._
 import is.hail.backend.ExecuteContext
 import is.hail.expr.ir.agg.AggStateSig
 import is.hail.expr.ir.lowering.LoweringPipeline
-import is.hail.expr.ir.streams.{EmitStream, StreamArgType}
+import is.hail.expr.ir.streams.EmitStream
 import is.hail.io.fs.FS
 import is.hail.rvd.RVDContext
 import is.hail.types.physical.stypes.{PTypeReferenceSingleCodeType, SingleCodeType, StreamSingleCodeType}
-import is.hail.types.physical.stypes.interfaces.SStream
+import is.hail.types.physical.stypes.interfaces.{NoBoxLongIterator, SStream}
 import is.hail.types.physical.{PStruct, PType}
 import is.hail.types.virtual.Type
 import is.hail.utils._
@@ -18,7 +18,7 @@ import java.io.PrintWriter
 
 case class CodeCacheKey(aggSigs: IndexedSeq[AggStateSig], args: Seq[(String, EmitParamType)], body: IR)
 
-case class CodeCacheValue(typ: Option[SingleCodeType], f: (FS, Int, Region) => Any)
+case class CodeCacheValue(typ: Option[SingleCodeType], f: (HailClassLoader, FS, Int, Region) => Any)
 
 object Compile {
   private[this] val codeCache: Cache[CodeCacheKey, CodeCacheValue] = new Cache(50)
@@ -29,8 +29,9 @@ object Compile {
     expectedCodeParamTypes: IndexedSeq[TypeInfo[_]], expectedCodeReturnType: TypeInfo[_],
     body: IR,
     optimize: Boolean = true,
+    writeIRs: Boolean = false,
     print: Option[PrintWriter] = None
-  ): (Option[SingleCodeType], (FS, Int, Region) => F) = {
+  ): (Option[SingleCodeType], (HailClassLoader, FS, Int, Region) => F) = {
 
     val normalizeNames = new NormalizeNames(_.toString)
     val normalizedBody = normalizeNames(body,
@@ -38,7 +39,7 @@ object Compile {
     val k = CodeCacheKey(FastIndexedSeq[AggStateSig](), params.map { case (n, pt) => (n, pt) }, normalizedBody)
     codeCache.get(k) match {
       case Some(v) =>
-        return (v.typ, v.f.asInstanceOf[(FS, Int, Region) => F])
+        return (v.typ, v.f.asInstanceOf[(HailClassLoader, FS, Int, Region) => F])
       case None =>
     }
 
@@ -48,7 +49,7 @@ object Compile {
       .foldLeft(Env.empty[IR]) { case (e, ((n, t), i)) => e.bind(n, In(i, t)) }))
     ir = LoweringPipeline.compileLowerer(optimize).apply(ctx, ir).asInstanceOf[IR].noSharing
 
-    TypeCheck(ir, BindingEnv.empty)
+    TypeCheck(ctx, ir, BindingEnv.empty)
 
     val returnParam = CodeParamType(SingleCodeType.typeInfoFromType(ir.typ))
 
@@ -76,7 +77,7 @@ object Compile {
     val emitContext = EmitContext.analyze(ctx, ir)
     val rt = Emit(emitContext, ir, fb, expectedCodeReturnType, params.length)
 
-    val f = fb.resultWithIndex(print)
+    val f = fb.resultWithIndex(writeIRs, print)
     codeCache += k -> CodeCacheValue(rt, f)
 
     (rt, f)
@@ -93,14 +94,14 @@ object CompileWithAggregators {
     expectedCodeParamTypes: IndexedSeq[TypeInfo[_]], expectedCodeReturnType: TypeInfo[_],
     body: IR,
     optimize: Boolean = true
-  ): (Option[SingleCodeType], (FS, Int, Region) => (F with FunctionWithAggRegion)) = {
+  ): (Option[SingleCodeType], (HailClassLoader, FS, Int, Region) => (F with FunctionWithAggRegion)) = {
     val normalizeNames = new NormalizeNames(_.toString)
     val normalizedBody = normalizeNames(body,
       Env(params.map { case (n, _) => n -> n }: _*))
     val k = CodeCacheKey(aggSigs, params.map { case (n, pt) => (n, pt) }, normalizedBody)
     codeCache.get(k) match {
       case Some(v) =>
-        return (v.typ, v.f.asInstanceOf[(FS, Int, Region) => (F with FunctionWithAggRegion)])
+        return (v.typ, v.f.asInstanceOf[(HailClassLoader, FS, Int, Region) => (F with FunctionWithAggRegion)])
       case None =>
     }
 
@@ -110,7 +111,7 @@ object CompileWithAggregators {
       .foldLeft(Env.empty[IR]) { case (e, ((n, t), i)) => e.bind(n, In(i, t)) }))
     ir = LoweringPipeline.compileLowerer(optimize).apply(ctx, ir).asInstanceOf[IR].noSharing
 
-    TypeCheck(ir, BindingEnv(Env.fromSeq[Type](params.map { case (name, t) => name -> t.virtualType })))
+    TypeCheck(ctx, ir, BindingEnv(Env.fromSeq[Type](params.map { case (name, t) => name -> t.virtualType })))
 
     val fb = EmitFunctionBuilder[F](ctx, "CompiledWithAggs",
       CodeParamType(typeInfo[Region]) +: params.map { case (_, pt) => pt },
@@ -134,7 +135,7 @@ object CompileWithAggregators {
 
     val f = fb.resultWithIndex()
     codeCache += k -> CodeCacheValue(rt, f)
-    (rt, f.asInstanceOf[(FS, Int, Region) => (F with FunctionWithAggRegion)])
+    (rt, f.asInstanceOf[(HailClassLoader, FS, Int, Region) => (F with FunctionWithAggRegion)])
   }
 }
 
@@ -151,7 +152,7 @@ object CompileIterator {
   }
 
   private trait TMPStepFunction extends StepFunctionBase {
-    def apply(o: Object, a: Long, b: StreamArgType): Boolean
+    def apply(o: Object, a: Long, b: NoBoxLongIterator): Boolean
 
     def setRegions(outerRegion: Region, eltRegion: Region): Unit
   }
@@ -183,8 +184,9 @@ object CompileIterator {
     ctx: ExecuteContext,
     body: IR,
     argTypeInfo: Array[ParamType],
+    writeIRs: Boolean,
     printWriter: Option[PrintWriter]
-  ): (PType, (FS, Int, Region) => F) = {
+  ): (PType, (HailClassLoader, FS, Int, Region) => F) = {
 
     val fb = EmitFunctionBuilder.apply[F](ctx, "stream", argTypeInfo.toFastIndexedSeq, CodeParamType(BooleanInfo))
     val outerRegionField = fb.genFieldThisRef[Region]("outerRegion")
@@ -198,7 +200,7 @@ object CompileIterator {
     val outerRegion = outerRegionField
 
     val ir = LoweringPipeline.compileLowerer(true)(ctx, body).asInstanceOf[IR].noSharing
-    TypeCheck(ir)
+    TypeCheck(ctx, ir)
 
     var elementAddress: Settable[Long] = null
     var returnType: PType = null
@@ -207,7 +209,7 @@ object CompileIterator {
       val emitContext = EmitContext.analyze(ctx, ir)
       val emitter = new Emit(emitContext, stepFECB)
 
-      val env = EmitEnv(Env.empty, argTypeInfo.indices.filter(i => argTypeInfo(i).isInstanceOf[EmitParamType]).map(i => stepF.storeEmitParam(i + 1, cb)))
+      val env = EmitEnv(Env.empty, argTypeInfo.indices.filter(i => argTypeInfo(i).isInstanceOf[EmitParamType]).map(i => stepF.getEmitParam(cb, i + 1)))
       val optStream = EmitCode.fromI(stepF)(cb => EmitStream.produce(emitter, ir, cb, outerRegion, env, None))
       returnType = optStream.st.asInstanceOf[SStream].elementEmitType.storageType.setRequired(true)
 
@@ -218,7 +220,7 @@ object CompileIterator {
 
       val eosField = stepF.genFieldThisRef[Boolean]("eos")
 
-      val producer = optStream.pv.asStream.producer
+      val producer = optStream.pv.asStream.getProducer(cb.emb)
 
       val ret = cb.newLocal[Boolean]("stepf_ret")
       val Lreturn = CodeLabel()
@@ -227,7 +229,7 @@ object CompileIterator {
         optStream.toI(cb).get(cb) // handle missing, but bound stream producer above
 
         cb.assign(producer.elementRegion, eltRegionField)
-        producer.initialize(cb)
+        producer.initialize(cb, outerRegion)
         cb.assign(didSetup, true)
         cb.assign(eosField, false)
       })
@@ -261,14 +263,14 @@ object CompileIterator {
     val getMB = fb.newEmitMethod("loadAddress", FastIndexedSeq(), LongInfo)
     getMB.emit(elementAddress.load())
 
-    (returnType, fb.resultWithIndex(printWriter))
+    (returnType, fb.resultWithIndex(writeIRs, printWriter))
   }
 
   def forTableMapPartitions(
     ctx: ExecuteContext,
     typ0: PStruct, streamElementType: PType,
     ir: IR
-  ): (PType, (FS, Int, RVDContext, Long, streams.StreamArgType) => Iterator[java.lang.Long]) = {
+  ): (PType, (HailClassLoader, FS, Int, RVDContext, Long, NoBoxLongIterator) => Iterator[java.lang.Long]) = {
     assert(typ0.required)
     assert(streamElementType.required)
     val (eltPType, makeStepper) = compileStepper[TMPStepFunction](
@@ -276,10 +278,11 @@ object CompileIterator {
       Array[ParamType](
         CodeParamType(typeInfo[Object]),
         SingleCodeEmitParamType(true, PTypeReferenceSingleCodeType(typ0)),
-        SingleCodeEmitParamType(true, StreamSingleCodeType(true, streamElementType))),
+        SingleCodeEmitParamType(true, StreamSingleCodeType(true, streamElementType, true))),
+      false,
       None)
-    (eltPType, (fs, idx, consumerCtx, v0, part) => {
-      val stepper = makeStepper(fs, idx, consumerCtx.partitionRegion)
+    (eltPType, (theHailClassLoader, fs, idx, consumerCtx, v0, part) => {
+      val stepper = makeStepper(theHailClassLoader, fs, idx, consumerCtx.partitionRegion)
       stepper.setRegions(consumerCtx.partitionRegion, consumerCtx.region)
       new LongIteratorWrapper {
         val stepFunction: TMPStepFunction = stepper
@@ -293,7 +296,7 @@ object CompileIterator {
     ctx: ExecuteContext,
     ctxType: PStruct, bcValsType: PType,
     ir: IR
-  ): (PType, (FS, Int, RVDContext, Long, Long) => Iterator[java.lang.Long]) = {
+  ): (PType, (HailClassLoader, FS, Int, RVDContext, Long, Long) => Iterator[java.lang.Long]) = {
     assert(ctxType.required)
     assert(bcValsType.required)
     val (eltPType, makeStepper) = compileStepper[TableStageToRVDStepFunction](
@@ -302,9 +305,10 @@ object CompileIterator {
         CodeParamType(typeInfo[Object]),
         SingleCodeEmitParamType(true, PTypeReferenceSingleCodeType(ctxType)),
         SingleCodeEmitParamType(true, PTypeReferenceSingleCodeType(bcValsType))),
+      false,
       None)
-    (eltPType, (fs, idx, consumerCtx, v0, v1) => {
-      val stepper = makeStepper(fs, idx, consumerCtx.partitionRegion)
+    (eltPType, (theHailClassLoader, fs, idx, consumerCtx, v0, v1) => {
+      val stepper = makeStepper(theHailClassLoader, fs, idx, consumerCtx.partitionRegion)
       stepper.setRegions(consumerCtx.partitionRegion, consumerCtx.region)
       new LongIteratorWrapper {
         val stepFunction: TableStageToRVDStepFunction = stepper

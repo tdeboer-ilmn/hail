@@ -1366,8 +1366,8 @@ class MatrixTable(ExprContainer):
         -----
         The row key type of the matrix table must match the key type of `other`.
 
-        This method does not change the schema of the matrix table; it is a
-        filtering the matrix table to row keys not present in another table.
+        This method does not change the schema of the matrix table; it is
+        filtering the matrix table to row keys present in another table.
 
         To discard rows whose key is present in `other`, use
         :meth:`.anti_join_rows`.
@@ -1386,7 +1386,13 @@ class MatrixTable(ExprContainer):
         --------
         :meth:`.anti_join_rows`, :meth:`.filter_rows`, :meth:`.semi_join_cols`
         """
-        return self.filter_rows(hl.is_defined(other.index(self.row_key)))
+        if len(other.key) == 0:
+            raise ValueError('semi_join_rows: cannot join with a table with no key')
+        if len(other.key) > len(self.row_key) or any(t[0].dtype != t[1].dtype for t in zip(self.row_key.values(), other.key.values())):
+            raise ValueError('semi_join_rows: cannot join: table must have a key of the same type(s) and be the same length or shorter:'
+                             f'\n  MatrixTable row key: {", ".join(str(x.dtype) for x in self.row_key.values())}'
+                             f'\n            Table key: {", ".join(str(x.dtype) for x in other.key.values())}')
+        return self.filter_rows(hl.is_defined(other.index(*(self.row_key[i] for i in range(len(other.key))))))
 
     @typecheck_method(other=Table)
     def anti_join_rows(self, other: 'Table') -> 'MatrixTable':
@@ -1425,7 +1431,13 @@ class MatrixTable(ExprContainer):
         --------
         :meth:`.anti_join_rows`, :meth:`.filter_rows`, :meth:`.anti_join_cols`
         """
-        return self.filter_rows(hl.is_missing(other.index(self.row_key)))
+        if len(other.key) == 0:
+            raise ValueError('anti_join_rows: cannot join with a table with no key')
+        if len(other.key) > len(self.row_key) or any(t[0].dtype != t[1].dtype for t in zip(self.row_key.values(), other.key.values())):
+            raise ValueError('anti_join_rows: cannot join: table must have a key of the same type(s) and be the same length or shorter:'
+                             f'\n  MatrixTable row key: {", ".join(str(x.dtype) for x in self.row_key.values())}'
+                             f'\n            Table key: {", ".join(str(x.dtype) for x in other.key.values())}')
+        return self.filter_rows(hl.is_missing(other.index(*(self.row_key[i] for i in range(len(other.key))))))
 
     @typecheck_method(other=Table)
     def semi_join_cols(self, other: 'Table') -> 'MatrixTable':
@@ -1464,7 +1476,14 @@ class MatrixTable(ExprContainer):
         --------
         :meth:`.anti_join_cols`, :meth:`.filter_cols`, :meth:`.semi_join_rows`
         """
-        return self.filter_cols(hl.is_defined(other.index(self.col_key)))
+        if len(other.key) == 0:
+            raise ValueError('semi_join_cols: cannot join with a table with no key')
+        if len(other.key) > len(self.col_key) or any(t[0].dtype != t[1].dtype for t in zip(self.col_key.values(), other.key.values())):
+            raise ValueError('semi_join_cols: cannot join: table must have a key of the same type(s) and be the same length or shorter:'
+                             f'\n  MatrixTable col key: {", ".join(str(x.dtype) for x in self.col_key.values())}'
+                             f'\n            Table key: {", ".join(str(x.dtype) for x in other.key.values())}')
+
+        return self.filter_cols(hl.is_defined(other.index(*(self.col_key[i] for i in range(len(other.key))))))
 
     @typecheck_method(other=Table)
     def anti_join_cols(self, other: 'Table') -> 'MatrixTable':
@@ -1503,7 +1522,14 @@ class MatrixTable(ExprContainer):
         --------
         :meth:`.semi_join_cols`, :meth:`.filter_cols`, :meth:`.anti_join_rows`
         """
-        return self.filter_cols(hl.is_missing(other.index(self.col_key)))
+        if len(other.key) == 0:
+            raise ValueError('anti_join_cols: cannot join with a table with no key')
+        if len(other.key) > len(self.col_key) or any(t[0].dtype != t[1].dtype for t in zip(self.col_key.values(), other.key.values())):
+            raise ValueError('anti_join_cols: cannot join: table must have a key of the same type(s) and be the same length or shorter:'
+                             f'\n  MatrixTable col key: {", ".join(str(x.dtype) for x in self.col_key.values())}'
+                             f'\n            Table key: {", ".join(str(x.dtype) for x in other.key.values())}')
+
+        return self.filter_cols(hl.is_missing(other.index(*(self.col_key[i] for i in range(len(other.key))))))
 
     @typecheck_method(expr=expr_bool, keep=bool)
     def filter_rows(self, expr, keep: bool = True) -> 'MatrixTable':
@@ -1995,9 +2021,10 @@ class MatrixTable(ExprContainer):
         """
         base, _ = self._process_joins(expr)
         analyze('MatrixTable.aggregate_rows', expr, self._global_indices, {self._row_axis})
-        subst_query = ir.subst(expr._ir, {}, {'va': ir.Ref('row')})
+        rows_table = ir.MatrixRowsTable(base._mir)
+        subst_query = ir.subst(expr._ir, {}, {'va': ir.Ref('row', rows_table.typ.row_type)})
 
-        agg_ir = ir.TableAggregate(ir.MatrixRowsTable(base._mir), subst_query)
+        agg_ir = ir.TableAggregate(rows_table, subst_query)
         if _localize:
             return Env.backend().execute(ir.MakeTuple([agg_ir]))[0]
         else:
@@ -2045,9 +2072,10 @@ class MatrixTable(ExprContainer):
         """
         base, _ = self._process_joins(expr)
         analyze('MatrixTable.aggregate_cols', expr, self._global_indices, {self._col_axis})
-        subst_query = ir.subst(expr._ir, {}, {'sa': ir.Ref('row')})
+        cols_table = ir.MatrixColsTable(base._mir)
+        subst_query = ir.subst(expr._ir, {}, {'sa': ir.Ref('row', cols_table.typ.row_type)})
 
-        agg_ir = ir.TableAggregate(ir.MatrixColsTable(base._mir), subst_query)
+        agg_ir = ir.TableAggregate(cols_table, subst_query)
         if _localize:
             return Env.backend().execute(ir.MakeTuple([agg_ir]))[0]
         else:
@@ -2125,7 +2153,7 @@ class MatrixTable(ExprContainer):
 
         Returns
         -------
-        :class:MatrixTable`
+        :class:`.MatrixTable`
             Matrix table exploded row-wise for each element of `field_expr`.
         """
         if isinstance(field_expr, str):
@@ -2500,8 +2528,20 @@ class MatrixTable(ExprContainer):
 }"""
         if not _read_if_exists or not hl.hadoop_exists(f'{output}/_SUCCESS'):
             self.write(output=output, overwrite=overwrite, stage_locally=stage_locally, _codec_spec=_codec_spec)
-        return hl.read_matrix_table(output, _intervals=_intervals, _filter_intervals=_filter_intervals,
-                                    _drop_cols=_drop_cols, _drop_rows=_drop_rows)
+            _assert_type = self._type
+            _load_refs = False
+        else:
+            _assert_type = None
+            _load_refs = True
+        return hl.read_matrix_table(
+            output,
+            _intervals=_intervals,
+            _filter_intervals=_filter_intervals,
+            _drop_cols=_drop_cols,
+            _drop_rows=_drop_rows,
+            _assert_type=_assert_type,
+            _load_refs=_load_refs
+        )
 
     @typecheck_method(output=str,
                       overwrite=bool,
@@ -2972,7 +3012,7 @@ class MatrixTable(ExprContainer):
                                           col_exprs={col_uid: src_cols_indexed.index(*col_exprs)[col_uid]})
                 return left.annotate_entries(**{uid: left[row_uid][left[col_uid]]})
 
-            join_ir = ir.Join(ir.GetField(ir.TopLevelReference('g'), uid),
+            join_ir = ir.Join(ir.ProjectedTopLevelReference('g', uid, self.entry.dtype),
                               uids,
                               [*row_exprs, *col_exprs],
                               joiner)
@@ -2980,6 +3020,8 @@ class MatrixTable(ExprContainer):
 
     @typecheck_method(entries_field_name=str, cols_field_name=str)
     def _localize_entries(self, entries_field_name, cols_field_name) -> 'Table':
+        assert entries_field_name not in self.row
+        assert cols_field_name not in self.globals
         return Table(ir.CastMatrixToTable(
             self._mir, entries_field_name, cols_field_name))
 
@@ -3056,6 +3098,13 @@ class MatrixTable(ExprContainer):
         """
         entries = entries_array_field_name or Env.get_uid()
         cols = columns_array_field_name or Env.get_uid()
+        if entries in self.row:
+            raise ValueError(
+                f"'localize_entries': cannot localize entries to field {entries!r}, which is already a row field")
+        if cols in self.globals:
+            raise ValueError(
+                f"'localize_entries': cannot localize columns to field {cols!r}, which is already a global field")
+
         t = self._localize_entries(entries, cols)
         if entries_array_field_name is None:
             t = t.drop(entries)
@@ -3326,6 +3375,20 @@ class MatrixTable(ExprContainer):
         :class:`.MatrixTable`
             Repartitioned dataset.
         """
+        if hl.current_backend().requires_lowering:
+            tmp = hl.utils.new_temp_file()
+
+            if len(self.row_key) == 0:
+                uid = Env.get_uid()
+                tmp2 = hl.utils.new_temp_file()
+                self.checkpoint(tmp2)
+                ht = hl.read_matrix_table(tmp2).add_row_index(uid).key_rows_by(uid)
+                ht.checkpoint(tmp)
+                return hl.read_matrix_table(tmp, _n_partitions=n_partitions).drop(uid)
+            else:
+                # checkpoint rather than write to use fast codec
+                self.checkpoint(tmp)
+                return hl.read_matrix_table(tmp, _n_partitions=n_partitions)
 
         return MatrixTable(ir.MatrixRepartition(
             self._mir, n_partitions,
@@ -3360,7 +3423,6 @@ class MatrixTable(ExprContainer):
         :class:`.MatrixTable`
             Matrix table with at most `max_partitions` partitions.
         """
-
         return MatrixTable(ir.MatrixRepartition(
             self._mir, max_partitions, ir.RepartitionStrategy.NAIVE_COALESCE))
 
@@ -3625,8 +3687,9 @@ class MatrixTable(ExprContainer):
             return MatrixTable(ir.MatrixUnionRows(*[d._mir for d in datasets]))
 
     @typecheck_method(other=matrix_table_type,
-                      row_join_type=enumeration('inner', 'outer'))
-    def union_cols(self, other: 'MatrixTable', row_join_type='inner') -> 'MatrixTable':
+                      row_join_type=enumeration('inner', 'outer'),
+                      drop_right_row_fields=bool)
+    def union_cols(self, other: 'MatrixTable', row_join_type='inner', drop_right_row_fields=True) -> 'MatrixTable':
         """Take the union of dataset columns.
 
         Examples
@@ -3672,9 +3735,13 @@ class MatrixTable(ExprContainer):
         ----------
         other : :class:`.MatrixTable`
             Dataset to concatenate.
-        outer : bool
-            If `True`, perform an outer join on rows, otherwise perform an
-            inner join. Default `False`.
+        row_join_type : string
+            If `outer`, perform an outer join on rows; if 'inner', perform an
+            inner join. Default `inner`.
+        drop_right_row_fields : boolean
+            If true, non-key row fields of `other` are dropped. Otherwise,
+            non-key row fields in the two datasets must have distinct names,
+            and the result contains the union of the row fields.
 
         Returns
         -------
@@ -3697,6 +3764,9 @@ class MatrixTable(ExprContainer):
             raise ValueError(f'row key types differ:\n'
                              f'    left: {", ".join(self.row_key.dtype.values())}\n'
                              f'    right: {", ".join(other.row_key.dtype.values())}')
+
+        if drop_right_row_fields:
+            other = other.select_rows()
 
         return MatrixTable(ir.MatrixUnionCols(self._mir, other._mir, row_join_type))
 

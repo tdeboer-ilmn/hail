@@ -1,26 +1,24 @@
 package is.hail.io.bgen
 
-import is.hail.HailContext
-import is.hail.backend.{BroadcastValue, ExecuteContext}
-import is.hail.backend.spark.SparkBackend
+import is.hail.backend.ExecuteContext
 import is.hail.expr.ir
-import is.hail.expr.ir.{IRParser, IRParserEnvironment, Interpret, MatrixHybridReader, Pretty, TableIR, TableRead, TableValue}
-import is.hail.types._
-import is.hail.types.physical.{PCanonicalStruct, PStruct, PType}
-import is.hail.types.virtual._
+import is.hail.expr.ir.{IRParser, IRParserEnvironment, Interpret, MatrixHybridReader, MatrixReader, Pretty, TableIR, TableValue}
 import is.hail.io._
 import is.hail.io.fs.{FS, FileStatus}
 import is.hail.io.index.{IndexReader, IndexReaderBuilder}
 import is.hail.io.vcf.LoadVCF
 import is.hail.rvd.{RVD, RVDPartitioner, RVDType}
 import is.hail.sparkextras.RepartitionedOrderedRDD2
+import is.hail.types._
+import is.hail.types.physical.{PInt64Required, PStruct, PType}
+import is.hail.types.virtual._
 import is.hail.utils._
 import is.hail.variant._
 import org.apache.spark.Partition
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.json4s.JsonAST.{JArray, JInt, JNull, JString}
-import org.json4s.{CustomSerializer, DefaultFormats, Extraction, Formats, JObject, JValue}
+import org.json4s.{DefaultFormats, Formats, JObject, JValue}
 
 import scala.io.Source
 
@@ -161,7 +159,7 @@ object LoadBgen {
 
         if (fs.isDir(file))
           fs.listStatus(file)
-            .filter(status => ".*part-[0-9]+".r.matches(status.getPath.toString))
+            .filter(status => ".*part-[0-9]+(-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?".r.matches(status.getPath.toString))
         else
           Array(status)
       }
@@ -194,7 +192,7 @@ object LoadBgen {
         val (intPType: PStruct, intDec) = internalNodeCodec.buildDecoder(ctx, internalNodeCodec.encodedVirtualType)
         IndexReaderBuilder.withDecoders(leafDec, intDec, BgenSettings.indexKeyType(rg), BgenSettings.indexAnnotationType, leafPType, intPType)
       }
-      using(indexReaderBuilder(fs, indexFile, 8, ctx.r.pool)) { index =>
+      using(indexReaderBuilder(ctx.theHailClassLoader, fs, indexFile, 8, ctx.r.pool)) { index =>
         val attributes = index.attributes
         val rg = Option(attributes("reference_genome")).map(name => ReferenceGenome.getReference(name.asInstanceOf[String]))
         val skipInvalidLoci = attributes("skip_invalid_loci").asInstanceOf[Boolean]
@@ -280,10 +278,11 @@ object LoadBgen {
 }
 
 object MatrixBGENReader {
-  def fullMatrixType(rg: Option[ReferenceGenome]): MatrixType = {
+  def fullMatrixTypeWithoutUIDs(rg: Option[ReferenceGenome]): MatrixType = {
     MatrixType(
       globalType = TStruct.empty,
-      colType = TStruct("s" -> TString),
+      colType = TStruct(
+        "s" -> TString),
       colKey = Array("s"),
       rowType = TStruct(
         "locus" -> TLocus.schemaFromRG(rg),
@@ -297,6 +296,14 @@ object MatrixBGENReader {
         "GT" -> TCall,
         "GP" -> TArray(TFloat64),
         "dosage" -> TFloat64))
+  }
+
+  def fullMatrixType(rg: Option[ReferenceGenome]): MatrixType = {
+    val mt = fullMatrixTypeWithoutUIDs(rg)
+    val newRowType = mt.rowType.appendKey(MatrixReader.rowUIDFieldName, TInt64)
+    val newColType = mt.colType.appendKey(MatrixReader.colUIDFieldName, TInt64)
+
+    mt.copy(rowType = newRowType, colType = newColType)
   }
 
   def fromJValue(env: IRParserEnvironment, jv: JValue): MatrixBGENReader = {
@@ -354,7 +361,7 @@ object MatrixBGENReader {
 
     val referenceGenome = LoadBgen.getReferenceGenome(fileMetadata)
 
-    val fullMatrixType: MatrixType = MatrixBGENReader.fullMatrixType(referenceGenome)
+    val fullMatrixType: MatrixType = MatrixBGENReader.fullMatrixTypeWithoutUIDs(referenceGenome)
 
     val (indexKeyType, indexAnnotationType) = LoadBgen.getIndexTypes(fileMetadata)
 
@@ -421,7 +428,11 @@ case class MatrixBGENReaderParameters(
       }.toList),
       "nPartitions" -> nPartitions.map(JInt(_)).getOrElse(JNull),
       "blockSizeInMB" -> blockSizeInMB.map(JInt(_)).getOrElse(JNull),
-      "includedVariants" -> includedVariants.map(t => JString(Pretty(t))).getOrElse(JNull)))
+      // FIXME: feels like a hack that Pretty needs execute context
+      // FIXME: feels like a hack that I use null here
+      // FIXME: feels like a hack that toJValue uses Pretty?
+      // Q: can we parse SSA'ed pretty table IR?
+      "includedVariants" -> includedVariants.map(t => JString(Pretty(null, t))).getOrElse(JNull)))
   }
 }
 
@@ -429,7 +440,7 @@ class MatrixBGENReader(
   val params: MatrixBGENReaderParameters,
   allFiles: Array[String],
   referenceGenome: Option[ReferenceGenome],
-  val fullMatrixType: MatrixType,
+  val fullMatrixTypeWithoutUIDs: MatrixType,
   indexKeyType: Type,
   indexAnnotationType: Type,
   sampleIds: Array[String],
@@ -437,6 +448,10 @@ class MatrixBGENReader(
   partitions: Array[Partition],
   partitioner: RVDPartitioner,
   variants: RDD[Row]) extends MatrixHybridReader {
+
+  def rowUIDType = TInt64
+  def colUIDType = TInt64
+
   def pathsUsed: Seq[String] = allFiles
 
   private val nSamples = sampleIds.length
@@ -458,22 +473,26 @@ class MatrixBGENReader(
     _settings
   }
 
-  def rowAndGlobalPTypes(context: ExecuteContext, requestedType: TableType): (PStruct, PStruct) = {
+  override def concreteRowRequiredness(ctx: ExecuteContext, requestedType: TableType): VirtualTypeWithReq = {
     val settings = getSettings(requestedType)
-    settings.rowPType -> PType.canonical(requestedType.globalType, required = true).asInstanceOf[PStruct]
+    VirtualTypeWithReq(settings.rowPType)
   }
 
-  def apply(tr: TableRead, ctx: ExecuteContext): TableValue = {
-    val requestedType = tr.typ
+  override def uidRequiredness: VirtualTypeWithReq =
+    VirtualTypeWithReq(PInt64Required)
 
+  override def globalRequiredness(ctx: ExecuteContext, requestedType: TableType): VirtualTypeWithReq =
+    VirtualTypeWithReq(PType.canonical(requestedType.globalType, required = true))
+
+  override def apply(ctx: ExecuteContext, requestedType: TableType, dropRows: Boolean): TableValue = {
     assert(requestedType.keyType == indexKeyType)
 
     val settings = getSettings(requestedType)
 
-    val rvdType = RVDType(coerce[PStruct](settings.rowPType.subsetTo(requestedType.rowType)),
+    val rvdType = RVDType(tcoerce[PStruct](settings.rowPType.subsetTo(requestedType.rowType)),
       fullType.key.take(requestedType.key.length))
 
-    val rvd = if (tr.dropRows)
+    val rvd = if (dropRows)
       RVD.empty(rvdType)
     else
       new RVD(
@@ -483,7 +502,7 @@ class MatrixBGENReader(
 
     val globalValue = makeGlobalValue(ctx, requestedType.globalType, sampleIds.map(Row(_)))
 
-    TableValue(ctx, tr.typ, globalValue, rvd)
+    TableValue(ctx, requestedType, globalValue, rvd)
   }
 
   override def toJValue: JValue = params.toJValue

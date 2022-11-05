@@ -55,13 +55,13 @@ class StaticField[T: TypeInfo](classBuilder: ClassBuilder[_], val name: String) 
 class ClassesBytes(classesBytes: Array[(String, Array[Byte])]) extends Serializable {
   @transient @volatile var loaded: Boolean = false
 
-  def load(): Unit = {
+  def load(hcl: HailClassLoader): Unit = {
     if (!loaded) {
       synchronized {
         if (!loaded) {
           classesBytes.foreach { case (n, bytes) =>
             try {
-              HailClassLoader.loadOrDefineClass(n, bytes)
+              hcl.loadOrDefineClass(n, bytes)
             } catch {
               case e: Exception =>
                 val buffer = new ByteArrayOutputStream()
@@ -95,7 +95,7 @@ trait WrappedModuleBuilder {
 
   def genClass[C](baseName: String)(implicit cti: TypeInfo[C]): ClassBuilder[C] = modb.genClass[C](baseName)
 
-  def classesBytes(print: Option[PrintWriter] = None): ClassesBytes = modb.classesBytes(print)
+  def classesBytes(writeIRs: Boolean, print: Option[PrintWriter] = None): ClassesBytes = modb.classesBytes(writeIRs, print)
 }
 
 class ModuleBuilder() {
@@ -143,16 +143,53 @@ class ModuleBuilder() {
 
   var classesBytes: ClassesBytes = _
 
-  def classesBytes(print: Option[PrintWriter] = None): ClassesBytes = {
+  def classesBytes(writeIRs: Boolean, print: Option[PrintWriter] = None): ClassesBytes = {
     if (classesBytes == null) {
       classesBytes = new ClassesBytes(
         classes
           .iterator
-          .flatMap(c => c.classBytes(print))
+          .flatMap(c => c.classBytes(writeIRs, print))
           .toArray)
 
     }
     classesBytes
+  }
+
+  private var staticFieldWrapperIdx: Int = 0
+  private val maxFieldsOrMethodsOnClass: Int = 512
+  private var nStaticFieldsOnThisClass: Int = maxFieldsOrMethodsOnClass
+  private var staticCls: ClassBuilder[_] = null
+
+  private def incrStaticClassSize(n: Int = 1): Unit = {
+    if (nStaticFieldsOnThisClass + n >= maxFieldsOrMethodsOnClass) {
+      nStaticFieldsOnThisClass = n
+      staticFieldWrapperIdx += 1
+      staticCls = genClass[Unit](s"staticWrapperClass_$staticFieldWrapperIdx")
+    }
+  }
+
+  def genStaticField[T: TypeInfo](name: String = null): StaticFieldRef[T] = {
+    incrStaticClassSize()
+    val fd = staticCls.newStaticField[T](genName("f", name))
+    new StaticFieldRef[T](fd)
+  }
+
+  var _objectsField: Settable[Array[AnyRef]] = _
+  var _objects: BoxedArrayBuilder[AnyRef] = _
+
+  def setObjects(cb: EmitCodeBuilder, objects: Code[Array[AnyRef]]): Unit = {
+    cb.assign(_objectsField, objects)
+  }
+
+  def getObject[T <: AnyRef : TypeInfo](obj: T): Code[T] = {
+    if (_objectsField == null) {
+      _objectsField = genStaticField[Array[AnyRef]]()
+      _objects = new BoxedArrayBuilder[AnyRef]()
+    }
+
+    val i = _objects.size
+    _objects += obj
+    Code.checkcast[T](toCodeArray(_objectsField).apply(i))
   }
 }
 
@@ -203,7 +240,7 @@ trait WrappedClassBuilder[C] extends WrappedModuleBuilder {
   )(body: MethodBuilder[C] => Unit): MethodBuilder[C] =
     cb.getOrGenMethod(baseName, key, argsInfo, returnInfo)(body)
 
-  def result(print: Option[PrintWriter] = None): () => C = cb.result(print)
+  def result(writeIRs: Boolean, print: Option[PrintWriter] = None): (HailClassLoader) => C = cb.result(writeIRs, print)
 
   def _this: Value[C] = cb._this
 
@@ -241,7 +278,8 @@ class ClassBuilder[C](
 
   val lazyFieldMemo: mutable.Map[Any, Value[_]] = mutable.Map.empty
 
-  val lInit = lclass.newMethod("<init>", FastIndexedSeq(), UnitInfo)
+  val lInitBuilder = new MethodBuilder[C](this, "<init>", FastIndexedSeq(), UnitInfo)
+  val lInit = lInitBuilder.lmethod
 
   var initBody: Code[Unit] = {
     val L = new lir.Block()
@@ -263,6 +301,11 @@ class ClassBuilder[C](
 
   def emitInit(c: Code[Unit]): Unit = {
     initBody = Code(initBody, c)
+  }
+
+  def emitInitI(f: CodeBuilder => Unit): Unit = {
+    val body = CodeBuilder.scopedVoid(lInitBuilder)(f)
+    emitInit(body)
   }
 
   def emitClinit(c: Code[Unit]): Unit = {
@@ -334,7 +377,7 @@ class ClassBuilder[C](
     }
   }
 
-  def classBytes(print: Option[PrintWriter] = None): Array[(String, Array[Byte])] = {
+  def classBytes(writeIRs: Boolean, print: Option[PrintWriter] = None): Array[(String, Array[Byte])] = {
     assert(initBody.start != null)
     lInit.setEntry(initBody.start)
 
@@ -348,30 +391,30 @@ class ClassBuilder[C](
         lClinit.setEntry(nbody.start)
     }
 
-    lclass.asBytes(print)
+    lclass.asBytes(writeIRs, print)
   }
 
-  def result(print: Option[PrintWriter] = None): () => C = {
+  def result(writeIRs: Boolean, print: Option[PrintWriter] = None): (HailClassLoader) => C = {
     val n = className.replace("/", ".")
-    val classesBytes = modb.classesBytes()
+    val classesBytes = modb.classesBytes(writeIRs)
 
     assert(TaskContext.get() == null,
       "FunctionBuilder emission should happen on master, but happened on worker")
 
-    new (() => C) with java.io.Serializable {
+    new ((HailClassLoader) => C) with java.io.Serializable {
       @transient @volatile private var theClass: Class[_] = null
 
-      def apply(): C = {
+      def apply(hcl: HailClassLoader): C = {
         if (theClass == null) {
           this.synchronized {
             if (theClass == null) {
-              classesBytes.load()
-              theClass = loadClass(n)
+              classesBytes.load(hcl)
+              theClass = loadClass(hcl, n)
             }
           }
         }
 
-        theClass.newInstance().asInstanceOf[C]
+        theClass.getDeclaredConstructor().newInstance().asInstanceOf[C]
       }
     }
   }
@@ -482,6 +525,10 @@ class MethodBuilder[C](
   val returnTypeInfo: TypeInfo[_],
   val isStatic: Boolean = false
 ) extends WrappedClassBuilder[C] {
+  require(parameterTypeInfo.length + isStatic.toInt <= 255,
+    s"""Invalid method, methods may have at most 255 arguments, found ${parameterTypeInfo.length + isStatic.toInt}
+       |Return Type Info: $returnTypeInfo
+       |Parameter Type Info: ${parameterTypeInfo.mkString}""".stripMargin)
   // very long method names, repeated hundreds of thousands of times can cause memory issues.
   // If necessary to find the name of a method precisely, this can be set to around the constant
   // limit of 65535 characters, but usually, this can be much smaller.

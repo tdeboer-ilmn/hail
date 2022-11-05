@@ -1,9 +1,10 @@
 package is.hail.backend
 
+import is.hail.asm4s._
 import is.hail.backend.spark.SparkBackend
 import is.hail.expr.ir.lowering.{TableStage, TableStageDependency}
 import is.hail.expr.ir.{IR, SortField}
-import is.hail.io.fs.FS
+import is.hail.io.fs._
 import is.hail.linalg.BlockMatrix
 import is.hail.types._
 import is.hail.utils._
@@ -26,6 +27,8 @@ abstract class BackendContext
 abstract class Backend {
   def defaultParallelism: Int
 
+  def canExecuteParallelTasksOnDriver: Boolean = true
+
   def broadcast[T: ClassTag](value: T): BroadcastValue[T]
 
   def persist(backendContext: BackendContext, id: String, value: BlockMatrix, storageLevel: String): Unit
@@ -36,12 +39,21 @@ abstract class Backend {
 
   def getPersistedBlockMatrixType(backendContext: BackendContext, id: String): BlockMatrixType
 
-  def parallelizeAndComputeWithIndex(backendContext: BackendContext, fs: FS, collection: Array[Array[Byte]], dependency: Option[TableStageDependency] = None)(f: (Array[Byte], HailTaskContext, FS) => Array[Byte]): Array[Array[Byte]]
+  def parallelizeAndComputeWithIndex(
+    backendContext: BackendContext,
+    fs: FS,
+    collection: Array[Array[Byte]],
+    dependency: Option[TableStageDependency] = None
+  )(
+    f: (Array[Byte], HailTaskContext, HailClassLoader, FS) => Array[Byte]
+  ): Array[Array[Byte]]
 
   def stop(): Unit
 
   def asSpark(op: String): SparkBackend =
     fatal(s"${ getClass.getSimpleName }: $op requires SparkBackend")
+
+  def shouldCacheQueryInfo: Boolean = true
 
   def lowerDistributedSort(
     ctx: ExecuteContext,

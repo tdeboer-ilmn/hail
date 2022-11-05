@@ -29,14 +29,13 @@ class Tests(unittest.TestCase):
         self.assertEqual(t1.is_female, True)
         self.assertEqual(t1.is_female, True)
         self.assertEqual(t1.is_male, False)
-        
+
         self.assertEqual(t1.is_complete(), False)
         self.assertEqual(t4.is_complete(), True)
         self.assertEqual(t5.is_complete(), False)
         self.assertEqual(t6.is_complete(), True)
 
 
-    @skip_when_service_backend('gcsfs does not support crc32 hashes and sample.fam intermittent only has a crc32 hash')
     def test_pedigree(self):
         ped = Pedigree.read(resource('sample.fam'))
         ped.write('/tmp/sample_out.fam')

@@ -5,20 +5,20 @@ from .ir import MatrixWrite, MatrixMultiWrite, BlockMatrixWrite, \
     BlockMatrixMultiWrite, TableToValueApply, \
     MatrixToValueApply, BlockMatrixToValueApply, BlockMatrixCollect, \
     Literal, LiftMeOut, Join, JavaIR, I32, I64, F32, F64, Str, FalseIR, TrueIR, \
-    Void, Cast, NA, IsNA, If, Coalesce, Let, AggLet, Ref, TopLevelReference, \
+    Void, Cast, NA, IsNA, If, Coalesce, Let, AggLet, Ref, TopLevelReference, ProjectedTopLevelReference, SelectedTopLevelReference, \
     TailLoop, Recur, ApplyBinaryPrimOp, ApplyUnaryPrimOp, ApplyComparisonOp, \
     MakeArray, ArrayRef, ArraySlice, ArrayLen, ArrayZeros, StreamIota, StreamRange, StreamGrouped, MakeNDArray, \
     NDArrayShape, NDArrayReshape, NDArrayMap, NDArrayMap2, NDArrayRef, NDArraySlice, NDArraySVD, \
     NDArrayReindex, NDArrayAgg, NDArrayMatMul, NDArrayQR, NDArrayInv, NDArrayConcat, NDArrayWrite, \
-    ArraySort, ToSet, ToDict, ToArray, CastToArray, ToStream, \
-    LowerBoundOnOrderedCollection, GroupByKey, StreamMap, StreamZip, \
+    ArraySort, ToSet, ToDict, toArray, ToArray, CastToArray, toStream, ToStream, \
+    LowerBoundOnOrderedCollection, GroupByKey, StreamTake, StreamMap, StreamZip, \
     StreamFilter, StreamFlatMap, StreamFold, StreamScan, \
     StreamJoinRightDistinct, StreamFor, AggFilter, AggExplode, AggGroupBy, \
     AggArrayPerElement, BaseApplyAggOp, ApplyAggOp, ApplyScanOp, AggFold, Begin, \
     MakeStruct, SelectFields, InsertFields, GetField, MakeTuple, \
-    GetTupleElement, Die, ConsoleLog, Apply, ApplySeeded, TableCount, TableGetGlobals, \
-    TableCollect, TableAggregate, MatrixCount, MatrixAggregate, TableWrite, \
-    udf, subst, clear_session_functions
+    GetTupleElement, Die, ConsoleLog, Apply, ApplySeeded, RNGStateLiteral, RNGSplit,\
+    TableCount, TableGetGlobals, TableCollect, TableAggregate, MatrixCount,\
+    MatrixAggregate, TableWrite, udf, subst, clear_session_functions, get_static_split_uid
 from .register_functions import register_functions
 from .register_aggregators import register_aggregators
 from .table_ir import MatrixRowsTable, TableJoin, TableLeftJoinRightDistinct, \
@@ -43,18 +43,18 @@ from .blockmatrix_ir import BlockMatrixRead, BlockMatrixMap, BlockMatrixMap2, \
     BlockMatrixDot, BlockMatrixBroadcast, BlockMatrixAgg, BlockMatrixFilter, \
     BlockMatrixDensify, BlockMatrixSparsifier, BandSparsifier, \
     RowIntervalSparsifier, RectangleSparsifier, PerBlockSparsifier, BlockMatrixSparsify, \
-    BlockMatrixSlice, ValueToBlockMatrix, BlockMatrixRandom, JavaBlockMatrix, \
+    BlockMatrixSlice, ValueToBlockMatrix, BlockMatrixRandom, \
     tensor_shape_to_matrix_shape
-from .utils import filter_predicate_with_keep, make_filter_and_replace
+from .utils import filter_predicate_with_keep, make_filter_and_replace, finalize_randomness
 from .matrix_reader import MatrixReader, MatrixNativeReader, MatrixRangeReader, \
-    MatrixVCFReader, MatrixBGENReader, TextMatrixReader, MatrixPLINKReader
+    MatrixVCFReader, MatrixBGENReader, MatrixPLINKReader
 from .table_reader import AvroTableReader, TableReader, TableNativeReader, \
     TextTableReader, TableFromBlockMatrixNativeReader, StringTableReader
 from .blockmatrix_reader import BlockMatrixReader, BlockMatrixNativeReader, \
     BlockMatrixBinaryReader, BlockMatrixPersistReader
 from .matrix_writer import MatrixWriter, MatrixNativeWriter, MatrixVCFWriter, \
     MatrixGENWriter, MatrixBGENWriter, MatrixPLINKWriter, MatrixNativeMultiWriter, MatrixBlockMatrixWriter
-from .table_writer import TableWriter, TableNativeWriter, TableTextWriter
+from .table_writer import (TableWriter, TableNativeWriter, TableTextWriter, TableNativeFanoutWriter)
 from .blockmatrix_writer import BlockMatrixWriter, BlockMatrixNativeWriter, \
     BlockMatrixBinaryWriter, BlockMatrixRectanglesWriter, \
     BlockMatrixMultiWriter, BlockMatrixBinaryMultiWriter, \
@@ -74,6 +74,7 @@ __all__ = [
     'register_aggregators',
     'filter_predicate_with_keep',
     'make_filter_and_replace',
+    'finalize_randomness',
     'Renderable',
     'RenderableStr',
     'ParensRenderer',
@@ -103,7 +104,6 @@ __all__ = [
     'BlockMatrixSlice',
     'ValueToBlockMatrix',
     'BlockMatrixRandom',
-    'JavaBlockMatrix',
     'tensor_shape_to_matrix_shape',
     'BlockMatrixReader',
     'BlockMatrixNativeReader',
@@ -135,6 +135,8 @@ __all__ = [
     'AggLet',
     'Ref',
     'TopLevelReference',
+    'ProjectedTopLevelReference',
+    'SelectedTopLevelReference',
     'TailLoop',
     'Recur',
     'ApplyBinaryPrimOp',
@@ -165,11 +167,14 @@ __all__ = [
     'ArraySort',
     'ToSet',
     'ToDict',
+    'toArray',
     'ToArray',
     'CastToArray',
+    'toStream',
     'ToStream',
     'LowerBoundOnOrderedCollection',
     'GroupByKey',
+    'StreamTake',
     'StreamMap',
     'StreamZip',
     'StreamFilter',
@@ -198,6 +203,8 @@ __all__ = [
     'ConsoleLog',
     'Apply',
     'ApplySeeded',
+    'RNGStateLiteral',
+    'RNGSplit',
     'TableCount',
     'TableGetGlobals',
     'TableCollect',
@@ -208,6 +215,7 @@ __all__ = [
     'udf',
     'subst',
     'clear_session_functions',
+    'get_static_split_uid',
     'MatrixWrite',
     'MatrixMultiWrite',
     'BlockMatrixWrite',
@@ -255,7 +263,6 @@ __all__ = [
     'MatrixRangeReader',
     'MatrixVCFReader',
     'MatrixBGENReader',
-    'TextMatrixReader',
     'MatrixPLINKReader',
     'MatrixWriter',
     'MatrixNativeWriter',
@@ -306,5 +313,6 @@ __all__ = [
     'AvroTableReader',
     'TableWriter',
     'TableNativeWriter',
-    'TableTextWriter'
+    'TableTextWriter',
+    'TableNativeFanoutWriter'
 ]

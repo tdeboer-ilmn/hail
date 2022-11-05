@@ -1,13 +1,11 @@
-import asyncio
 import os
 from timeit import default_timer as timer
 import unittest
 import pytest
 from decorator import decorator
 
-from hail.utils.java import Env
+from hail.utils.java import Env, choose_backend
 import hail as hl
-from hail.backend.local_backend import LocalBackend
 
 _initialized = False
 
@@ -15,7 +13,7 @@ _initialized = False
 def startTestHailContext():
     global _initialized
     if not _initialized:
-        backend_name = os.environ.get('HAIL_QUERY_BACKEND', 'spark')
+        backend_name = choose_backend()
         if backend_name == 'spark':
             hl.init(master='local[2]', min_block_size=0, quiet=True)
         else:
@@ -119,23 +117,35 @@ def create_all_values_matrix_table():
 def create_all_values_datasets():
     return (create_all_values_table(), create_all_values_matrix_table())
 
-def skip_unless_spark_backend():
+def skip_unless_spark_backend(reason='requires Spark'):
     from hail.backend.spark_backend import SparkBackend
     @decorator
     def wrapper(func, *args, **kwargs):
         if isinstance(hl.utils.java.Env.backend(), SparkBackend):
             return func(*args, **kwargs)
         else:
-            raise unittest.SkipTest('requires Spark')
+            raise unittest.SkipTest(reason)
 
     return wrapper
 
-def skip_when_service_backend(message='does not work on ServiceBackend'):
+def skip_when_service_backend(reason='skipping for Service Backend'):
     from hail.backend.service_backend import ServiceBackend
     @decorator
     def wrapper(func, *args, **kwargs):
         if isinstance(hl.utils.java.Env.backend(), ServiceBackend):
-            raise unittest.SkipTest(message)
+            raise unittest.SkipTest(reason)
+        else:
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+def skip_unless_service_backend(reason='only relevant to service backend'):
+    from hail.backend.service_backend import ServiceBackend
+    @decorator
+    def wrapper(func, *args, **kwargs):
+        if not isinstance(hl.utils.java.Env.backend(), ServiceBackend):
+            raise unittest.SkipTest(reason)
         else:
             return func(*args, **kwargs)
 
@@ -143,22 +153,19 @@ def skip_when_service_backend(message='does not work on ServiceBackend'):
 
 
 fails_local_backend = pytest.mark.xfail(
-    os.environ.get('HAIL_QUERY_BACKEND') == 'local',
+    choose_backend() == 'local',
     reason="doesn't yet work on local backend",
     strict=True)
 
 
 fails_service_backend = pytest.mark.xfail(
-    os.environ.get('HAIL_QUERY_BACKEND') == 'service',
+    choose_backend() == 'batch',
     reason="doesn't yet work on service backend",
     strict=True)
 
-def check_spark():
-    backend_name = os.environ.get('HAIL_QUERY_BACKEND', 'spark')
-    return backend_name == 'spark'
 
 fails_spark_backend = pytest.mark.xfail(
-    check_spark(),
+    choose_backend() == 'spark',
     reason="doesn't yet work on spark backend",
     strict=True)
 
@@ -191,7 +198,7 @@ def with_flags(*flags):
 def lower_only():
     @decorator
     def wrapper(func, *args, **kwargs):
-        flags = hl._get_flags()
+        flags = hl._get_flags('lower', 'lower_only')
         prev_lower = flags.get('lower')
         prev_lower_only = flags.get('lower_only')
 

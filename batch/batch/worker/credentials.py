@@ -3,12 +3,29 @@ from typing import Dict
 
 
 class CloudUserCredentials(abc.ABC):
-    secret_name: str
-    secret_data: Dict[str, bytes]
-    file_name: str
-    cloud_env_name: str
-    hail_env_name: str
-    username: str
+    @property
+    def secret_name(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def secret_data(self) -> Dict[str, bytes]:
+        raise NotImplementedError
+
+    @property
+    def file_name(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def cloud_env_name(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def hail_env_name(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def username(self) -> str:
+        raise NotImplementedError
 
     @property
     def password(self) -> str:
@@ -17,3 +34,7 @@ class CloudUserCredentials(abc.ABC):
     @property
     def mount_path(self):
         return f'/{self.secret_name}/{self.file_name}'
+
+    @abc.abstractmethod
+    def cloudfuse_credentials(self, fuse_config: dict) -> str:
+        raise NotImplementedError

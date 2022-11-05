@@ -1,25 +1,26 @@
-from typing import Dict
 import base64
 import json
 import logging
 import os
 from shlex import quote as shq
+from typing import Dict
 
 from gear.cloud_config import get_global_config
 
-from ....batch_configuration import (DOCKER_ROOT_IMAGE, DOCKER_PREFIX, DEFAULT_NAMESPACE,
-                                     INTERNAL_GATEWAY_IP)
+from ....batch_configuration import DEFAULT_NAMESPACE, DOCKER_PREFIX, DOCKER_ROOT_IMAGE, INTERNAL_GATEWAY_IP
 from ....file_store import FileStore
 from ....instance_config import InstanceConfig
 from ...resource_utils import unreserved_worker_data_disk_size_gib
-
+from ...utils import ACCEPTABLE_QUERY_JAR_URL_PREFIX
 from ..resource_utils import gcp_machine_type_to_worker_type_and_cores
 
 log = logging.getLogger('create_instance')
 
 BATCH_WORKER_IMAGE = os.environ['HAIL_BATCH_WORKER_IMAGE']
 
+
 log.info(f'BATCH_WORKER_IMAGE {BATCH_WORKER_IMAGE}')
+log.info(f'ACCEPTABLE_QUERY_JAR_URL_PREFIX {ACCEPTABLE_QUERY_JAR_URL_PREFIX}')
 
 
 def create_vm_config(
@@ -72,6 +73,23 @@ def create_vm_config(
 
     assert instance_config.is_valid_configuration(resource_rates.keys())
 
+    def scheduling() -> dict:
+        result = {
+            'automaticRestart': False,
+            'onHostMaintenance': 'TERMINATE',
+            'preemptible': preemptible,
+        }
+
+        if preemptible:
+            result.update(
+                {
+                    'provisioningModel': 'SPOT',
+                    'instanceTerminationAction': 'DELETE',
+                }
+            )
+
+        return result
+
     return {
         'name': machine_name,
         'machineType': f'projects/{project}/zones/{zone}/machineTypes/{machine_type}',
@@ -95,7 +113,7 @@ def create_vm_config(
                 'accessConfigs': [{'type': 'ONE_TO_ONE_NAT', 'name': 'external-nat'}],
             }
         ],
-        'scheduling': {'automaticRestart': False, 'onHostMaintenance': "TERMINATE", 'preemptible': preemptible},
+        'scheduling': scheduling(),
         'serviceAccounts': [
             {
                 'email': f'batch2-agent@{project}.iam.gserviceaccount.com',
@@ -135,86 +153,11 @@ nohup /bin/bash run.sh >run.log 2>&1 &
 #!/bin/bash
 set -x
 
-WORKER_DATA_DISK_NAME="{worker_data_disk_name}"
-UNRESERVED_WORKER_DATA_DISK_SIZE_GB="{unreserved_disk_storage_gb}"
-
-# format worker data disk
-sudo mkfs.xfs -m reflink=1 -n ftype=1 /dev/$WORKER_DATA_DISK_NAME
-sudo mkdir -p /mnt/disks/$WORKER_DATA_DISK_NAME
-sudo mount -o prjquota /dev/$WORKER_DATA_DISK_NAME /mnt/disks/$WORKER_DATA_DISK_NAME
-sudo chmod a+w /mnt/disks/$WORKER_DATA_DISK_NAME
-XFS_DEVICE=$(xfs_info /mnt/disks/$WORKER_DATA_DISK_NAME | head -n 1 | awk '{{ print $1 }}' | awk  'BEGIN {{ FS = "=" }}; {{ print $2 }}')
-
-# reconfigure docker to use local SSD
-sudo service docker stop
-sudo mv /var/lib/docker /mnt/disks/$WORKER_DATA_DISK_NAME/docker
-sudo ln -s /mnt/disks/$WORKER_DATA_DISK_NAME/docker /var/lib/docker
-sudo service docker start
-
-# reconfigure /batch and /logs and /gcsfuse to use local SSD
-sudo mkdir -p /mnt/disks/$WORKER_DATA_DISK_NAME/batch/
-sudo ln -s /mnt/disks/$WORKER_DATA_DISK_NAME/batch /batch
-
-sudo mkdir -p /mnt/disks/$WORKER_DATA_DISK_NAME/logs/
-sudo ln -s /mnt/disks/$WORKER_DATA_DISK_NAME/logs /logs
-
-sudo mkdir -p /mnt/disks/$WORKER_DATA_DISK_NAME/gcsfuse/
-sudo ln -s /mnt/disks/$WORKER_DATA_DISK_NAME/gcsfuse /gcsfuse
-
-sudo mkdir -p /etc/netns
-
-CORES=$(nproc)
-NAMESPACE=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/namespace")
-ACTIVATION_TOKEN=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/activation_token")
-IP_ADDRESS=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip")
-PROJECT=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/project/project-id")
-
-BATCH_LOGS_STORAGE_URI=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/batch_logs_storage_uri")
-INSTANCE_ID=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/instance_id")
-INSTANCE_CONFIG=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/instance_config")
-MAX_IDLE_TIME_MSECS=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/max_idle_time_msecs")
-NAME=$(curl -s http://metadata.google.internal/computeMetadata/v1/instance/name -H 'Metadata-Flavor: Google')
-ZONE=$(curl -s http://metadata.google.internal/computeMetadata/v1/instance/zone -H 'Metadata-Flavor: Google')
-
-BATCH_WORKER_IMAGE=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/batch_worker_image")
-DOCKER_ROOT_IMAGE=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/docker_root_image")
-DOCKER_PREFIX=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/docker_prefix")
-
-INTERNAL_GATEWAY_IP=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/internal_ip")
-
-# private job network = 10.0.0.0/16
-# public job network = 10.1.0.0/16
-# [all networks] Rewrite traffic coming from containers to masquerade as the host
-iptables --table nat --append POSTROUTING --source 10.0.0.0/15 --jump MASQUERADE
-
-# [public]
-# Block public traffic to the metadata server
-iptables --append FORWARD --source 10.1.0.0/16 --destination 169.254.169.254 --jump DROP
-# But allow the internal gateway
-iptables --append FORWARD --destination $INTERNAL_GATEWAY_IP --jump ACCEPT
-# And this worker
-iptables --append FORWARD --destination $IP_ADDRESS --jump ACCEPT
-# Forbid outgoing requests to cluster-internal IP addresses
-ENS_DEVICE=$(ip link list | grep ens | awk -F": " '{{ print $2 }}')
-iptables --append FORWARD --out-interface $ENS_DEVICE ! --destination 10.128.0.0/16 --jump ACCEPT
-
-
 # Setup fluentd
 touch /worker.log
 touch /run.log
 
 sudo rm /etc/google-fluentd/config.d/*  # remove unused config files
-
-sudo tee /etc/google-fluentd/config.d/syslog.conf <<EOF
-<source>
-@type tail
-format syslog
-path /var/log/syslog
-pos_file /var/lib/google-fluentd/pos/syslog.pos
-read_from_head true
-tag syslog
-</source>
-EOF
 
 sudo tee /etc/google-fluentd/config.d/worker-log.conf <<EOF
 <source>
@@ -260,6 +203,70 @@ rm /etc/google-fluentd/google-fluentd.conf.bak
 
 sudo service google-fluentd restart
 
+WORKER_DATA_DISK_NAME="{worker_data_disk_name}"
+UNRESERVED_WORKER_DATA_DISK_SIZE_GB="{unreserved_disk_storage_gb}"
+ACCEPTABLE_QUERY_JAR_URL_PREFIX="{ACCEPTABLE_QUERY_JAR_URL_PREFIX}"
+
+# format worker data disk
+sudo mkfs.xfs -m reflink=1 -n ftype=1 /dev/$WORKER_DATA_DISK_NAME
+sudo mkdir -p /mnt/disks/$WORKER_DATA_DISK_NAME
+sudo mount -o prjquota /dev/$WORKER_DATA_DISK_NAME /mnt/disks/$WORKER_DATA_DISK_NAME
+sudo chmod a+w /mnt/disks/$WORKER_DATA_DISK_NAME
+XFS_DEVICE=$(xfs_info /mnt/disks/$WORKER_DATA_DISK_NAME | head -n 1 | awk '{{ print $1 }}' | awk  'BEGIN {{ FS = "=" }}; {{ print $2 }}')
+
+# reconfigure docker to use local SSD
+sudo service docker stop
+sudo mv /var/lib/docker /mnt/disks/$WORKER_DATA_DISK_NAME/docker
+sudo ln -s /mnt/disks/$WORKER_DATA_DISK_NAME/docker /var/lib/docker
+sudo service docker start
+
+# reconfigure /batch and /logs and /gcsfuse to use local SSD
+sudo mkdir -p /mnt/disks/$WORKER_DATA_DISK_NAME/batch/
+sudo ln -s /mnt/disks/$WORKER_DATA_DISK_NAME/batch /batch
+
+sudo mkdir -p /mnt/disks/$WORKER_DATA_DISK_NAME/logs/
+sudo ln -s /mnt/disks/$WORKER_DATA_DISK_NAME/logs /logs
+
+sudo mkdir -p /mnt/disks/$WORKER_DATA_DISK_NAME/cloudfuse/
+sudo ln -s /mnt/disks/$WORKER_DATA_DISK_NAME/cloudfuse /cloudfuse
+
+sudo mkdir -p /etc/netns
+
+CORES=$(nproc)
+NAMESPACE=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/namespace")
+ACTIVATION_TOKEN=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/activation_token")
+IP_ADDRESS=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip")
+PROJECT=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/project/project-id")
+
+BATCH_LOGS_STORAGE_URI=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/batch_logs_storage_uri")
+INSTANCE_ID=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/instance_id")
+INSTANCE_CONFIG=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/instance_config")
+MAX_IDLE_TIME_MSECS=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/max_idle_time_msecs")
+NAME=$(curl -s http://metadata.google.internal/computeMetadata/v1/instance/name -H 'Metadata-Flavor: Google')
+ZONE=$(curl -s http://metadata.google.internal/computeMetadata/v1/instance/zone -H 'Metadata-Flavor: Google')
+
+BATCH_WORKER_IMAGE=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/batch_worker_image")
+DOCKER_ROOT_IMAGE=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/docker_root_image")
+DOCKER_PREFIX=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/docker_prefix")
+
+INTERNAL_GATEWAY_IP=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/internal_ip")
+
+# private job network = 172.20.0.0/16
+# public job network = 172.21.0.0/16
+# [all networks] Rewrite traffic coming from containers to masquerade as the host
+iptables --table nat --append POSTROUTING --source 172.20.0.0/15 --jump MASQUERADE
+
+# [public]
+# Block public traffic to the metadata server
+iptables --append FORWARD --source 172.21.0.0/16 --destination 169.254.169.254 --jump DROP
+# But allow the internal gateway
+iptables --append FORWARD --destination $INTERNAL_GATEWAY_IP --jump ACCEPT
+# And this worker
+iptables --append FORWARD --destination $IP_ADDRESS --jump ACCEPT
+# Forbid outgoing requests to cluster-internal IP addresses
+INTERNET_INTERFACE=$(ip link list | grep ens | awk -F": " '{{ print $2 }}')
+iptables --append FORWARD --out-interface $INTERNET_INTERFACE ! --destination 10.128.0.0/16 --jump ACCEPT
+
 {make_global_config_str}
 
 # retry once
@@ -286,7 +293,9 @@ docker run \
 -e MAX_IDLE_TIME_MSECS=$MAX_IDLE_TIME_MSECS \
 -e BATCH_WORKER_IMAGE=$BATCH_WORKER_IMAGE \
 -e BATCH_WORKER_IMAGE_ID=$BATCH_WORKER_IMAGE_ID \
+-e INTERNET_INTERFACE=$INTERNET_INTERFACE \
 -e UNRESERVED_WORKER_DATA_DISK_SIZE_GB=$UNRESERVED_WORKER_DATA_DISK_SIZE_GB \
+-e ACCEPTABLE_QUERY_JAR_URL_PREFIX=$ACCEPTABLE_QUERY_JAR_URL_PREFIX \
 -e INTERNAL_GATEWAY_IP=$INTERNAL_GATEWAY_IP \
 -v /var/run/docker.sock:/var/run/docker.sock \
 -v /var/run/netns:/var/run/netns:shared \
@@ -295,7 +304,7 @@ docker run \
 -v /batch:/batch:shared \
 -v /logs:/logs \
 -v /global-config:/global-config \
--v /gcsfuse:/gcsfuse:shared \
+-v /cloudfuse:/cloudfuse:shared \
 -v /etc/netns:/etc/netns \
 -v /sys/fs/cgroup:/sys/fs/cgroup \
 --mount type=bind,source=/mnt/disks/$WORKER_DATA_DISK_NAME,target=/host \
@@ -339,7 +348,10 @@ journalctl -u docker.service > dockerd.log
                 {'key': 'batch_logs_storage_uri', 'value': file_store.batch_logs_storage_uri},
                 {'key': 'instance_id', 'value': file_store.instance_id},
                 {'key': 'max_idle_time_msecs', 'value': max_idle_time_msecs},
-                {'key': 'instance_config', 'value': base64.b64encode(json.dumps(instance_config.to_dict()).encode()).decode()},
+                {
+                    'key': 'instance_config',
+                    'value': base64.b64encode(json.dumps(instance_config.to_dict()).encode()).decode(),
+                },
             ]
         },
         'tags': {'items': ["batch2-agent"]},

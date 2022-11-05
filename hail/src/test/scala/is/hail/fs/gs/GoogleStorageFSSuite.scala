@@ -1,34 +1,64 @@
 package is.hail.fs.gs
 
 import java.io.FileInputStream
-
 import is.hail.fs.FSSuite
 import is.hail.io.fs.GoogleStorageFS
 import org.apache.commons.io.IOUtils
 import org.scalatest.testng.TestNGSuite
-import org.testng.annotations.Test
+import org.testng.annotations.{BeforeClass, Test}
+import org.testng.SkipException
 
 class GoogleStorageFSSuite extends TestNGSuite with FSSuite {
-  val bucket: String = System.getenv("HAIL_TEST_GCS_BUCKET")
+  @BeforeClass
+  def beforeclass(): Unit = {
+    if (System.getenv("HAIL_CLOUD") != "gcp") {
+      throw new SkipException("This test suite is only run in GCP.");
+    } else {
+      assert(hail_test_storage_uri != null)
+      assert(fsResourcesRoot != null)
+    }
+  }
 
-  val root: String = s"gs://$bucket"
+  val hail_test_storage_uri: String = System.getenv("HAIL_TEST_STORAGE_URI")
 
-  val fsResourcesRoot: String = System.getenv("HAIL_GS_FS_TEST_RESOURCES")
+  val root: String = hail_test_storage_uri
 
-  private val keyFile = "/test-gsa-key/key.json"
+  val fsResourcesRoot: String = System.getenv("HAIL_FS_TEST_CLOUD_RESOURCES_URI")
 
-  lazy val fs = new GoogleStorageFS(
-    new String(IOUtils.toByteArray(new FileInputStream(keyFile))))
+  lazy val fs = {
+    val gac = System.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if (gac == null) {
+      new GoogleStorageFS()
+    } else {
+      new GoogleStorageFS(
+        Some(new String(IOUtils.toByteArray(new FileInputStream(gac)))))
+    }
+  }
 
-  lazy val tmpdir: String = s"gs://$bucket/tmp"
+  lazy val tmpdir: String = hail_test_storage_uri
 
-  @Test def testDropTailingSlash(): Unit = {
-    import GoogleStorageFS._
+  @Test def testMakeQualified(): Unit = {
+    val qualifiedFileName = "gs://bucket/path"
+    assert(fs.makeQualified(qualifiedFileName) == qualifiedFileName)
 
-    assert(dropTrailingSlash("") == "")
-    assert(dropTrailingSlash("/foo/bar") == "/foo/bar")
-    assert(dropTrailingSlash("foo/bar/") == "foo/bar")
-    assert(dropTrailingSlash("/foo///") == "/foo")
-    assert(dropTrailingSlash("///") == "")
+    val unqualifiedFileName = "not-gs://bucket/path"
+    try {
+      fs.makeQualified(unqualifiedFileName)
+    }
+    catch {
+      case _: IllegalArgumentException =>
+        return
+    }
+    assert(false)
+  }
+
+  @Test def deleteManyFiles(): Unit = {
+    val prefix = s"$hail_test_storage_uri/google-storage-fs-suite/delete-many-files/${ java.util.UUID.randomUUID() }"
+    for (i <- 0 until 2000) {
+      fs.touch(s"$prefix/$i")
+    }
+    assert(fs.exists(prefix))
+    fs.delete(prefix, recursive = true)
+    assert(!fs.exists(prefix), s"files not deleted:\n${ fs.listStatus(prefix).map(_.getPath).mkString("\n") }")
   }
 }

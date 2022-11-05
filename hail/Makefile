@@ -12,9 +12,9 @@ REVISION := $(shell git rev-parse HEAD)
 SHORT_REVISION := $(shell git rev-parse --short=12 HEAD)
 BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 SCALA_VERSION ?= 2.12.13
-SPARK_VERSION ?= 3.1.2
+SPARK_VERSION ?= 3.1.3
 HAIL_MAJOR_MINOR_VERSION := 0.2
-HAIL_PATCH_VERSION := 78
+HAIL_PATCH_VERSION := 105
 HAIL_PIP_VERSION := $(HAIL_MAJOR_MINOR_VERSION).$(HAIL_PATCH_VERSION)
 HAIL_VERSION := $(HAIL_PIP_VERSION)-$(SHORT_REVISION)
 ELASTIC_MAJOR_VERSION ?= 7
@@ -38,6 +38,7 @@ JAVAC ?= javac
 JAR ?= jar
 endif
 
+PYTEST_TARGET ?= test/hail
 
 # not perfect, not robust to simdpp changes, but probably fine
 BUILD_DEBUG_PREFIX := build/classes/scala/debug
@@ -49,7 +50,8 @@ JAR_DEBUG_CLASSES := $(addprefix $(BUILD_DEBUG_PREFIX)/, $(JAR_DEBUG_SOURCES:src
 PY_FILES := $(shell git ls-files python)
 
 INIT_SCRIPTS := python/hailtop/hailctl/deploy.yaml
-PYTHON_VERSION_INFO := python/hail/hail_version
+PYTHON_VERSION_INFO := python/hail/hail_revision
+PYTHON_VERSION_INFO += python/hail/hail_version
 PYTHON_VERSION_INFO += python/hail/hail_pip_version
 PYTHON_VERSION_INFO += python/hailtop/hail_version
 PYTHON_VERSION_INFO += python/hail/docs/_static/hail_version.js
@@ -60,22 +62,30 @@ SHADOW_TEST_JAR := build/libs/hail-all-spark-test.jar
 PYTHON_JAR := python/hail/backend/hail-all-spark.jar
 WHEEL := build/deploy/dist/hail-$(HAIL_PIP_VERSION)-py3-none-any.whl
 EGG := build/deploy/dist/hail-$(HAIL_PIP_VERSION)-py3.6.egg
-ELASTICSEARCH_311_JAR := libs/elasticsearch-spark-30_2.12-8.0.0-SNAPSHOT-custom-hail-spark311.jar
 
 GRADLE_ARGS += -Dscala.version=$(SCALA_VERSION) -Dspark.version=$(SPARK_VERSION) -Delasticsearch.major-version=$(ELASTIC_MAJOR_VERSION)
 
-.PHONY: elasticsearchJar
-elasticsearchJar: $(ELASTICSEARCH_311_JAR)
+QUERY_STORAGE_URI = $(shell kubectl get secret global-config --template={{.data.query_storage_uri}} | base64 --decode)
+TEST_STORAGE_URI = $(shell kubectl get secret global-config --template={{.data.test_storage_uri}} | base64 --decode)
+TOKEN := $(shell cat /dev/urandom | LC_ALL=C tr -dc 'a-z0-9' | head -c 12)
 
-$(ELASTICSEARCH_311_JAR):
-	@mkdir -p libs
-	curl https://storage.googleapis.com/hail-common/elasticsearch-libs/elasticsearch-spark-30_2.12-8.0.0-SNAPSHOT-custom-hail-spark311.jar >  libs/elasticsearch-spark-30_2.12-8.0.0-SNAPSHOT-custom-hail-spark311.jar
+ifeq ($(NAMESPACE),default)
+ifeq ($(UPLOAD_RELEASE_JAR),true)
+# This should only be used if the normal CI deploy process fails and you need to upload a JAR to the
+# expected location for our users.
+JAR_LOCATION = $(QUERY_STORAGE_URI)/jars/$(REVISION).jar
+else
+JAR_LOCATION = $(QUERY_STORAGE_URI)/jars/$(shell whoami)/$(TOKEN)/$(REVISION).jar
+endif
+else
+JAR_LOCATION = $(TEST_STORAGE_URI)/$(NAMESPACE)/jars/$(TOKEN)/$(REVISION).jar
+endif
+HAIL_TEST_RESOURCES_PREFIX = $(TEST_STORAGE_URI)/$(HAIL_TEST_GCS_TOKEN)/hail-test-resources
+HAIL_TEST_RESOURCES_DIR = $(HAIL_TEST_RESOURCES_PREFIX)/test/resources/
+HAIL_DOCTEST_DATA_DIR = $(HAIL_TEST_RESOURCES_PREFIX)/doctest/data/
 
 .PHONY: shadowJar
 shadowJar: $(SHADOW_JAR)
-
-$(JAR_SOURCES): $(ELASTICSEARCH_311_JAR)
-$(JAR_TEST_SOURCES): $(ELASTICSEARCH_311_JAR)
 
 ifdef HAIL_COMPILE_NATIVES
 $(SHADOW_JAR): native-lib-prebuilt
@@ -114,7 +124,7 @@ services-jvm-test: $(SCALA_BUILD_INFO) $(JAR_SOURCES) $(JAR_TEST_SOURCES)
 # javac args from compileJava in build.gradle
 $(BUILD_DEBUG_PREFIX)/%.class: src/debug/scala/%.java
 	@mkdir -p $(BUILD_DEBUG_PREFIX)
-	$(JAVAC) -d $(BUILD_DEBUG_PREFIX) -Xlint:all -Werror -XDenableSunApiLintControl -Xlint:-sunapi $<
+	$(JAVAC) -d $(BUILD_DEBUG_PREFIX) -Xlint:all -Werror -XDenableSunApiLintControl -XDignore.symbol.file $<
 
 src/main/resources/build-info.properties: env/REVISION env/SHORT_REVISION env/BRANCH
 src/main/resources/build-info.properties: env/SPARK_VERSION env/HAIL_PIP_VERSION
@@ -129,6 +139,9 @@ src/main/resources/build-info.properties: Makefile
 
 .PHONY: python-version-info
 python-version-info: $(PYTHON_VERSION_INFO)
+
+python/hail/hail_revision: env/REVISION
+	echo $(REVISION) > $@
 
 python/hail/hail_version: env/SHORT_REVISION env/HAIL_PIP_VERSION
 	echo $(HAIL_VERSION) > $@
@@ -146,12 +159,14 @@ python/hailtop/hail_version: python/hail/hail_version
 python/README.md: ../README.md
 	cp ../README.md python/
 
-$(PYTHON_JAR): shadowJar
+$(PYTHON_JAR): $(SHADOW_JAR)
 	cp -f $(SHADOW_JAR) $@
 
+.PHONY: python-jar
+python-jar: $(PYTHON_JAR)
+
 .PHONY: pytest
-pytest: PYTEST_TARGET ?= test/hail
-pytest: $(PYTHON_VERSION_INFO) $(SHADOW_JAR) $(INIT_SCRIPTS)
+pytest: $(PYTHON_VERSION_INFO) $(INIT_SCRIPTS)
 pytest: python/README.md $(PYTHON_JAR)
 	cd python && $(HAIL_PYTHON3) setup.py pytest \
      --addopts "-v \
@@ -163,8 +178,28 @@ pytest: python/README.md $(PYTHON_JAR)
      $(PYTEST_TARGET) \
      $(PYTEST_ARGS)"
 
+# NOTE: Look at upload-qob-test-resources target if test resources are missing
+.PHONY: pytest-qob
+pytest-qob: upload-qob-jar upload-qob-test-resources install-editable
+	! [ -z $(NAMESPACE) ]  # call this like: make pytest-qob NAMESPACE=default
+	HAIL_QUERY_BACKEND=batch \
+	HAIL_QUERY_JAR_URL=$$(cat upload-qob-jar) \
+	HAIL_DEFAULT_NAMESPACE=$(NAMESPACE) \
+	HAIL_TEST_RESOURCES_DIR='$(HAIL_TEST_RESOURCES_DIR)' \
+	HAIL_DOCTEST_DATA_DIR='$(HAIL_DOCTEST_DATA_DIR)' \
+	cd python && pytest \
+		-v \
+		--color=no \
+		--instafail \
+		-r A \
+		--self-contained-html \
+		--html=../build/reports/pytest.html \
+		$(PYTEST_TARGET) \
+		$(PYTEST_ARGS)
+
+
 .PHONY: doctest
-doctest: $(PYTHON_VERSION_INFO) $(SHADOW_JAR) $(INIT_SCRIPTS)
+doctest: $(PYTHON_VERSION_INFO) $(INIT_SCRIPTS)
 doctest: python/README.md $(PYTHON_JAR)
 	cd python && $(HAIL_PYTHON3) setup.py pytest \
 	  --addopts "-v \
@@ -187,7 +222,7 @@ doctest: python/README.md $(PYTHON_JAR)
     $(PYTEST_ARGS)"
 
 .PHONY: copy-py-files
-copy-py-files: $(PYTHON_VERSION_INFO) $(SHADOW_JAR) $(INIT_SCRIPTS) $(PY_FILES) $(PYTHON_JAR)
+copy-py-files: $(PYTHON_VERSION_INFO) $(INIT_SCRIPTS) $(PY_FILES) $(PYTHON_JAR)
 	rm -rf build/deploy
 	mkdir -p build/deploy
 	mkdir -p build/deploy/src
@@ -208,7 +243,8 @@ copy-py-files: $(PYTHON_VERSION_INFO) $(SHADOW_JAR) $(INIT_SCRIPTS) $(PY_FILES) 
 wheel: $(WHEEL)
 
 $(WHEEL): copy-py-files
-	cd build/deploy; $(HAIL_PYTHON3) setup.py -q sdist bdist_wheel
+	# Clear the bdist build cache before building the wheel
+	cd build/deploy; rm -rf build; $(HAIL_PYTHON3) setup.py -q sdist bdist_wheel
 
 .PHONY: egg
 egg: $(EGG)
@@ -246,46 +282,101 @@ upload-artifacts: $(WHEEL)
 	gsutil -m acl set -r public-read $(cloud_base)
 	$(UPLOAD_RETENTION)
 
+
+# NOTE: 1-day expiration of the test bucket means that this
+# target must be run at least once a day. To trigger this target to re-run,
+# > rm upload-qob-test-resources
+upload-qob-test-resources: $(JAR_TEST_SOURCES)
+	! [ -z $(NAMESPACE) ]  # call this like: make upload-qob-test-resources NAMESPACE=default
+	gsutil -m cp -r src/test/resources $(HAIL_TEST_RESOURCES_DIR)
+	gsutil -m cp -r python/hail/docs/data $(HAIL_DOCTEST_DATA_DIR)
+	touch $@
+
+# NOTE: 1-day expiration of the test bucket means that this
+# target must be run at least once a day if using a dev NAMESPACE.
+# To trigger this target to re-run,
+# > rm upload-qob-jar
+upload-qob-jar: SPARK_VERSION := 3.2.1
+upload-qob-jar: $(SHADOW_JAR)
+	! [ -z $(NAMESPACE) ]  # call this like: make upload-qob-jar NAMESPACE=default
+	gsutil -m cp $(SHADOW_JAR) $(JAR_LOCATION)
+	echo $(JAR_LOCATION) > $@
+
 .PHONY: install-editable
 install-editable: $(PYTHON_VERSION_INFO) $(INIT_SCRIPTS)
 install-editable: python/README.md $(PYTHON_JAR)
 	-$(PIP) uninstall -y hail
 	cd python && $(PIP) install -e .
+	hailctl config set query/backend spark
+
+.PHONY: install-for-qob
+install-for-qob: upload-qob-jar install-editable
+	! [ -z $(NAMESPACE) ]  # call this like: make install-for-qob NAMESPACE=default
+	hailctl config set query/backend batch
+	hailctl config set query/jar_url $$(cat upload-qob-jar)
+	hailctl dev config set default_namespace $(NAMESPACE)
 
 .PHONY: install
 install: $(WHEEL)
 	-$(PIP) uninstall -y hail
 	$(PIP) install $(WHEEL)
+	hailctl config set query/backend spark
 
 .PHONY: install-on-cluster
 install-on-cluster: $(WHEEL)
-	sed '/^pyspark/d' python/requirements.txt | grep -v '^#' | xargs $(PIP) install -U
+	sed '/^pyspark/d' python/requirements.txt | grep -v '^#' | tr '\n' '\0' | xargs -0 $(PIP) install -U
 	-$(PIP) uninstall -y hail
 	$(PIP) install $(WHEEL) --no-deps
+	hailctl config set query/backend spark
 
 .PHONY: install-hailctl
 install-hailctl: install upload-artifacts
 
-.PHONY: test-dataproc
-test-dataproc: install-hailctl
-	bash scripts/test-dataproc.sh
+.PHONY: test-dataproc-37
+test-dataproc-37: install-hailctl
+	bash scripts/test-dataproc.sh "GRCh37"
 
+.PHONY: test-dataproc-38
+test-dataproc-38: install-hailctl
+	bash scripts/test-dataproc.sh "GRCh38"
+
+# install skopeo
 # use curl version >=7.55.0
+#
 # set DEPLOY_REMOTE to the hail-is/hail remote
+#
 # create an access token with full repo privileges at https://github.com/settings/tokens
 # create a file that contains "Authorization: token YOUR_ACCESS_TOKEN_HERE"
 # set GITHUB_OAUTH_HEADER_FILE to that filename
+#
+# create the hailgenetics/hail image (see /docker) and place it somewhere skopeo can access it
+# set HAIL_GENETICS_HAIL_IMAGE to that image's full name including the protocol, e.g. docker://gcr.io/hail-vdc/hailgenetics/hail:1234abcd
+#
+# build a Azure-HDInsight-compatible wheel file (see build.yaml "build_wheel_for_azure" or start a
+# cluster to find the correct Scala and Spark versions because the version webpage does not include
+# sufficient detail)
+# set WHEEL_FOR_AZURE to the path to that wheel file
+#
+# Create a hail docs www.tar.gz file (see build.yaml "make_docs" rule) and set WEBSITE_TAR to the path to www.tar.gz
+#
 .PHONY: deploy
 deploy: test-dataproc $(WHEEL)
-	bash scripts/deploy.sh $(HAIL_PIP_VERSION) $(HAIL_VERSION) $(REVISION) $(DEPLOY_REMOTE) $(WHEEL) $(GITHUB_OAUTH_HEADER_FILE)
+	bash scripts/deploy.sh $(HAIL_PIP_VERSION) $(HAIL_VERSION) $(REVISION) $(DEPLOY_REMOTE) $(WHEEL) $(GITHUB_OAUTH_HEADER_FILE) $(HAIL_GENETICS_HAIL_IMAGE) $(WHEEL_FOR_AZURE) $(WEBSITE_TAR)
 
 .PHONY: install-dev-deps
 install-dev-deps:
-	$(PIP) install -U -r python/dev-requirements.txt
+	$(PIP) install -U -r python/dev/requirements.txt
 
 .PHONY: install-deps
 install-deps: install-dev-deps
 	sed "s/^pyspark.*/pyspark==$(SPARK_VERSION)/" python/requirements.txt | xargs $(PIP) install -U
+
+.PHONY: generate-pip-lockfile
+generate-pip-lockfile:
+	pip-compile --upgrade python/requirements.txt \
+		--output-file=python/pinned-requirements.txt
+	pip-compile --upgrade python/dev/requirements.txt \
+		--output-file=python/dev/pinned-requirements.txt
 
 .PHONY: benchmark
 benchmark: $(WHEEL)

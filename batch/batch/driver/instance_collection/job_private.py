@@ -1,78 +1,105 @@
-from typing import List, Tuple
-import random
+import asyncio
 import json
 import logging
-import asyncio
+import random
+import traceback
+from typing import List, Tuple
+
 import sortedcontainers
 
 from gear import Database
 from hailtop import aiotools
 from hailtop.utils import (
-    Notice,
-    run_if_changed,
-    WaitableSharedPool,
-    time_msecs,
-    retry_long_running,
-    secret_alnum_string,
     AsyncWorkerPool,
+    Notice,
+    WaitableSharedPool,
     periodically_call,
+    retry_long_running,
+    run_if_changed,
+    secret_alnum_string,
+    time_msecs,
 )
 
 from ...batch_format_version import BatchFormatVersion
 from ...inst_coll_config import JobPrivateInstanceManagerConfig
-from ...utils import Box, ExceededSharesCounter
 from ...instance_config import QuantifiedResource
-
+from ...utils import Box, ExceededSharesCounter, regions_bits_rep_to_regions
+from ..exceptions import RegionsNotSupportedError
 from ..instance import Instance
-from ..job import mark_job_creating, schedule_job
+from ..job import mark_job_creating, mark_job_errored, schedule_job
 from ..resource_manager import CloudResourceManager
-
-from .base import InstanceCollectionManager, InstanceCollection
+from .base import InstanceCollection, InstanceCollectionManager
 
 log = logging.getLogger('job_private_inst_coll')
 
 
 class JobPrivateInstanceManager(InstanceCollection):
     @staticmethod
-    async def create(app,
-                     db: Database,  # BORROWED
-                     inst_coll_manager: InstanceCollectionManager,
-                     resource_manager: CloudResourceManager,
-                     machine_name_prefix: str,
-                     config: JobPrivateInstanceManagerConfig,
-                     task_manager: aiotools.BackgroundTaskManager,
-                     ):
+    async def create(
+        app,
+        db: Database,  # BORROWED
+        inst_coll_manager: InstanceCollectionManager,
+        resource_manager: CloudResourceManager,
+        machine_name_prefix: str,
+        config: JobPrivateInstanceManagerConfig,
+        task_manager: aiotools.BackgroundTaskManager,
+    ):
         jpim = JobPrivateInstanceManager(
-            app, db, inst_coll_manager, resource_manager, machine_name_prefix, config, task_manager)
+            app, db, inst_coll_manager, resource_manager, machine_name_prefix, config, task_manager
+        )
 
         log.info(f'initializing {jpim}')
 
         async for record in db.select_and_fetchall(
-            'SELECT * FROM instances WHERE removed = 0 AND inst_coll = %s;', (jpim.name,)
+            '''
+SELECT instances.*, instances_free_cores_mcpu.free_cores_mcpu
+FROM instances
+INNER JOIN instances_free_cores_mcpu
+ON instances.name = instances_free_cores_mcpu.name
+WHERE removed = 0 AND inst_coll = %s;
+''',
+            (jpim.name,),
         ):
             jpim.add_instance(Instance.from_record(app, jpim, record))
 
+        task_manager.ensure_future(
+            retry_long_running(
+                'create_instances_loop',
+                run_if_changed,
+                jpim.create_instances_state_changed,
+                jpim.create_instances_loop_body,
+            )
+        )
+        task_manager.ensure_future(
+            retry_long_running(
+                'schedule_jobs_loop', run_if_changed, jpim.scheduler_state_changed, jpim.schedule_jobs_loop_body
+            )
+        )
+        task_manager.ensure_future(periodically_call(15, jpim.bump_scheduler))
         return jpim
 
-    def __init__(self,
-                 app,
-                 db: Database,  # BORROWED
-                 inst_coll_manager: InstanceCollectionManager,
-                 resource_manager: CloudResourceManager,
-                 machine_name_prefix: str,
-                 config: JobPrivateInstanceManagerConfig,
-                 task_manager: aiotools.BackgroundTaskManager,
-                 ):
-        super().__init__(db,
-                         inst_coll_manager,
-                         resource_manager,
-                         config.cloud,
-                         config.name,
-                         machine_name_prefix,
-                         is_pool=False,
-                         max_instances=config.max_instances,
-                         max_live_instances=config.max_live_instances,
-                         task_manager=task_manager)
+    def __init__(
+        self,
+        app,
+        db: Database,  # BORROWED
+        inst_coll_manager: InstanceCollectionManager,
+        resource_manager: CloudResourceManager,
+        machine_name_prefix: str,
+        config: JobPrivateInstanceManagerConfig,
+        task_manager: aiotools.BackgroundTaskManager,
+    ):
+        super().__init__(
+            db,
+            inst_coll_manager,
+            resource_manager,
+            config.cloud,
+            config.name,
+            machine_name_prefix,
+            is_pool=False,
+            max_instances=config.max_instances,
+            max_live_instances=config.max_live_instances,
+            task_manager=task_manager,
+        )
         self.app = app
         global_scheduler_state_changed: Notice = self.app['scheduler_state_changed']
         self.create_instances_state_changed = global_scheduler_state_changed.subscribe()
@@ -82,22 +109,6 @@ class JobPrivateInstanceManager(InstanceCollection):
         self.exceeded_shares_counter = ExceededSharesCounter()
 
         self.boot_disk_size_gb = config.boot_disk_size_gb
-
-        task_manager.ensure_future(
-            retry_long_running(
-                'create_instances_loop',
-                run_if_changed,
-                self.create_instances_state_changed,
-                self.create_instances_loop_body,
-            )
-        )
-        task_manager.ensure_future(
-            retry_long_running(
-                'schedule_jobs_loop', run_if_changed, self.scheduler_state_changed, self.schedule_jobs_loop_body
-            )
-        )
-        task_manager.ensure_future(
-            periodically_call(15, self.bump_scheduler))
 
     def config(self):
         return {
@@ -129,12 +140,10 @@ WHERE name = %s;
             log.info(f'not scheduling any jobs for {self}; batch is frozen')
             return True
 
-        log.info(f'starting scheduling jobs for {self}')
         waitable_pool = WaitableSharedPool(self.async_worker_pool)
 
-        should_wait = True
-
-        n_scheduled = 0
+        n_records_seen = 0
+        max_records = 300
 
         async for record in self.db.select_and_fetchall(
             '''
@@ -149,10 +158,9 @@ WHERE batches.state = 'running'
   AND jobs.inst_coll = %s
   AND instances.`state` = 'active'
 ORDER BY instances.time_activated ASC
-LIMIT 300;
+LIMIT %s;
 ''',
-            (self.name,),
-            timer_description=f'in schedule_jobs for {self}: get ready jobs with active instances',
+            (self.name, max_records),
         ):
             batch_id = record['batch_id']
             job_id = record['job_id']
@@ -161,8 +169,7 @@ LIMIT 300;
             log.info(f'scheduling job {id}')
 
             instance = self.name_instance[instance_name]
-            n_scheduled += 1
-            should_wait = False
+            n_records_seen += 1
 
             async def schedule_with_error_handling(app, record, id, instance):
                 try:
@@ -174,8 +181,10 @@ LIMIT 300;
 
         await waitable_pool.wait()
 
-        log.info(f'scheduled {n_scheduled} jobs for {self}')
+        if n_records_seen > 0:
+            log.info(f'attempted to schedule {n_records_seen} jobs for {self}')
 
+        should_wait = n_records_seen < max_records
         return should_wait
 
     def max_instances_to_create(self):
@@ -210,7 +219,6 @@ GROUP BY user
 HAVING n_ready_jobs + n_creating_jobs + n_running_jobs > 0;
 ''',
             (self.name,),
-            timer_description=f'in compute_fair_share for {self}: aggregate user_inst_coll_resources',
         )
 
         async for record in records:
@@ -245,7 +253,7 @@ HAVING n_ready_jobs + n_creating_jobs + n_running_jobs > 0;
                     allocate_jobs(lowest_total_user, mark)
                     continue
 
-            allocation = min([c for c in [lowest_running, lowest_total] if c is not None])
+            allocation = min(c for c in [lowest_running, lowest_total] if c is not None)
 
             n_allocating_users = len(allocating_users_by_total_jobs)
             jobs_to_allocate = n_allocating_users * (allocation - mark)
@@ -263,7 +271,9 @@ HAVING n_ready_jobs + n_creating_jobs + n_running_jobs > 0;
 
         return result
 
-    async def create_instance(self, machine_spec: dict) -> Tuple[Instance, List[QuantifiedResource]]:
+    async def create_instance(
+        self, machine_spec: dict, regions: List[str]
+    ) -> Tuple[Instance, List[QuantifiedResource]]:
         machine_type = machine_spec['machine_type']
         preemptible = machine_spec['preemptible']
         storage_gb = machine_spec['storage_gib']
@@ -273,12 +283,12 @@ HAVING n_ready_jobs + n_creating_jobs + n_running_jobs > 0;
             cores=cores,
             machine_type=machine_type,
             job_private=True,
-            location=None,
+            regions=regions,
             preemptible=preemptible,
             max_idle_time_msecs=None,
             local_ssd_data_disk=False,
             data_disk_size_gb=storage_gb,
-            boot_disk_size_gb=self.boot_disk_size_gb
+            boot_disk_size_gb=self.boot_disk_size_gb,
         )
 
         return (instance, total_resources_on_instance)
@@ -288,7 +298,6 @@ HAVING n_ready_jobs + n_creating_jobs + n_running_jobs > 0;
             log.info(f'not creating instances for {self}; batch is frozen')
             return True
 
-        log.info(f'create_instances for {self}: starting')
         start = time_msecs()
         n_instances_created = 0
 
@@ -296,7 +305,6 @@ HAVING n_ready_jobs + n_creating_jobs + n_running_jobs > 0;
 
         total = sum(resources['n_allocated_jobs'] for resources in user_resources.values())
         if not total:
-            log.info(f'create_instances {self}: no allocated jobs')
             should_wait = True
             return should_wait
         user_share = {
@@ -307,16 +315,17 @@ HAVING n_ready_jobs + n_creating_jobs + n_running_jobs > 0;
         async def user_runnable_jobs(user, remaining):
             async for batch in self.db.select_and_fetchall(
                 '''
-SELECT id, cancelled, userdata, user, format_version
+SELECT batches.id, batches_cancelled.id IS NOT NULL AS cancelled, userdata, user, format_version
 FROM batches
+LEFT JOIN batches_cancelled
+       ON batches.id = batches_cancelled.id
 WHERE user = %s AND `state` = 'running';
 ''',
                 (user,),
-                timer_description=f'in create_instances {self}: get {user} running batches',
             ):
                 async for record in self.db.select_and_fetchall(
                     '''
-SELECT jobs.job_id, jobs.spec, jobs.cores_mcpu, COALESCE(SUM(instances.state IS NOT NULL AND
+SELECT jobs.batch_id, jobs.job_id, jobs.spec, jobs.cores_mcpu, regions_bits_rep, COALESCE(SUM(instances.state IS NOT NULL AND
   (instances.state = 'pending' OR instances.state = 'active')), 0) as live_attempts
 FROM jobs FORCE INDEX(jobs_batch_id_state_always_run_inst_coll_cancelled)
 LEFT JOIN attempts ON jobs.batch_id = attempts.batch_id AND jobs.job_id = attempts.job_id
@@ -327,7 +336,6 @@ HAVING live_attempts = 0
 LIMIT %s;
 ''',
                     (batch['id'], self.name, remaining.value),
-                    timer_description=f'in create_instances {self}: get {user} batch {batch["id"]} runnable jobs (1)',
                 ):
                     record['batch_id'] = batch['id']
                     record['userdata'] = batch['userdata']
@@ -337,7 +345,7 @@ LIMIT %s;
                 if not batch['cancelled']:
                     async for record in self.db.select_and_fetchall(
                         '''
-SELECT jobs.job_id, jobs.spec, jobs.cores_mcpu, COALESCE(SUM(instances.state IS NOT NULL AND
+SELECT jobs.batch_id, jobs.job_id, jobs.spec, jobs.cores_mcpu, regions_bits_rep, COALESCE(SUM(instances.state IS NOT NULL AND
   (instances.state = 'pending' OR instances.state = 'active')), 0) as live_attempts
 FROM jobs FORCE INDEX(jobs_batch_id_state_always_run_cancelled)
 LEFT JOIN attempts ON jobs.batch_id = attempts.batch_id AND jobs.job_id = attempts.job_id
@@ -345,10 +353,9 @@ LEFT JOIN instances ON attempts.instance_name = instances.name
 WHERE jobs.batch_id = %s AND jobs.state = 'Ready' AND always_run = 0 AND jobs.inst_coll = %s AND cancelled = 0
 GROUP BY jobs.job_id, jobs.spec, jobs.cores_mcpu
 HAVING live_attempts = 0
-LIMIT %s;
+LIMIT %s
 ''',
                         (batch['id'], self.name, remaining.value),
-                        timer_description=f'in create_instances {self}: get {user} batch {batch["id"]} runnable jobs (2)',
                     ):
                         record['batch_id'] = batch['id']
                         record['userdata'] = batch['userdata']
@@ -391,19 +398,34 @@ LIMIT %s;
 
                 log.info(f'creating job private instance for job {id}')
 
-                async def create_instance_with_error_handling(batch_id: int,
-                                                              job_id: int,
-                                                              attempt_id: str,
-                                                              record: dict,
-                                                              id: Tuple[int, int]):
+                async def create_instance_with_error_handling(
+                    batch_id: int, job_id: int, attempt_id: str, record: dict, id: Tuple[int, int]
+                ):
                     try:
                         batch_format_version = BatchFormatVersion(record['format_version'])
                         spec = json.loads(record['spec'])
                         machine_spec = batch_format_version.get_spec_machine_spec(spec)
-                        instance, total_resources_on_instance = await self.create_instance(machine_spec)
+
+                        regions_bits_rep = record['regions_bits_rep']
+                        if regions_bits_rep is None:
+                            regions = self.inst_coll_manager.regions
+                        else:
+                            regions = regions_bits_rep_to_regions(regions_bits_rep, self.app['regions'])
+
+                        instance, total_resources_on_instance = await self.create_instance(machine_spec, regions)
                         log.info(f'created {instance} for {(batch_id, job_id)}')
                         await mark_job_creating(
                             self.app, batch_id, job_id, attempt_id, instance, time_msecs(), total_resources_on_instance
+                        )
+                    except RegionsNotSupportedError:
+                        await mark_job_errored(
+                            self.app,
+                            batch_id,
+                            job_id,
+                            attempt_id,
+                            record['user'],
+                            record['format_version'],
+                            traceback.format_exc(),
                         )
                     except Exception:
                         log.exception(f'while creating job private instance for job {id}', exc_info=True)
